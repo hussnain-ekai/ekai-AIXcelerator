@@ -236,26 +236,122 @@ Triggered by clicking ERD Diagram artifact (from chat or artifacts panel).
 
 ---
 
-## 7. Data Quality Report Panel (Right Slide-over)
+## 7. Data Quality Scoring System
 
-Triggered by clicking Data Quality Report artifact.
+Runs automatically after database discovery completes. This is the gatekeeper — it protects ekai from blame when customer data is bad.
+
+### 7.1 Four Quality Checks
+
+Run these checks via Snowflake INFORMATION_SCHEMA and statistical profiling queries. **Search latest 2026 Snowflake docs** for INFORMATION_SCHEMA patterns before implementing.
+
+| # | Check | What it detects | Deduction |
+|---|-------|----------------|-----------|
+| 1 | **Duplicate PKs in dimension tables** | `SELECT pk_col, COUNT(*) FROM dim_table GROUP BY pk_col HAVING COUNT(*) > 1` — duplicates inflate joins | -15 per table with duplicates |
+| 2 | **Orphaned FKs** | FK values in fact tables with no matching PK in dimension — broken joins | -10 per orphaned relationship |
+| 3 | **Numeric data stored as VARCHAR** | Columns that are VARCHAR but contain >90% numeric values — aggregation will fail | -5 per column |
+| 4 | **Missing table/column descriptions** | Tables or columns with no COMMENT in INFORMATION_SCHEMA — poor discoverability | -2 per table with no description |
+
+**Starting score: 100.** Deduct per issue found. Floor at 0.
+
+### 7.2 Threshold Gating
+
+| Score | Behavior |
+|-------|----------|
+| **70-100** (green) | Pass through. Show report as informational artifact. |
+| **40-69** (gold) | Show modal requiring **checkbox acknowledgment**: "I understand these data quality issues may affect the accuracy of my semantic model." User must check to proceed. Log `user_acknowledged = true`. |
+| **0-39** (red) | **Block progression.** Show modal explaining issues. No proceed button — only "Go Back" or "Contact Admin". User cannot move to Requirements phase. |
+
+### 7.3 Data Quality Modal (MUI Dialog)
+
+Shown in chat workspace after discovery completes, before allowing user to proceed.
+
+```
++-----------------------------------------------+
+|  Data Health Check                         [X] |
+|                                                |
+|  [ 78 ]  (large donut, gold ring)              |
+|  Overall Health Score                          |
+|                                                |
+|  Top Issues:                                   |
+|  1. ⚠️ 500 duplicate customers means           |
+|     counts will be wrong                        |
+|  2. ⚠️ 12 columns store numbers as text —      |
+|     SUM/AVG will fail without CAST              |
+|  3. ⚠️ 8 tables have no descriptions —         |
+|     AI may misinterpret column purposes         |
+|                                                |
+|  [ ] I understand these issues may affect      |
+|      accuracy of my semantic model (40-69)     |
+|                                                |
+|  [View Full Report]          [Continue ➔]      |
++-----------------------------------------------+
+```
+
+- **Score 70+**: No checkbox shown, Continue button enabled
+- **Score 40-69**: Checkbox required, Continue disabled until checked
+- **Score 0-39**: No Continue button, only "Go Back" and "Contact your data team"
+- **"View Full Report"** button opens the full Data Quality Report panel (section 7.5)
+- **Top 3 issues** shown in **plain English** — not technical jargon:
+  - "500 duplicate customers means counts will be wrong"
+  - "12 columns store numbers as text — SUM/AVG will fail without CAST"
+  - "3,200 orders reference products that don't exist — joins will drop rows"
+  - "8 tables have no descriptions — AI may misinterpret column purposes"
+
+### 7.4 Database Logging
+
+Store every health check result in PostgreSQL `data_quality_checks` table:
+
+```sql
+CREATE TABLE data_quality_checks (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  data_product_id UUID REFERENCES data_products(id),
+  health_score INTEGER NOT NULL CHECK (health_score >= 0 AND health_score <= 100),
+  issues JSONB NOT NULL DEFAULT '[]',
+  -- issues array: [{check, table, column, description, deduction, plain_english}]
+  user_acknowledged BOOLEAN NOT NULL DEFAULT false,
+  acknowledged_at TIMESTAMPTZ,
+  blocked BOOLEAN NOT NULL DEFAULT false,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+### 7.5 Data Quality Report Panel (Right Slide-over)
+
+Full detailed report, triggered by "View Full Report" or clicking artifact card.
 
 - **Width**: ~500px slide-over from right
 - **Header**: "Data Quality Report" title + Close (X) button
-- **Donut chart**: gold ring, large percentage in center (e.g., "78%"), "Overall" label
-- **Summary text**: "4 of 6 tables meet quality threshold (>60%)"
-- **Table**: MUI Table with columns:
+- **Donut chart**: color-coded ring (green/gold/red based on score), large percentage in center, "Overall" label
+- **Summary text**: "N of M tables meet quality threshold"
+- **Issue breakdown by check type** (collapsible sections):
+  - Duplicate PKs: list affected tables + duplicate counts
+  - Orphaned FKs: list broken relationships + orphan counts
+  - Numeric as VARCHAR: list affected columns
+  - Missing descriptions: list tables without comments
+- **Per-table summary table**:
 
 | Column | Example |
 |--------|---------|
 | Table Name | CONVERSIONS |
 | Rows | 847K |
-| Null % | 2.1% |
-| Score | 95% (color-coded: green >=80%, gold 60-79%, red <60%) |
+| Issues | 2 |
+| Score | 95% (color-coded) |
 
-### Score color coding:
-- 95%, 97%, 100%, 89% → green text
-- 68%, 72% → gold text
+Score color coding: green >= 80%, gold 40-79%, red < 40%
+
+### 7.6 UI Integration Points
+
+Three places where health score surfaces beyond the modal:
+
+1. **Dashboard health badge**: On each data product row, show a small colored dot or badge next to the status:
+   - Green dot = score 70+
+   - Gold dot = score 40-69 (acknowledged)
+   - Red dot = score < 40 (blocked)
+   - No dot = discovery not yet run
+
+2. **Warning banner during data product creation**: If score is 40-69 (acknowledged), show a persistent gold banner at top of chat workspace: "Data quality score: {score}/100 — some results may be affected. [View Report]"
+
+3. **Disclaimer in published Cortex Agent**: When publishing, append to the agent's system prompt: "Note: Source data health score was {score}/100 at time of publishing. Known issues: {top_issues_summary}." This is stored in the semantic view metadata, not shown to end users directly but available for audit.
 
 ---
 
