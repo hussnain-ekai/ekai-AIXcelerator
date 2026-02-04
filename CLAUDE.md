@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ekaiX enables business users to create semantic models and Cortex Agents through AI conversation. It runs entirely within a customer's Snowflake account via SPCS (Snowpark Container Services). Users interact with an AI agent to discover gold layer databases, capture business requirements, generate semantic view YAML, and publish Cortex Agents to Snowflake Intelligence.
 
-**Status:** Pre-development. The `ekaiX_Technical_PRD.md` file (2381 lines) contains the complete technical specification and is the authoritative source for all requirements.
+**Status:** Pre-development. The `ekaiX_Technical_PRD.md` file (2381 lines) contains the complete technical specification and is the authoritative source for all requirements. The `docs/plans/2026-02-04-ui-ux-design-spec.md` contains the validated UI/UX design spec (every screen, component, interaction, and state) — always reference it when building frontend.
 
 ## Design System (ekai Brand)
 
