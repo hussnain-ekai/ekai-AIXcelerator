@@ -1,0 +1,73 @@
+# ===========================
+# Environment & Credentials
+# ===========================
+.env
+.env.*
+.env.local
+.env.development
+.env.production
+*.env
+sf.txt
+
+# ===========================
+# Dependencies
+# ===========================
+node_modules/
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# ===========================
+# Build artifacts
+# ===========================
+.next/
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# ===========================
+# IDE & Editor
+# ===========================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ===========================
+# Testing & Tooling
+# ===========================
+.playwright-mcp/
+playwright-report/
+test-results/
+coverage/
+.nyc_output/
+*.log
+
+# ===========================
+# Screenshots & temp artifacts
+# ===========================
+# Never commit screenshots or temporary images to root.
+# Reference images belong in images/ only.
+*.png
+*.jpg
+*.jpeg
+!images/**
+images/gemini-key.json
+
+# ===========================
+# Docker
+# ===========================
+docker-compose.override.yml
+
+# ===========================
+# Misc
+# ===========================
+.claude/
+*.bak
+*.tmp
