@@ -15,6 +15,52 @@ interface MessageThreadProps {
 
 const GOLD = '#D4A843';
 
+/* ------------------------------------------------------------------ */
+/*  Message content filters                                            */
+/* ------------------------------------------------------------------ */
+
+/** Messages that should be completely hidden from the user. */
+function isHiddenMessage(message: ChatMessage): boolean {
+  const text = typeof message.content === 'string' ? message.content : '';
+  // Internal discovery context injected for the LLM — never for user display
+  if (text.includes('[INTERNAL CONTEXT')) return true;
+  return false;
+}
+
+/**
+ * Condense messages that contain large code blocks (e.g. full YAML dumps).
+ * Returns the summary text before the first code fence, stripping markdown.
+ * If no code fence, returns original content unchanged.
+ */
+function condenseContent(content: string): { text: string; hasCodeBlock: boolean } {
+  const fenceIndex = content.indexOf('```');
+  if (fenceIndex === -1 || content.length < 500) {
+    return { text: content, hasCodeBlock: false };
+  }
+
+  // Extract text before the first code fence
+  let summary = content.slice(0, fenceIndex).trim();
+
+  // Strip markdown formatting: **bold**, ### headings
+  summary = summary.replace(/\*\*(.*?)\*\*/g, '$1');
+  summary = summary.replace(/^#{1,6}\s+/gm, '');
+
+  // If there's meaningful text after the last code fence, append it
+  const lastFenceEnd = content.lastIndexOf('```');
+  if (lastFenceEnd > fenceIndex) {
+    const afterCode = content.slice(lastFenceEnd + 3).trim();
+    // Only append if it's not too long and adds value
+    if (afterCode.length > 0 && afterCode.length < 500) {
+      const cleaned = afterCode.replace(/\*\*(.*?)\*\*/g, '$1').replace(/^#{1,6}\s+/gm, '');
+      if (cleaned.length > 0) {
+        summary = summary + '\n\n' + cleaned;
+      }
+    }
+  }
+
+  return { text: summary || 'Artifact generated.', hasCodeBlock: true };
+}
+
 const TOOL_DISPLAY_NAMES: Record<string, string> = {
   profile_table: 'Analyzing data patterns',
   query_information_schema: 'Reading data structure',
@@ -67,9 +113,23 @@ function AgentMessage({
   }
 
   // Extract text from content (defensive handling for structured content)
-  const contentText = typeof message.content === 'string'
+  const rawText = typeof message.content === 'string'
     ? message.content
     : (message.content as {text?: string})?.text ?? JSON.stringify(message.content);
+
+  // Condense messages with large code blocks (e.g. YAML dumps)
+  const { text: contentText, hasCodeBlock } = condenseContent(rawText);
+
+  // If a code block was stripped and the message has save_semantic_view tool call,
+  // ensure a yaml artifact card is shown
+  if (hasCodeBlock && inlineArtifacts.every((a) => a.type !== 'yaml')) {
+    const hasYamlTool = message.toolCalls?.some(
+      (tc) => tc.name === 'save_semantic_view' || tc.name === 'create_semantic_view',
+    );
+    if (hasYamlTool) {
+      inlineArtifacts.push({ type: 'yaml', title: 'Semantic View YAML' });
+    }
+  }
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', maxWidth: '75%' }}>
@@ -243,7 +303,7 @@ export function MessageThread({
         </Box>
       )}
 
-      {messages.map((message) => (
+      {messages.filter((m) => !isHiddenMessage(m)).map((message) => (
         <MessageBubble
           key={message.id}
           message={message}

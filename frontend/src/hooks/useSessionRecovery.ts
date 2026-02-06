@@ -85,18 +85,20 @@ function useSessionRecovery(dataProduct: DataProduct | undefined): UseSessionRec
         console.log('[useSessionRecovery] Got history with', historyMessages?.length ?? 0, 'messages');
 
         if (historyMessages && historyMessages.length > 0) {
-          // Transform backend messages to ChatMessage format
-          const chatMessages: ChatMessage[] = historyMessages.map((msg, idx) => ({
-            id: `recovered-${idx}-${Date.now()}`,
-            role: msg.role,
-            content: msg.content,
-            timestamp: msg.timestamp ?? new Date().toISOString(),
-            toolCalls: msg.tool_calls?.map((tc) => ({
-              name: tc.name,
-              input: tc.input,
-              result: tc.result,
-            })),
-          }));
+          // Transform backend messages to ChatMessage format, filtering internal context
+          const chatMessages: ChatMessage[] = historyMessages
+            .filter((msg) => !msg.content.includes('[INTERNAL CONTEXT'))
+            .map((msg, idx) => ({
+              id: `recovered-${idx}-${Date.now()}`,
+              role: msg.role,
+              content: msg.content,
+              timestamp: msg.timestamp ?? new Date().toISOString(),
+              toolCalls: msg.tool_calls?.map((tc) => ({
+                name: tc.name,
+                input: tc.input,
+                result: tc.result,
+              })),
+            }));
 
           // Determine phase from response or data product
           const phase = (response.phase ?? dataProduct?.state?.current_phase ?? 'idle') as AgentPhase;
