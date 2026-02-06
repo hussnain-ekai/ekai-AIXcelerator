@@ -3,6 +3,7 @@
 # ===========================
 .env
 .env.*
+!.env.example
 .env.local
 .env.development
 .env.production
@@ -59,11 +60,22 @@ coverage/
 *.jpeg
 !images/**
 images/gemini-key.json
+images/gcp-credentials.json
 
 # ===========================
 # Docker
 # ===========================
 docker-compose.override.yml
+
+# ===========================
+# v0 prototype backup
+# ===========================
+v0/
+
+# ===========================
+# Temporary files
+# ===========================
+tmp/
 
 # ===========================
 # Misc

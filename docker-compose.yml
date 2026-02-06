@@ -1,0 +1,101 @@
+# ekaiX AIXcelerator — Data Services
+# Start: docker-compose up -d
+# Stop:  docker-compose down
+#
+# IMPORTANT: Environment variables are loaded from the ROOT .env file.
+# Docker Compose automatically reads .env from the same directory as this file.
+
+services:
+  postgresql:
+    image: postgres:18
+    container_name: ekaix-postgresql
+    environment:
+      POSTGRES_DB: ekaix
+      POSTGRES_USER: ekaix
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ekaix_dev_password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./docs/plans/postgresql-schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ekaix -d ekaix"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - ekaix-net
+
+  neo4j:
+    image: neo4j:2025-community
+    container_name: ekaix-neo4j
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-ekaix_dev_password}
+      NEO4J_PLUGINS: '["apoc"]'
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4jdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p ${NEO4J_PASSWORD:-ekaix_dev_password} 'RETURN 1' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - ekaix-net
+
+  redis:
+    image: redis:8
+    container_name: ekaix-redis
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:-ekaix_dev_password}
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-ekaix_dev_password}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - ekaix-net
+
+  minio:
+    image: minio/minio:latest
+    container_name: ekaix-minio
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-ekaix}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-ekaix_dev_password}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - ekaix-net
+
+volumes:
+  pgdata:
+  neo4jdata:
+  redisdata:
+  miniodata:
+
+networks:
+  ekaix-net:
+    driver: bridge

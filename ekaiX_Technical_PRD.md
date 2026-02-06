@@ -786,6 +786,64 @@ Bias: Prefer false positives (show uncertain relationships). Users correct visib
 Always cite your reasoning: "Based on 99.2% uniqueness and '_id' suffix, this appears to be a primary key."
 ```
 
+#### Discovery Agent Communication Guidelines (CRITICAL)
+
+**The user is a business analyst, NOT a data engineer.** Every message the Discovery Agent produces must be written for someone who understands their business domain deeply but does not know SQL, database internals, or data engineering terminology.
+
+**Forbidden in agent output:**
+- UUIDs, data product IDs, or internal identifiers
+- Database technology names (Neo4j, Redis, MinIO, PostgreSQL)
+- SQL keywords or syntax (VARCHAR, TABLESAMPLE, COUNT DISTINCT, INFORMATION_SCHEMA)
+- Internal tool names (upload_artifact, save_quality_report, update_erd)
+- Implementation details ("persisted to Neo4j", "sampled using BERNOULLI")
+- Raw profiling metrics without business context (null_pct, uniqueness_pct)
+- PK/FK jargon — say "unique identifier" or "linking column"
+
+**Required communication pattern: [Analysis] → [Recognition] → [Question] → [Suggestion]**
+
+The agent must NOT silently run all tools and dump a summary. It must engage the user conversationally between analysis steps to build a shared understanding of the business domain (Conceptual Data Model per DAMA CDM framework).
+
+**Example of GOOD discovery output:**
+```
+I've analyzed your 23 customer data tables. Here's what I found:
+
+Your data looks healthy (90/100). I found a central Customer table connected
+to invoices, orders, and segments — a clean star pattern that's great for
+analytics.
+
+I noticed you have ORDERS, ORDER_DETAILS, and PRODUCTS tables with price
+fields in multiple locations. This typically represents either a retail
+transaction system or a B2B order management workflow.
+
+Which of these better describes your business?
+• Retail/E-commerce (customer-facing orders)
+• B2B Sales (orders between business entities)
+• Internal procurement (company purchasing)
+
+Based on the presence of SHIPPERS and FREIGHT columns, I'm leaning toward
+B2B logistics.
+```
+
+**Example of BAD discovery output (what we must avoid):**
+```
+Discovery phase complete for Data Product ID `019c2fe4-5e5a-754b-8449-a260a01eb124`.
+Tables Profiled: 23 (All views)
+Relationships Detected: 21 inferred relationships based on metadata.
+Overall Data Health Score: 25/100
+ERD Status: Built and persisted to Neo4j.
+Critical Data Quality Warnings:
+- Profiling Limitations: TABLESAMPLE returned 100% NULLs
+- Numeric/Date as VARCHAR: 15 columns in COERCE_ tables
+```
+
+**Question strategy rules:**
+1. **Sharp, business-focused questions** — NO generic "What is this table?" fluff
+2. **Extract semantic meaning from column names FIRST** — use statistics only as fallback
+3. **DAMA CDM approach** — questions build the Conceptual Data Model (business entities and relationships), not technical schema documentation
+4. **Never ignore user instructions** — if user says "this is a supply chain system," build on that context, never question it
+5. **Progressive disclosure** — don't dump all findings at once; reveal in digestible steps
+6. **Translate ALL technical findings** into business impact (e.g., "some date fields are stored as text, which may cause sorting issues in reports")
+
 **Requirements Agent:**
 
 ```

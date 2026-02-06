@@ -8,7 +8,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ekaiX enables business users to create semantic models and Cortex Agents through AI conversation. It runs entirely within a customer's Snowflake account via SPCS (Snowpark Container Services). Users interact with an AI agent to discover gold layer databases, capture business requirements, generate semantic view YAML, and publish Cortex Agents to Snowflake Intelligence.
 
-**Status:** Pre-development. The `ekaiX_Technical_PRD.md` file (2381 lines) contains the complete technical specification and is the authoritative source for all requirements. The `docs/plans/2026-02-04-ui-ux-design-spec.md` contains the validated UI/UX design spec (every screen, component, interaction, and state) — always reference it when building frontend.
+**Status:** Pre-development. Key design documents:
+
+- `ekaiX_Technical_PRD.md` — Complete technical specification (2381 lines). Authoritative source for all requirements.
+- `docs/plans/2026-02-04-ui-ux-design-spec.md` — Validated UI/UX design spec (every screen, component, interaction, and state). Always reference when building frontend.
+- `docs/plans/tech-stack-research.md` — Verified 2026 package versions, breaking changes, install commands, and decision log for all dependencies.
+- `docs/plans/postgresql-schema.sql` — Complete PostgreSQL 18 schema (9 tables, indexes, RLS policies, triggers, partitioning). Run directly to initialize the database.
+- `docs/plans/api-specification.yaml` — OpenAPI 3.1 spec (30+ endpoints, full request/response schemas, SSE streaming, error codes). Use as the contract between frontend and backend.
 
 ## Design System (ekai Brand)
 
@@ -81,7 +87,7 @@ All services deploy as containers in SPCS. Locally, the three app services run n
 ### Snowflake Integration
 
 - Stored procedures use Python with `EXECUTE AS CALLER` for RCR
-- Cortex AI (Claude Sonnet 4) is the primary LLM via `SNOWFLAKE.CORTEX.COMPLETE`
+- LLM provider is configurable via UI (`/llm-configuration`). Supported: Vertex AI, Snowflake Cortex, Azure OpenAI, Anthropic, OpenAI
 - Semantic views follow Snowflake's YAML specification (tables, measures, dimensions, time_dimensions, joins, filters)
 - Published Cortex Agents are accessible via Snowflake Intelligence
 
@@ -137,10 +143,15 @@ black . && isort .                        # Formatting
 ```
 
 ### E2E Tests
-```bash
-npx playwright test                       # All E2E tests
-npx playwright test tests/discovery.spec.ts  # Single spec
-```
+**Playwright MCP is available** — use Playwright MCP tools for browser testing instead of installing Playwright manually.
+
+Available MCP tools:
+- `mcp__plugin_playwright_playwright__browser_navigate` — Navigate to URL
+- `mcp__plugin_playwright_playwright__browser_snapshot` — Capture accessibility snapshot
+- `mcp__plugin_playwright_playwright__browser_click` — Click elements
+- `mcp__plugin_playwright_playwright__browser_type` — Type text
+- `mcp__plugin_playwright_playwright__browser_take_screenshot` — Take screenshots
+- Full suite of interaction tools for testing
 
 ## Implementation Phases
 
@@ -164,6 +175,20 @@ The PRD defines 11 build phases. Follow them in order:
 2. **All Python work must use a virtual environment (venv).** Always create/activate a venv before installing packages or running Python code. Never install Python packages globally.
 3. **Use PM2 for process management.** All services (frontend, backend, AI service) must be managed via PM2 in local development. Use an `ecosystem.config.js` at the project root to define all processes. Start/stop/monitor services through PM2 commands.
 4. **Keep the root folder clean.** The repository root must only contain project configuration files (`CLAUDE.md`, `ekaiX_Technical_PRD.md`, `package.json`, `ecosystem.config.js`, `docker-compose.yml`, `.gitignore`, etc.) and service directories (`frontend/`, `backend/`, `ai-service/`). Never dump screenshots, temporary files, logs, or build artifacts in the root. Playwright screenshots must be saved to the scratchpad directory or a dedicated `tmp/` folder outside the repo. Reference images belong in `images/` only.
+5. **No synthetic or mock data.** Never use hardcoded, simulated, or synthetic data in any service. All data must come from real Snowflake queries using the actual Snowflake account. Mock data endpoints are not acceptable — always connect to Snowflake and query real databases, schemas, and tables via the Snowflake SDK. Snowflake credentials are stored in `sf.txt` (never committed) and loaded via environment variables.
+6. **Single `.env` file in repository root.** All environment variables MUST be defined in a single `.env` file located in the repository root. Do NOT create separate `.env` files in `frontend/`, `backend/`, or `ai-service/` directories. Each service is configured to load from the root `.env` file. This ensures consistent configuration across all services and prevents credential duplication.
+7. **No hardcoded configuration in code.** Never hardcode URLs, ports, credentials, API keys, file paths, or any configuration values in source code. All configuration must come from environment variables defined in the root `.env` file. Default values in code are acceptable ONLY as fallbacks for development convenience, and must be overridable via environment variables.
+
+## Snowflake Connection (Local Dev)
+
+For local development, connect to the real Snowflake account. Credentials are in `sf.txt`:
+- **Account:** `lqb12348.us-east-1`
+- **User:** `EKAIBA`
+- **Warehouse:** `COMPUTE_WH`
+- **Role:** `ACCOUNTADMIN`
+- **Password:** Loaded from `sf.txt` or `SNOWFLAKE_PASSWORD` env var
+
+The backend must use the `snowflake-sdk` package to execute real queries against Snowflake. The databases, schemas, and tables endpoints must return actual data from `SHOW DATABASES`, `INFORMATION_SCHEMA.SCHEMATA`, etc. — never hardcoded lists.
 
 ## Critical Implementation Notes
 
@@ -175,17 +200,89 @@ The PRD defines 11 build phases. Follow them in order:
 
 ## Environment Variables
 
-Three `.env` files are needed (see PRD section "Environment Variables" for full list):
+A single `.env` file in the repository root contains ALL configuration for every service. Never create separate `.env` files in subdirectories.
 
-- `frontend/.env.local` — API URLs (`NEXT_PUBLIC_API_URL`, `NEXT_PUBLIC_WS_URL`)
-- `backend/.env` — Database URLs, Snowflake credentials, FastAPI URL
-- `ai-service/.env` — Database URLs, Snowflake credentials, LLM API keys, LangSmith config
+**File location:** `/.env` (repository root)
+
+### Service Ports
+- `FRONTEND_PORT` — Next.js port (default: 3000)
+- `BACKEND_PORT` — Node.js API port (default: 8000)
+- `AI_SERVICE_PORT` — FastAPI AI service port (default: 8001)
+
+### Environment
+- `NODE_ENV` — development | production | test
+
+### CORS
+- `ALLOWED_CORS_ORIGINS` — Comma-separated list of allowed origins
+
+### Frontend URLs
+- `NEXT_PUBLIC_API_URL` — Backend API URL (exposed to browser)
+- `NEXT_PUBLIC_WS_URL` — WebSocket URL (exposed to browser)
+
+### Internal Service URLs
+- `AI_SERVICE_URL` — AI service URL for backend-to-AI-service communication
+
+### PostgreSQL
+- `DATABASE_URL` — Full connection string
+- `POSTGRES_PASSWORD` — Password for Docker Compose
+
+### Neo4j
+- `NEO4J_URI` — Bolt protocol URI
+- `NEO4J_USER` — Username
+- `NEO4J_PASSWORD` — Password
+
+### Redis
+- `REDIS_URL` — Full connection string with password
+- `REDIS_PASSWORD` — Password for Docker Compose
+
+### MinIO
+- `MINIO_ENDPOINT` — Hostname
+- `MINIO_PORT` — Port (default: 9000)
+- `MINIO_ACCESS_KEY` — Access key
+- `MINIO_SECRET_KEY` — Secret key
+- `MINIO_USE_SSL` — true | false
+- `MINIO_ROOT_USER` — Root user for Docker Compose
+- `MINIO_ROOT_PASSWORD` — Root password for Docker Compose
+
+### Snowflake
+- `SNOWFLAKE_ACCOUNT` — Account identifier (e.g., `lqb12348.us-east-1`)
+- `SNOWFLAKE_USER` — Username
+- `SNOWFLAKE_PASSWORD` — Password/token (load from `sf.txt`, not hardcoded)
+- `SNOWFLAKE_WAREHOUSE` — Warehouse name
+- `SNOWFLAKE_DATABASE` — Default database (optional)
+- `SNOWFLAKE_ROLE` — Role to assume
+
+### LLM Provider (UI-Only Configuration)
+LLM provider and model selection is configured exclusively via the UI at `/llm-configuration`. These settings are stored in PostgreSQL and restored on service startup. **Do NOT add LLM configuration to .env files.**
+
+For Vertex AI: Set `GOOGLE_APPLICATION_CREDENTIALS` in your shell profile (not .env) pointing to your service account JSON file.
+
+### Langfuse (Tracing)
+- `LANGFUSE_SECRET_KEY` — Secret key
+- `LANGFUSE_PUBLIC_KEY` — Public key
+- `LANGFUSE_BASE_URL` — Base URL
+
+### LangChain/LangSmith (Optional)
+- `LANGCHAIN_TRACING_V2` — true | false
+- `LANGCHAIN_API_KEY` — API key
+- `LANGCHAIN_PROJECT` — Project name
+
+### Connection Tuning (Optional)
+- `PG_IDLE_TIMEOUT_MS` — PostgreSQL idle timeout
+- `NEXT_PUBLIC_SSE_MAX_RETRIES` — SSE retry attempts (frontend, requires NEXT_PUBLIC_ prefix)
+- `NEXT_PUBLIC_SSE_BASE_DELAY_MS` — SSE retry base delay (frontend, requires NEXT_PUBLIC_ prefix)
+- `LLM_MAX_TOKENS` — Default max tokens for LLM calls
+- `LLM_TEMPERATURE` — Default temperature for LLM calls
+- `AGENT_RECURSION_LIMIT` — Max recursion depth for agent execution
+- `SESSION_TTL_SECONDS` — Redis session TTL
+- `CACHE_TTL_SECONDS` — Redis cache TTL
 
 ## Sensitive Files (DO NOT COMMIT)
 
+- `.env` — Root environment file (contains all credentials)
 - `images/gemini-key.json` — GCP credentials
+- `images/gcp-credentials.json` — GCP service account
 - `sf.txt` — Snowflake account credentials
-- Any `.env` files
 
 ## SPCS Packaging Structure
 
@@ -231,6 +328,20 @@ The orchestrator delegates to subagents based on conversation phase:
 Tools are organized by data store (Snowflake, Neo4j, PostgreSQL, MinIO) and integrated via LangChain. MCP servers provide external system access (Google Drive, Confluence, Slack, SharePoint).
 
 Backend uses CompositeBackend: Redis (active state) + PostgreSQL (persistence) + MinIO (artifacts) + Neo4j (graph).
+
+## Agent Communication Guidelines (CRITICAL — Read Before Touching Any Prompt)
+
+**The ICP is a business analyst, NOT a data engineer.** All agent output — especially the Discovery Agent — must be written for someone who understands their business domain but does NOT know SQL, database internals, or data engineering.
+
+**Never show in agent chat:** UUIDs, tool names, SQL keywords (VARCHAR, TABLESAMPLE), database technology names (Neo4j, Redis), implementation details ("persisted to...", "sampled using..."), or raw profiling jargon (null_pct, PK/FK).
+
+**Discovery Agent must use the [Analysis] → [Recognition] → [Question] → [Suggestion] pattern:**
+- Analyze column/table names for semantic meaning FIRST (not just statistics)
+- Recognize the business domain pattern
+- Ask sharp, business-focused questions (NOT "What is this table?")
+- Suggest an answer based on the data
+
+**Discovery is CONVERSATIONAL, not a silent batch job.** The agent must engage the user between analysis steps to build shared understanding of the business domain (DAMA CDM: Conceptual → Logical → Physical). See PRD section "Discovery Agent Communication Guidelines" for full spec with good/bad examples.
 
 ## Requirements Beyond the PRD
 

@@ -1,0 +1,42 @@
+{
+  "name": "ekaix-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --port 3000",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "test": "vitest"
+  },
+  "dependencies": {
+    "@dagrejs/dagre": "^2.0.3",
+    "@dagrejs/graphlib": "^3.0.2",
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.0",
+    "@mui/icons-material": "^7.3.7",
+    "@mui/material": "^7.3.7",
+    "@mui/material-nextjs": "^7.3.7",
+    "@tanstack/react-query": "^5.90.20",
+    "@xyflow/react": "^12.0.0",
+    "dotenv": "^17.2.3",
+    "next": "^15.3.3",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "react-syntax-highlighter": "^15.6.0",
+    "recharts": "^2.15.0",
+    "zustand": "^5.0.5"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.1",
+    "@types/dagre": "^0.7.53",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@types/react-syntax-highlighter": "^15.5.0",
+    "eslint": "^9.0.0",
+    "eslint-config-next": "^15.3.3",
+    "typescript": "^5.8.3",
+    "vitest": "^3.0.0"
+  }
+}
