@@ -2,6 +2,7 @@ import { useQuery } from '@tanstack/react-query';
 import { api } from '@/lib/api';
 import type { ERDNode, ERDEdge } from '@/components/panels/ERDDiagramPanel';
 import type { QualityReport } from '@/components/panels/DataQualityReport';
+import type { BRDResponse } from '@/components/panels/BRDViewer';
 
 interface Artifact {
   id: string;
@@ -61,5 +62,14 @@ function useYAMLContent(dataProductId: string | null, enabled = false) {
   });
 }
 
-export { useArtifacts, useERDData, useQualityReport, useYAMLContent };
+function useBRD(dataProductId: string | null, enabled = false) {
+  return useQuery<BRDResponse>({
+    queryKey: ['artifacts', 'brd', dataProductId],
+    queryFn: () =>
+      api.get<BRDResponse>(`/artifacts/${dataProductId}/brd`),
+    enabled: enabled && dataProductId !== null && dataProductId.length > 0,
+  });
+}
+
+export { useArtifacts, useERDData, useQualityReport, useYAMLContent, useBRD };
 export type { Artifact, ArtifactsResponse, ERDResponse };

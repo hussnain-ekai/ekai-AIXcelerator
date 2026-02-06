@@ -93,15 +93,19 @@ async def save_brd(
     pool = await _get_pool()
     brd_id = str(uuid4())
 
+    # LLM may send raw text or malformed JSON — normalize to valid JSON string
+    try:
+        parsed = json.loads(brd_json)
+    except (json.JSONDecodeError, TypeError):
+        # Wrap raw BRD text in a JSON object
+        parsed = {"document": brd_json}
+    clean_json = json.dumps(parsed)
+
     sql = """
-    INSERT INTO business_requirements (id, data_product_id, content, created_by, created_at)
+    INSERT INTO business_requirements (id, data_product_id, brd_json, created_by, created_at)
     VALUES ($1::uuid, $2::uuid, $3::jsonb, $4, NOW())
-    ON CONFLICT (data_product_id) DO UPDATE
-    SET content = EXCLUDED.content,
-        created_by = EXCLUDED.created_by,
-        created_at = NOW()
     """
-    await pg_service.execute(pool, sql, brd_id, data_product_id, brd_json, created_by)
+    await pg_service.execute(pool, sql, brd_id, data_product_id, clean_json, created_by)
 
     return json.dumps({"status": "ok", "brd_id": brd_id})
 
@@ -127,10 +131,6 @@ async def save_semantic_view(
     sql = """
     INSERT INTO semantic_views (id, data_product_id, yaml_content, created_by, created_at)
     VALUES ($1::uuid, $2::uuid, $3, $4, NOW())
-    ON CONFLICT (data_product_id) DO UPDATE
-    SET yaml_content = EXCLUDED.yaml_content,
-        created_by = EXCLUDED.created_by,
-        created_at = NOW()
     """
     await pg_service.execute(pool, sql, sv_id, data_product_id, yaml_content, created_by)
 

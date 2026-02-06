@@ -832,7 +832,7 @@ async def _step_artifacts(
                     "type": "artifact",
                     "data": {
                         "artifact_id": qr_artifact_id,
-                        "artifact_type": "quality_report",
+                        "artifact_type": "data_quality",
                     },
                 })
 

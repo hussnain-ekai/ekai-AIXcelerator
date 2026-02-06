@@ -139,9 +139,14 @@ export const useChatStore = create<ChatState>()((set) => ({
     set({ sessionId }),
 
   addArtifact: (artifact: ChatArtifact) =>
-    set((state) => ({
-      artifacts: [...state.artifacts, artifact],
-    })),
+    set((state) => {
+      // Deduplicate: skip if same id or same type already exists
+      const exists = state.artifacts.some(
+        (a) => a.id === artifact.id || a.type === artifact.type,
+      );
+      if (exists) return state;
+      return { artifacts: [...state.artifacts, artifact] };
+    }),
 
   setActivePanel: (panel: ArtifactType | null) =>
     set({ activePanel: panel }),
@@ -152,6 +157,7 @@ export const useChatStore = create<ChatState>()((set) => ({
   clearMessages: () =>
     set({
       messages: [],
+      artifacts: [],
       currentPhase: 'idle',
       sessionId: null,
       isHydrated: false,

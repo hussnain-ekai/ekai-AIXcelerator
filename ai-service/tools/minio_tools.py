@@ -38,6 +38,51 @@ def _get_client() -> minio_service.Minio:
     return minio_service._client
 
 
+async def upload_artifact_programmatic(
+    data_product_id: str,
+    artifact_type: str,
+    filename: str,
+    content: str,
+) -> dict:
+    """Upload an artifact without going through LangChain tool decorator.
+
+    Used by the safety net in agent.py when the LLM fails to call tools.
+    """
+    client = _get_client()
+    content_type = CONTENT_TYPES.get(artifact_type, "application/octet-stream")
+    content_bytes = content.encode("utf-8")
+    artifact_id = str(uuid4())
+    version = 1
+
+    try:
+        pool = pg_service._pool
+        if pool is not None:
+            sql = """
+            INSERT INTO artifacts (id, data_product_id, artifact_type, minio_path, filename, file_size_bytes, content_type, created_by)
+            VALUES ($1::uuid, $2::uuid, $3::artifact_type, $4, $5, $6, $7, $8)
+            RETURNING version
+            """
+            placeholder_path = f"{data_product_id}/{artifact_type}/{filename}"
+            rows = await pg_service.query(
+                pool, sql,
+                artifact_id, data_product_id, artifact_type,
+                placeholder_path, filename, len(content_bytes), content_type, "agent",
+            )
+            if rows and len(rows) > 0:
+                version = rows[0]["version"] if "version" in rows[0].keys() else 1
+            final_path = f"{data_product_id}/{artifact_type}/v{version}/{filename}"
+            await pg_service.execute(pool, "UPDATE artifacts SET minio_path = $1 WHERE id = $2::uuid", final_path, artifact_id)
+            logger.info("Artifact persisted to PostgreSQL: %s/%s v%d", data_product_id, artifact_type, version)
+    except Exception as e:
+        logger.warning("Failed to persist artifact to PostgreSQL: %s", e)
+        version = 1
+
+    final_path = f"{data_product_id}/{artifact_type}/v{version}/{filename}"
+    minio_service.ensure_bucket(client, _get_artifacts_bucket())
+    minio_service.upload_file(client, _get_artifacts_bucket(), final_path, content_bytes, content_type=content_type)
+    return {"status": "ok", "artifact_id": artifact_id, "version": version}
+
+
 @tool
 async def upload_artifact(
     data_product_id: str,

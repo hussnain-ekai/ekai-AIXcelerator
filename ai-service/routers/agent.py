@@ -94,36 +94,137 @@ async def _get_data_product_info(data_product_id: str) -> dict | None:
     }
 
 
+def _simplify_type(data_type: str) -> str:
+    """Simplify Snowflake data type to business-friendly category."""
+    dt = data_type.upper().strip()
+    if dt in ("NUMBER", "FLOAT", "DECIMAL", "INTEGER", "INT", "BIGINT",
+              "SMALLINT", "TINYINT", "DOUBLE", "REAL", "NUMERIC"):
+        return "numeric"
+    if dt in ("VARCHAR", "TEXT", "STRING", "CHAR", "NCHAR", "NVARCHAR",
+              "CLOB", "NCLOB"):
+        return "text"
+    if dt in ("TIMESTAMP_NTZ", "TIMESTAMP_LTZ", "TIMESTAMP_TZ",
+              "TIMESTAMP", "DATE", "DATETIME", "TIME"):
+        return "date/time"
+    if dt == "BOOLEAN":
+        return "boolean"
+    if dt in ("VARIANT", "OBJECT", "ARRAY"):
+        return "structured"
+    return "text"
+
+
+def _suggest_field_role(col_name: str, simplified_type: str,
+                        is_pk: bool, distinct_count: int | None,
+                        null_pct: float | None) -> str:
+    """Suggest the analytical role of a field based on name and type."""
+    name_lower = col_name.lower()
+
+    # ID fields
+    if is_pk or name_lower.endswith("_id") or name_lower.endswith("_key") or name_lower == "id":
+        return "identifier"
+
+    # Date/time → time dimension
+    if simplified_type == "date/time":
+        return "potential time dimension"
+
+    # Numeric fields (not IDs) → potential measure
+    if simplified_type == "numeric":
+        # Skip fields that look like codes or counts of categories
+        if any(kw in name_lower for kw in ("code", "zip", "postal", "phone")):
+            return "potential dimension"
+        return "potential measure"
+
+    # Text fields with low cardinality → potential dimension
+    if simplified_type == "text" and distinct_count is not None:
+        if distinct_count <= 100:
+            return "potential dimension"
+        if distinct_count <= 500:
+            return "potential dimension (many values)"
+
+    # Boolean → potential filter/dimension
+    if simplified_type == "boolean":
+        return "potential dimension"
+
+    # Descriptive text fields
+    if any(kw in name_lower for kw in ("description", "comment", "note",
+                                        "text", "body", "message", "remark")):
+        return "descriptive"
+
+    return ""
+
+
 def _build_discovery_summary(
     pipeline_results: dict,
     dp_name: str,
     data_product_id: str,
+    dp_description: str = "",
 ) -> str:
     """Convert pipeline results into a structured summary for the LLM.
 
-    The summary uses business language and avoids UUIDs, FQNs, and SQL.
-    Technical details are in the pipeline results (used for artifacts only).
+    Includes per-table field analysis with suggested roles (potential measure,
+    dimension, time dimension) so the LLM can propose specific analytics.
     """
     metadata = pipeline_results.get("metadata", [])
+    profiles = pipeline_results.get("profiles", [])
     classifications = pipeline_results.get("classifications", {})
     relationships = pipeline_results.get("relationships", [])
     quality = pipeline_results.get("quality", {})
 
-    # Build table summaries with business names
-    table_lines = []
+    # Build profile lookup: fqn -> {column -> profile_data}
+    profile_lookup: dict[str, dict[str, dict]] = {}
+    for p in profiles:
+        table_fqn = p.get("table", "")
+        col_map: dict[str, dict] = {}
+        for col in p.get("columns", []):
+            col_map[col.get("column", "")] = col
+        profile_lookup[table_fqn] = col_map
+
+    # Build table detail sections (tables + field analysis)
+    table_sections = []
     for table in metadata:
         fqn = table["fqn"]
         name = table["name"]
         classification = classifications.get(fqn, "UNKNOWN")
         biz_type = "transaction data" if classification == "FACT" else "reference data"
-        col_count = len(table.get("columns", []))
         row_count = table.get("row_count")
         row_str = f", ~{row_count:,} records" if row_count else ""
-        table_lines.append(f"  - {name} ({biz_type}, {col_count} fields{row_str})")
 
-    # Build relationship summaries in plain language
+        # Get profile data for this table
+        col_profiles = profile_lookup.get(fqn, {})
+
+        # Build field analysis lines
+        field_lines = []
+        for col in table.get("columns", []):
+            col_name = col["name"]
+            raw_type = col.get("data_type", "")
+            simple_type = _simplify_type(raw_type)
+
+            # Get profiling info
+            prof = col_profiles.get(col_name, {})
+            is_pk = prof.get("is_likely_pk", False)
+            distinct = prof.get("distinct_count")
+            null_pct = prof.get("null_pct")
+
+            role = _suggest_field_role(col_name, simple_type, is_pk, distinct, null_pct)
+
+            # Build description parts
+            parts = [simple_type]
+            if is_pk:
+                parts.append("unique identifier")
+            if distinct is not None and simple_type == "text" and distinct <= 100:
+                parts.append(f"{distinct} values")
+            if null_pct is not None and null_pct > 5:
+                parts.append(f"{100 - null_pct:.0f}% complete")
+            if role and role not in ("identifier", "descriptive", ""):
+                parts.append(role)
+
+            field_lines.append(f"    - {col_name} ({', '.join(parts)})")
+
+        section = f"  {name} ({biz_type}{row_str})\n" + "\n".join(field_lines)
+        table_sections.append(section)
+
+    # Build relationship summaries
     rel_lines = []
-    # Build a lookup of fqn -> short name
     name_map = {t["fqn"]: t["name"] for t in metadata}
     for rel in relationships:
         src = name_map.get(rel["from_table"], rel["from_table"].split(".")[-1])
@@ -143,26 +244,36 @@ def _build_discovery_summary(
         issue_lines = [f"  - {i['message']}" for i in top_issues]
         issue_summary = "\nNotable issues:\n" + "\n".join(issue_lines)
 
-    # Fact vs dimension counts
+    # Counts
     fact_count = sum(1 for v in classifications.values() if v == "FACT")
     dim_count = sum(1 for v in classifications.values() if v == "DIMENSION")
+
+    # Description line
+    desc_line = f"\nUser's description: {dp_description}" if dp_description else ""
 
     summary = f"""[INTERNAL CONTEXT — NOT FOR USER DISPLAY]
 
 ═══════════════════════════════════════════════════════
 PRE-COMPUTED DISCOVERY RESULTS
 ═══════════════════════════════════════════════════════
-Data Product: {dp_name}
+Data Product: {dp_name}{desc_line}
 Data Product ID (for tool calls only): {data_product_id}
 Tables analyzed: {len(metadata)} ({fact_count} transaction, {dim_count} reference)
 
-Tables:
-{chr(10).join(table_lines)}
+═══════════════════════════════════════════════════════
+TABLE DETAILS & FIELD ANALYSIS
+═══════════════════════════════════════════════════════
+{chr(10).join(table_sections)}
 
-Connections found: {len(relationships)}
+═══════════════════════════════════════════════════════
+CONNECTIONS
+═══════════════════════════════════════════════════════
 {chr(10).join(rel_lines) if rel_lines else '  (none detected)'}
 
-Data Quality Score: {score}/100 (average completeness: {completeness:.0f}%)
+═══════════════════════════════════════════════════════
+DATA QUALITY
+═══════════════════════════════════════════════════════
+Score: {score}/100 (average completeness: {completeness:.0f}%)
 {issue_summary}
 
 ═══════════════════════════════════════════════════════
@@ -171,17 +282,23 @@ YOUR TASK
 All profiling, classification, relationship detection, data map construction,
 and quality checks are ALREADY DONE. Artifacts are ALREADY saved.
 
-Your ONLY job is to:
-1. Interpret these results in 3-5 natural sentences (like a colleague giving a quick update)
-2. Mention the quality score naturally
-3. Highlight one interesting finding or issue
-4. Ask ONE sharp business question about their domain
+Your job is to:
+1. Interpret these results in natural business language
+2. Recognize the business domain from table/field naming patterns
+3. Mention the quality score naturally
+4. Using the FIELD ANALYSIS above, PROPOSE 2-3 specific analytical questions or metrics
+   this data could support. Use fields tagged "potential measure" for metrics and
+   fields tagged "potential dimension" for grouping options.
+5. If the user's description above states their goal, tailor your suggestions to it.
+   Do NOT re-ask what they want to do — they already told you. Confirm understanding instead.
 
 RULES:
 - Do NOT call any tools — everything is already computed and saved
 - Do NOT repeat the data above verbatim — interpret it in business language
 - Refer to the data product as "{dp_name}"
 - Use table short names (e.g. "your Customers table") not FQNs
+- Your suggested metrics MUST reference actual field names from the analysis above
+  Use format: business name (FIELD_NAME) — e.g. "average reading value (VALUE)"
 - DATA ISOLATION: ONLY discuss the tables listed above. You know NOTHING about
   any other databases, schemas, or tables in this Snowflake account. They do not
   exist to you. NEVER mention or speculate about any other datasets.
@@ -203,6 +320,26 @@ async def _run_agent(
     # Track which LLM run_id is currently streaming to detect when a new
     # agent starts speaking (prevents concatenating subagent + orchestrator output)
     _current_run_id: str | None = None
+    # Deduplication: suppress orchestrator output after subagent has spoken
+    _previous_run_content: str = ""
+    _current_run_buffer: str = ""
+    _current_run_suppressed: bool = False
+    _DEDUP_CHARS: int = 80  # Characters to compare for deduplication
+    _subagent_completed: bool = False  # True after a `task` tool returns
+    # Safety net: track whether save_brd was called during this invocation
+    _brd_tool_called: bool = False
+    _brd_artifact_uploaded: bool = False
+    _requirements_phase_ran: bool = False
+    # Phase tracking: detect subagent transitions
+    _SUBAGENT_PHASE_MAP: dict[str, str] = {
+        "discovery-agent": "discovery",
+        "requirements-agent": "requirements",
+        "generation-agent": "generation",
+        "validation-agent": "validation",
+        "publishing-agent": "publishing",
+        "explorer-agent": "explorer",
+    }
+    _current_phase: str = "idle"
 
     try:
         from agents.orchestrator import get_orchestrator
@@ -212,6 +349,12 @@ async def _run_agent(
         actual_message = message
         if message.strip() == DISCOVERY_TRIGGER:
             logger.info("Discovery trigger detected for session %s, running pipeline...", session_id)
+            # Emit phase change to discovery
+            _current_phase = "discovery"
+            await queue.put({
+                "type": "phase_change",
+                "data": {"from": "idle", "to": "discovery"},
+            })
 
             # 1. Get data product details
             dp_info = await _get_data_product_info(data_product_id)
@@ -231,14 +374,40 @@ async def _run_agent(
                     queue=queue,
                 )
 
+                # 2b. Ensure artifact events are emitted (cache path skips step 7)
+                # Only emit if pipeline returned from cache (no artifact events were sent)
+                if pipeline_results.get("_cached_at"):
+                    cached_artifacts = pipeline_results.get("artifacts", {})
+                    if isinstance(cached_artifacts, dict):
+                        artifact_ids = cached_artifacts.get("artifact_ids", {})
+                        # Map storage types to frontend types
+                        _ART_TYPE_MAP = {"quality_report": "data_quality"}
+                        for art_type, art_id in artifact_ids.items():
+                            if art_id and art_type in ("erd", "quality_report"):
+                                await queue.put({
+                                    "type": "artifact",
+                                    "data": {
+                                        "artifact_id": art_id,
+                                        "artifact_type": _ART_TYPE_MAP.get(art_type, art_type),
+                                    },
+                                })
+
                 # 3. Build human-readable summary for the LLM
                 actual_message = _build_discovery_summary(
                     pipeline_results, dp_info["name"], data_product_id,
+                    dp_description=dp_info["description"],
                 )
                 logger.info("Pipeline complete, summary length: %d chars", len(actual_message))
 
-        # Add user message to collection (use original message for non-internal triggers)
-        if message.strip() != DISCOVERY_TRIGGER:
+        # Add user message to collection
+        if message.strip() == DISCOVERY_TRIGGER:
+            # Save the discovery context so subsequent calls see field analysis & data_product_id
+            collected_messages.append({
+                "role": "user",
+                "content": actual_message,
+                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+            })
+        else:
             collected_messages.append({
                 "role": "user",
                 "content": message,
@@ -272,7 +441,27 @@ async def _run_agent(
             "configurable": {"thread_id": session_id},
             "recursion_limit": _settings.agent_recursion_limit,  # Shared between orchestrator + subagents
         }
-        input_messages = {"messages": [HumanMessage(content=actual_message)]}
+
+        # Load previous conversation from Redis so subagents see full context
+        # (No checkpointer — each invocation starts fresh, so we replay history)
+        history_messages = []
+        try:
+            from services import redis as redis_service
+            client = await redis_service.get_client(settings.redis_url)
+            history_key = f"agent:history:{session_id}"
+            existing = await redis_service.get_json(client, history_key)
+            if existing:
+                for msg in existing.get("messages", []):
+                    role = msg.get("role", "")
+                    content = msg.get("content", "")
+                    if role == "user":
+                        history_messages.append(HumanMessage(content=content))
+                    elif role == "assistant":
+                        history_messages.append(AIMessage(content=content))
+        except Exception as e:
+            logger.warning("Failed to load history for session %s: %s", session_id, e)
+
+        input_messages = {"messages": history_messages + [HumanMessage(content=actual_message)]}
 
         # Stream events from the agent
         async for event in agent.astream_events(input_messages, config=config, version="v2"):
@@ -287,11 +476,23 @@ async def _run_agent(
                     # If a new LLM run starts, emit message_done to close previous bubble
                     if run_id and run_id != _current_run_id:
                         if _current_run_id is not None and current_assistant_content.strip():
+                            # Save content for deduplication before closing
+                            _previous_run_content = current_assistant_content.strip()
+                            # Persist this run's content as a separate message
+                            collected_messages.append({
+                                "role": "assistant",
+                                "content": current_assistant_content,
+                                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                            })
+                            current_assistant_content = ""  # Reset for new run
                             await queue.put({
                                 "type": "message_done",
                                 "data": {"content": ""},
                             })
                         _current_run_id = run_id
+                        _current_run_buffer = ""
+                        # If a subagent already completed, suppress orchestrator's follow-up
+                        _current_run_suppressed = _subagent_completed
 
                     # Extract text from structured content blocks if needed
                     content = chunk.content
@@ -304,7 +505,38 @@ async def _run_agent(
                     elif isinstance(content, dict):
                         content = content.get("text", str(content))
 
-                    # Collect content for message persistence
+                    # --- Deduplication: suppress orchestrator echoing subagent ---
+                    if _current_run_suppressed:
+                        # Already determined this run is a duplicate, skip
+                        continue
+
+                    if _previous_run_content and len(_previous_run_content) > _DEDUP_CHARS:
+                        _current_run_buffer += content
+                        if len(_current_run_buffer) >= _DEDUP_CHARS:
+                            # Compare first N chars to detect duplicate
+                            prev_snippet = _previous_run_content[:_DEDUP_CHARS]
+                            curr_snippet = _current_run_buffer.strip()[:_DEDUP_CHARS]
+                            if prev_snippet == curr_snippet:
+                                _current_run_suppressed = True
+                                logger.info(
+                                    "Suppressed duplicate orchestrator response for session %s",
+                                    session_id,
+                                )
+                                continue
+                            else:
+                                # Not a duplicate — flush buffer and continue
+                                current_assistant_content += _current_run_buffer
+                                await queue.put({
+                                    "type": "token",
+                                    "data": {"content": _current_run_buffer},
+                                })
+                                _previous_run_content = ""  # Stop dedup checks
+                                continue
+                        else:
+                            # Still buffering, don't emit yet
+                            continue
+
+                    # Normal path — emit token
                     current_assistant_content += content
 
                     await queue.put({
@@ -315,6 +547,42 @@ async def _run_agent(
             elif kind == "on_tool_start":
                 tool_name = event.get("name", "unknown")
                 tool_input = data.get("input", {})
+
+                # Track upload_artifact calls and emit artifact event from input
+                # (more reliable than parsing output — subagent tool output may not propagate cleanly)
+                if tool_name == "upload_artifact" and isinstance(tool_input, dict):
+                    art_type = tool_input.get("artifact_type", "")
+                    if art_type == "brd":
+                        _brd_artifact_uploaded = True
+                    if art_type:
+                        await queue.put({
+                            "type": "artifact",
+                            "data": {
+                                "artifact_id": str(uuid4()),
+                                "artifact_type": art_type,
+                            },
+                        })
+                        logger.info("Emitted artifact event from tool_start: type=%s", art_type)
+
+                # Detect subagent delegation via the `task` tool and emit phase_change
+                # Deep Agents uses a `task` tool with `subagent_type` parameter
+                if tool_name == "task" and isinstance(tool_input, dict):
+                    # Reset suppression flag — a new subagent is starting
+                    _subagent_completed = False
+                    _current_run_suppressed = False
+                    subagent_type = tool_input.get("subagent_type", "")
+                    phase_name = _SUBAGENT_PHASE_MAP.get(subagent_type)
+                    if phase_name == "requirements":
+                        _requirements_phase_ran = True
+                    if phase_name and phase_name != _current_phase:
+                        old_phase = _current_phase
+                        _current_phase = phase_name
+                        await queue.put({
+                            "type": "phase_change",
+                            "data": {"from": old_phase, "to": phase_name},
+                        })
+                        logger.info("Phase change: %s → %s (session %s)", old_phase, phase_name, session_id)
+
                 await queue.put({
                     "type": "tool_call",
                     "data": {
@@ -330,24 +598,38 @@ async def _run_agent(
                 truncate_len = _settings.tool_output_truncate_length
                 output_str = str(output)[:truncate_len] if output else ""
 
+                # Track save_brd completion for safety net
+                if tool_name == "save_brd":
+                    _brd_tool_called = True
+                    logger.info("save_brd completed for session %s", session_id)
+
+                # Mark when a subagent completes so we suppress orchestrator echo
+                if tool_name == "task":
+                    _subagent_completed = True
+                    logger.info("Subagent completed for session %s — will suppress orchestrator echo", session_id)
+
                 # Detect artifact creation and emit artifact event
                 if tool_name == "upload_artifact" and output_str:
+                    logger.info("upload_artifact output (type=%s): %s", type(output).__name__, output_str[:200])
                     try:
                         result = json.loads(output_str)
                         if result.get("status") == "ok":
                             path = result.get("path", "")
                             parts = path.split("/")
-                            # path format: {data_product_id}/{artifact_type}/{filename}
+                            # path format: {data_product_id}/{artifact_type}/v{version}/{filename}
                             if len(parts) >= 2:
                                 artifact_type = parts[1]
                                 await queue.put({
                                     "type": "artifact",
                                     "data": {
-                                        "artifact_id": str(uuid4()),
+                                        "artifact_id": result.get("artifact_id", str(uuid4())),
                                         "artifact_type": artifact_type,
                                     },
                                 })
-                    except (json.JSONDecodeError, IndexError):
+                                logger.info("Emitted artifact event: type=%s", artifact_type)
+                    except (json.JSONDecodeError, IndexError) as e:
+                        logger.warning("Failed to parse upload_artifact output: %s", e)
+                        # Fallback: check tool input for artifact_type
                         pass
 
                 await queue.put({
@@ -406,6 +688,11 @@ async def _run_agent(
         })
 
     finally:
+        # Flush any remaining dedup buffer content that wasn't emitted
+        if _current_run_buffer and not _current_run_suppressed:
+            current_assistant_content += _current_run_buffer
+            _current_run_buffer = ""
+
         # Add final assistant message to collection if we have content
         if current_assistant_content.strip():
             collected_messages.append({
@@ -413,6 +700,65 @@ async def _run_agent(
                 "content": current_assistant_content,
                 "timestamp": datetime.now(tz=timezone.utc).isoformat(),
             })
+
+        # --- Safety net: save BRD if requirements agent produced text but didn't call save_brd ---
+        if _requirements_phase_ran and not _brd_tool_called:
+            # Find the longest assistant message — likely the BRD
+            brd_content = ""
+            for msg in collected_messages:
+                if msg["role"] == "assistant" and len(msg["content"]) > len(brd_content):
+                    brd_content = msg["content"]
+            # Only save if it looks like a BRD (> 2000 chars AND contains BRD section markers)
+            _BRD_MARKERS = ("SECTION 1:", "EXECUTIVE SUMMARY", "METRICS AND CALCULATIONS",
+                            "DATA PRODUCT:", "---BEGIN BRD---", "SECTION 2:")
+            has_brd_markers = any(marker in brd_content for marker in _BRD_MARKERS)
+            if len(brd_content) > 2000 and has_brd_markers:
+                logger.warning(
+                    "Safety net: requirements agent did not call save_brd for session %s — saving programmatically",
+                    session_id,
+                )
+                try:
+                    from tools.postgres_tools import _get_pool
+                    from services import postgres as _pg_svc
+                    from uuid import uuid4 as _uuid4
+
+                    pool = await _get_pool()
+                    brd_id = str(_uuid4())
+                    clean_json = json.dumps({"document": brd_content})
+                    sql = """
+                    INSERT INTO business_requirements (id, data_product_id, brd_json, created_by, created_at)
+                    VALUES ($1::uuid, $2::uuid, $3::jsonb, $4, NOW())
+                    """
+                    await _pg_svc.execute(pool, sql, brd_id, data_product_id, clean_json, "ai-agent")
+                    logger.info("Safety net: BRD saved to PostgreSQL (brd_id=%s)", brd_id)
+                    _brd_tool_called = True
+
+                    # Also upload as artifact
+                    if not _brd_artifact_uploaded:
+                        from tools.minio_tools import upload_artifact_programmatic
+                        await upload_artifact_programmatic(
+                            data_product_id=data_product_id,
+                            artifact_type="brd",
+                            filename="business-requirements.md",
+                            content=brd_content,
+                        )
+                        logger.info("Safety net: BRD artifact uploaded for %s", data_product_id)
+                        # Emit artifact event so frontend shows the card
+                        await queue.put({
+                            "type": "artifact",
+                            "data": {
+                                "artifact_id": brd_id,
+                                "artifact_type": "brd",
+                            },
+                        })
+                except Exception as e:
+                    logger.error("Safety net: failed to save BRD: %s", e)
+            else:
+                logger.info(
+                    "Safety net: skipped — no BRD content detected (longest msg: %d chars, markers: %s)",
+                    len(brd_content),
+                    has_brd_markers,
+                )
 
         # Persist messages to Redis for session recovery
         if collected_messages:

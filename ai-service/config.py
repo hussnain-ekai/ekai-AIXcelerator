@@ -127,7 +127,7 @@ class Settings(BaseSettings):
 
     # --- LLM Configuration ---
     llm_temperature: float = 0.1
-    llm_max_tokens: int = 8000
+    llm_max_tokens: int = 64000
     llm_test_timeout: float = 15.0
     llm_test_max_tokens: int = 200
 

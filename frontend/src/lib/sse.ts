@@ -71,8 +71,8 @@ function dispatchEvent(event: SSEEvent, handlers: SSEHandlers): void {
       break;
     case 'phase_change':
       handlers.onPhaseChange(
-        (event.data.from_phase as string) ?? '',
-        (event.data.to_phase as string) ?? '',
+        (event.data.from as string) ?? (event.data.from_phase as string) ?? '',
+        (event.data.to as string) ?? (event.data.to_phase as string) ?? '',
       );
       break;
     case 'artifact':

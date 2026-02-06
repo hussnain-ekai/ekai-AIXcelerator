@@ -23,11 +23,12 @@ import type { Artifact as PanelArtifact } from '@/components/panels/ArtifactsPan
 import { ERDDiagramPanel } from '@/components/panels/ERDDiagramPanel';
 import { DataQualityReport } from '@/components/panels/DataQualityReport';
 import { YAMLViewer } from '@/components/panels/YAMLViewer';
+import { BRDViewer } from '@/components/panels/BRDViewer';
 import { DataPreview } from '@/components/panels/DataPreview';
 import { useDataProduct } from '@/hooks/useDataProducts';
 import { useAgent } from '@/hooks/useAgent';
 import { useSessionRecovery } from '@/hooks/useSessionRecovery';
-import { useArtifacts, useERDData, useQualityReport, useYAMLContent } from '@/hooks/useArtifacts';
+import { useArtifacts, useERDData, useQualityReport, useYAMLContent, useBRD } from '@/hooks/useArtifacts';
 import { useChatStore } from '@/stores/chatStore';
 import type { ArtifactType } from '@/stores/chatStore';
 
@@ -143,6 +144,7 @@ export default function ChatWorkspacePage({
     activePanel === 'data_quality',
   );
   const { data: yamlData } = useYAMLContent(id, activePanel === 'yaml');
+  const { data: brdData, isLoading: brdLoading } = useBRD(id, activePanel === 'brd');
 
   const handleSendMessage = useCallback(
     (content: string) => {
@@ -158,6 +160,7 @@ export default function ChatWorkspacePage({
   const handleRerunDiscovery = useCallback(() => {
     clearMessages();
     discoveryTriggeredRef.current = false;
+    artifactsHydratedRef.current = false;
     // clearMessages resets isHydrated to false; re-enable so auto-trigger fires
     setHydrated(true);
   }, [clearMessages, setHydrated]);
@@ -252,6 +255,15 @@ export default function ChatWorkspacePage({
             {productName}
           </Typography>
         </Breadcrumbs>
+        {dataProduct?.description && (
+          <Typography
+            variant="caption"
+            sx={{ color: 'text.secondary', ml: 2, maxWidth: 400, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+            title={dataProduct.description}
+          >
+            {dataProduct.description}
+          </Typography>
+        )}
         <Box sx={{ display: 'flex', gap: 1 }}>
           <Button
             variant="outlined"
@@ -337,6 +349,14 @@ export default function ChatWorkspacePage({
         open={activePanel === 'data_quality'}
         onClose={handleClosePanel}
         report={qualityReport ?? null}
+      />
+
+      {/* BRD viewer detail panel */}
+      <BRDViewer
+        open={activePanel === 'brd'}
+        onClose={handleClosePanel}
+        brd={brdData ?? null}
+        isLoading={brdLoading}
       />
 
       {/* YAML viewer detail panel */}

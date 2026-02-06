@@ -80,10 +80,10 @@ def _load_tools() -> None:
         query_erd_graph,
     ]
 
-    # Requirements Agent tools
+    # Requirements Agent tools — NO execute_rcr_query (discovery context has all
+    # field analysis; ad-hoc queries distract from BRD generation)
     _requirements_tools = [
         query_erd_graph,
-        execute_rcr_query,
         save_brd,
         upload_artifact,
     ]
@@ -143,10 +143,11 @@ def _build_subagents(model: Any) -> list[dict[str, Any]]:
         {
             "name": "requirements-agent",
             "description": (
-                "Captures business requirements through structured conversation, "
-                "producing a Business Requirements Document (BRD). Asks questions "
-                "one at a time, shows real data examples, max 15 turns. "
-                "Use after discovery is complete to define metrics, dimensions, and filters."
+                "Captures business requirements through sharp clarifying questions, "
+                "then generates a comprehensive Business Requirements Document. "
+                "Asks 3-5 specific questions, then produces and saves the full BRD. "
+                "Use immediately after the user responds to the discovery analysis — "
+                "do NOT wait for the user to explicitly ask for requirements."
             ),
             "system_prompt": REQUIREMENTS_PROMPT,
             "tools": _requirements_tools,
