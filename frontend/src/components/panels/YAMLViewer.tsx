@@ -1,8 +1,9 @@
 'use client';
 
 import { useCallback, useState } from 'react';
-import { Box, Drawer, IconButton, Snackbar, Typography } from '@mui/material';
+import { Box, IconButton, Snackbar, Typography } from '@mui/material';
 import CloseIcon from '@mui/icons-material/Close';
+import { ResizableDrawer } from './ResizableDrawer';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { atomDark } from 'react-syntax-highlighter/dist/cjs/styles/prism';
@@ -33,21 +34,10 @@ export function YAMLViewer({
   }, [yaml]);
 
   return (
-    <Drawer
-      anchor="right"
+    <ResizableDrawer
+      defaultWidth={DRAWER_WIDTH}
       open={open}
       onClose={onClose}
-      variant="temporary"
-      slotProps={{
-        paper: {
-          sx: {
-            width: DRAWER_WIDTH,
-            bgcolor: 'background.default',
-            borderLeft: 1,
-            borderColor: 'divider',
-          },
-        },
-      }}
     >
       <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
         {/* Header */}
@@ -123,7 +113,7 @@ export function YAMLViewer({
         message="Copied to clipboard"
         anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
       />
-    </Drawer>
+    </ResizableDrawer>
   );
 }
 

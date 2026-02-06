@@ -1,8 +1,9 @@
 'use client';
 
-import { Box, Drawer, IconButton, Skeleton, Typography } from '@mui/material';
+import { Box, IconButton, Skeleton, Typography } from '@mui/material';
 import CloseIcon from '@mui/icons-material/Close';
 import React from 'react';
+import { ResizableDrawer } from './ResizableDrawer';
 
 const GOLD = '#D4A843';
 const DRAWER_WIDTH = 500;
@@ -261,21 +262,10 @@ export function BRDViewer({
   const blocks = document ? parseBRDText(document) : [];
 
   return (
-    <Drawer
-      anchor="right"
+    <ResizableDrawer
+      defaultWidth={DRAWER_WIDTH}
       open={open}
       onClose={onClose}
-      variant="temporary"
-      slotProps={{
-        paper: {
-          sx: {
-            width: DRAWER_WIDTH,
-            bgcolor: 'background.default',
-            borderLeft: 1,
-            borderColor: 'divider',
-          },
-        },
-      }}
     >
       <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
         {/* Header */}
@@ -323,7 +313,7 @@ export function BRDViewer({
           )}
         </Box>
       </Box>
-    </Drawer>
+    </ResizableDrawer>
   );
 }
 

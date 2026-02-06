@@ -5,7 +5,6 @@ import {
   AccordionDetails,
   AccordionSummary,
   Box,
-  Drawer,
   IconButton,
   Table,
   TableBody,
@@ -16,6 +15,7 @@ import {
   Typography,
 } from '@mui/material';
 import CloseIcon from '@mui/icons-material/Close';
+import { ResizableDrawer } from './ResizableDrawer';
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import { PieChart, Pie, Cell } from 'recharts';
 
@@ -129,21 +129,10 @@ export function DataQualityReport({
   ];
 
   return (
-    <Drawer
-      anchor="right"
+    <ResizableDrawer
+      defaultWidth={DRAWER_WIDTH}
       open={open}
       onClose={onClose}
-      variant="temporary"
-      slotProps={{
-        paper: {
-          sx: {
-            width: DRAWER_WIDTH,
-            bgcolor: 'background.default',
-            borderLeft: 1,
-            borderColor: 'divider',
-          },
-        },
-      }}
     >
       <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
         {/* Header */}
@@ -328,7 +317,7 @@ export function DataQualityReport({
           )}
         </Box>
       </Box>
-    </Drawer>
+    </ResizableDrawer>
   );
 }
 

@@ -2,7 +2,6 @@
 
 import {
   Box,
-  Drawer,
   IconButton,
   Table,
   TableBody,
@@ -13,6 +12,7 @@ import {
   Typography,
 } from '@mui/material';
 import CloseIcon from '@mui/icons-material/Close';
+import { ResizableDrawer } from './ResizableDrawer';
 import DownloadIcon from '@mui/icons-material/Download';
 
 const GOLD = '#D4A843';
@@ -74,21 +74,10 @@ export function DataPreview({
   }
 
   return (
-    <Drawer
-      anchor="right"
+    <ResizableDrawer
+      defaultWidth={DRAWER_WIDTH}
       open={open}
       onClose={onClose}
-      variant="temporary"
-      slotProps={{
-        paper: {
-          sx: {
-            width: DRAWER_WIDTH,
-            bgcolor: 'background.default',
-            borderLeft: 1,
-            borderColor: 'divider',
-          },
-        },
-      }}
     >
       <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
         {/* Header */}
@@ -193,7 +182,7 @@ export function DataPreview({
           )}
         </Box>
       </Box>
-    </Drawer>
+    </ResizableDrawer>
   );
 }
 
