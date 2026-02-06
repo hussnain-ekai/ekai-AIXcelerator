@@ -1,6 +1,6 @@
 # Artifact Integration Progress — 2026-02-05
 
-**Updated:** 2026-02-06
+**Updated:** 2026-02-07
 
 ## Summary
 
@@ -104,6 +104,8 @@ The LLM agent only receives a text summary and generates a conversational respon
 - ~~Switch LLM provider to a cheaper option~~ → Done (Vertex AI / Gemini)
 - ~~Re-run end-to-end verification~~ → Done (2026-02-06)
 - ~~Confirm all 7 verification items~~ → Done (see above)
+- ~~ERD panel UX overhaul~~ → Done (see `2026-02-06-erd-discovery-quality-upgrades.md`)
+- ~~Discovery pipeline accuracy fixes~~ → Done (see `2026-02-06-erd-discovery-quality-upgrades.md`)
+- ~~BRD Viewer panel~~ → Done (2026-02-07, see `2026-02-07-implementation-progress.md`)
+- ~~Resizable artifact drawers~~ → Done (2026-02-07)
 - Verify DataQualityModal threshold gating behavior (70+/40-69/0-39 per PRD section 7.2-7.3)
-- ERD panel UX overhaul → Done (see `2026-02-06-erd-discovery-quality-upgrades.md`)
-- Discovery pipeline accuracy fixes → Done (see `2026-02-06-erd-discovery-quality-upgrades.md`)
