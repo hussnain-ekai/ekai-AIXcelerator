@@ -174,7 +174,9 @@ All tasks (21-29) complete with enhancements beyond the plan.
 1. Duplicate pipeline status messages ("I've reviewed your data tables..." appears twice)
 2. Message concatenation: run boundary dedup causes last bubble to accumulate prior content
 3. Artifact badge count doesn't update when BRD artifact is emitted via tool_end
-4. `[INTERNAL CONTEXT]` message visible in chat (should be hidden from user)
+4. ~~`[INTERNAL CONTEXT]` message visible in chat~~ → Fixed (cb9d2c0)
+5. ~~Semantic view YAML dumped as full code block in chat~~ → Fixed (cb9d2c0, condensed to summary)
+6. **YAML Viewer shows "No YAML content available"** — `GET /artifacts/:id/yaml` returns empty. The `save_semantic_view` tool persists to `semantic_views` table but the backend endpoint reads from a different source (MinIO or artifacts table). Generation layer needs end-to-end rework to ensure YAML artifact is accessible via the viewer
 
 ---
 
