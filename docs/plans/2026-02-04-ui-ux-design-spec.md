@@ -183,11 +183,41 @@ Triggered by "Create Data Product" button. MUI Dialog, centered, ~500px wide.
 #### User Messages (right-aligned)
 - Dark card background, rounded corners, right-aligned
 - White text, no label
+- **File attachment chips** (below message text, if files were attached):
+  - Image attachments: small thumbnail preview
+  - Document attachments: file icon + filename chip with size
 
-### Chat Input Bar (fixed bottom)
-- **Attachment button** (paperclip icon, left)
-- **Text input**: MUI TextField, placeholder "Ask ekaiX anything...", full width
-- **Send button** (gold arrow/paper-plane icon, right)
+#### Message Actions (hover-reveal)
+All messages show action buttons on hover, positioned below the message bubble (right-aligned).
+
+- **Agent messages**: Copy + Retry
+  - Copy: copies message text to clipboard. Icon swaps to checkmark for 2s
+  - Retry: replays the preceding user message from checkpoint, agent regenerates
+- **User messages**: Edit + Retry
+  - Edit: inline editor (TextField + Save/Cancel) replaces message text. On save, truncates conversation after this message and regenerates
+  - Retry: same message resent, agent regenerates from checkpoint
+- **System/pipeline messages**: no actions
+- **During streaming**: all action buttons disabled except Copy
+- Hover pattern: `opacity: 0` → `opacity: 1` on parent hover, 150ms transition
+
+### Chat Input Bar (fixed bottom, Claude AI-style)
+Unified container with border, rounded corners, and internal sections:
+
+- **File previews** (top, inside container, when files attached):
+  - Image attachments: 64px thumbnail with rounded corners + remove (X) button
+  - Document attachments: chip with file icon + filename + size + remove (X) button
+  - Max 5 files per message, max 50MB per file
+  - Accepted: `.pdf, .csv, .txt, .json, .xlsx, .png, .jpg, .jpeg`
+- **Textarea** (middle, borderless):
+  - Placeholder: "Reply to ekaiX..."
+  - Auto-resize, max height 120px
+  - Supports Shift+Enter for newlines, Enter to send
+  - Drag-and-drop files onto textarea
+  - Paste images from clipboard
+- **Bottom action row** (inside container):
+  - Left: **Attach button** (+ icon in circular outlined button) — opens file picker
+  - Right: **Send button** (up arrow, filled circle, gold when active, gray when disabled)
+  - When streaming: Send button replaced by **Stop button** (red filled circle with stop icon) — interrupts agent generation
 
 ---
 

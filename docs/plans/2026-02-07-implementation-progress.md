@@ -1,7 +1,7 @@
 # Implementation Progress — 2026-02-07
 
-**Updated:** 2026-02-07
-**Summary:** Phases 1-7 complete. Discovery, Requirements, and Generation agents verified end-to-end with real Snowflake data. BRD Viewer and resizable artifact panels added. Validation and Publishing agents have prompts/tools but are not yet tested.
+**Updated:** 2026-02-08
+**Summary:** Phases 1-7 complete. Discovery, Requirements, and Generation agents verified end-to-end with real Snowflake data. BRD Viewer and resizable artifact panels added. Message actions (edit/retry/copy), file upload with native multimodal support, and stop button implemented. Validation and Publishing agents have prompts/tools but are not yet tested.
 
 ---
 
@@ -53,8 +53,11 @@ All tasks (5-11) complete. Minor deviations noted.
 - `GET /auth/me` — User from SPCS header (mocked in dev)
 - `GET /databases`, `/databases/:db/schemas`, `/databases/:db/schemas/:schema/tables` — Real Snowflake queries
 - `POST /data-products`, `GET /data-products`, `GET /data-products/:id`, `PATCH /data-products/:id`, `DELETE /data-products/:id` — Full CRUD
-- `POST /agent/:dataProductId/message` — SSE proxy to AI service
-- `GET /agent/:dataProductId/history` — Redis message history
+- `POST /agent/message` — SSE proxy to AI service (with `file_contents` multimodal support)
+- `POST /agent/retry` — Retry/edit from LangGraph checkpoint (proxy to AI service)
+- `POST /agent/interrupt/:sessionId` — Interrupt streaming agent (proxy to AI service)
+- `GET /agent/stream/:sessionId` — SSE stream proxy
+- `GET /agent/history/:sessionId` — Checkpoint-based message history
 - `GET /artifacts/:dataProductId` — List artifacts
 - `GET /artifacts/:dataProductId/erd` — ERD data (Neo4j)
 - `GET /artifacts/:dataProductId/quality-report` — Quality report (PostgreSQL)
@@ -146,8 +149,8 @@ All tasks (21-29) complete with enhancements beyond the plan.
 |-----------|------|--------|
 | Sidebar + Layout | `layout.tsx` | COMPLETE |
 | Phase Stepper | `PhaseStepper.tsx` | COMPLETE — detects phase from `task` tool calls |
-| Message Thread | `MessageThread.tsx` | COMPLETE — renders agent/user messages + artifact cards |
-| Chat Input | `ChatInput.tsx` | COMPLETE |
+| Message Thread | `MessageThread.tsx` | COMPLETE — renders agent/user messages + artifact cards + hover actions (edit/retry/copy) |
+| Chat Input | `ChatInput.tsx` | COMPLETE — Claude AI-style unified container, file upload (+/drag-drop/paste), send/stop toggle |
 | Artifact Cards | `ArtifactCard.tsx` | COMPLETE — inline clickable cards with type icons |
 | ERD Diagram Panel | `ERDDiagramPanel.tsx` | COMPLETE — dagre layout, dark theme, sidebar, edge labels |
 | Data Quality Report | `DataQualityReport.tsx` | COMPLETE — donut chart, accordion sections, per-table summary |
@@ -168,6 +171,11 @@ All tasks (21-29) complete with enhancements beyond the plan.
 | **Re-run Discovery** | Button in top bar clears messages and re-triggers pipeline |
 | **Artifact hydration** | On page load, persisted artifacts load from PostgreSQL and appear in chat |
 | **Session recovery** | Messages hydrated from Redis on navigation/reload |
+| **Message Actions** | Hover-reveal Edit/Retry/Copy buttons on all messages. Inline edit mode with Save/Cancel. Copy to clipboard with checkmark feedback. Retry uses LangGraph checkpoint state (`RemoveMessage` + `aupdate_state`) |
+| **File Upload** | Claude AI-style unified input: `+` button, drag-and-drop, clipboard paste. File previews (thumbnails for images, chips for documents). Max 5 files, 50MB each. Supports PDF, CSV, TXT, JSON, XLSX, PNG, JPG, JPEG |
+| **Native Multimodal** | LangChain standard content blocks for all file types: images (`image_url`), PDFs (`file`), audio/video (`media`), text files (decoded UTF-8 string). Gemini processes binary files natively |
+| **Stop Button** | Red stop icon replaces send button during streaming. Calls `POST /agent/interrupt/{session_id}` |
+| **Empty AI Message Patch** | Scans checkpoint for empty-content AIMessages (from orchestrator tool calls) before `astream_events`. Patches with `content="."` or removes. Prevents Gemini 400 INVALID_ARGUMENT errors |
 
 ### Known Frontend Issues (Non-blocking)
 
@@ -177,6 +185,7 @@ All tasks (21-29) complete with enhancements beyond the plan.
 4. ~~`[INTERNAL CONTEXT]` message visible in chat~~ → Fixed (cb9d2c0)
 5. ~~Semantic view YAML dumped as full code block in chat~~ → Fixed (cb9d2c0, condensed to summary)
 6. **YAML Viewer shows "No YAML content available"** — `GET /artifacts/:id/yaml` returns empty. The `save_semantic_view` tool persists to `semantic_views` table but the backend endpoint reads from a different source (MinIO or artifacts table). Generation layer needs end-to-end rework to ensure YAML artifact is accessible via the viewer
+7. Retrying old messages with file attachments cannot recover original binary data — checkpoint stores text representation only. This is a known LangGraph limitation (binary content blocks aren't stored in checkpoints)
 
 ---
 
@@ -197,6 +206,13 @@ All tasks (21-29) complete with enhancements beyond the plan.
 | Artifact panels (ERD, Quality, BRD, YAML) | Manual browser testing | PASS |
 | Resizable drawer | Playwright drag test | PASS |
 | Session recovery on page reload | Manual browser testing | PASS |
+| Message copy to clipboard | Playwright browser test | PASS |
+| Message retry (user + agent) | Manual browser + PM2 logs | PASS |
+| Message edit with regeneration | Manual browser + PM2 logs | PASS |
+| File upload — CSV (text decode path) | Playwright + PM2 logs | PASS — agent received/parsed CSV content |
+| File upload — PDF (native `file` block) | Playwright + PM2 logs | PASS — multimodal content: 2 blocks (text + file) |
+| Stop button (interrupt streaming) | Manual browser testing | PASS |
+| Empty AI message checkpoint patch | PM2 log verification | PASS — "Patched 4 empty AI messages" |
 
 ### What's NOT Verified
 
@@ -207,7 +223,8 @@ All tasks (21-29) complete with enhancements beyond the plan.
 - RCR with multiple Snowflake roles
 - Workspace isolation (multi-user)
 - Error handling / SSE reconnect
-- Document upload + extraction
+- File upload — image files (image_url block path)
+- File upload — audio/video files (media block path)
 
 ---
 
@@ -281,3 +298,6 @@ Current model: Gemini (via Vertex AI). Configuration managed through UI at `/llm
 | `cca3242` | Implement full-stack ekaiX platform (Phases 1-7) |
 | `e177896` | Add BRD viewer panel and stabilize agent pipeline |
 | `65a6e37` | Add resizable drawer to all artifact panels |
+| `cb9d2c0` | Hide internal context and condense YAML in chat thread |
+| `7e07134` | Update progress doc with fixed and known YAML viewer issue |
+| `d3598fe` | Add message actions (edit/retry/copy), file upload, and native multimodal support |
