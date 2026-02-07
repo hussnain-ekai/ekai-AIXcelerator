@@ -18,18 +18,23 @@ Snowflake Native App enabling business users to create semantic models and Corte
 Business users interact with AI agent to:
 1. Analyze existing gold layer databases (automatic discovery)
 2. Capture business requirements through natural conversation
-3. Generate semantic views (YAML) referencing gold tables directly
-4. Publish as Snowflake Cortex Agents accessible via Snowflake Intelligence
+3. Generate a **universal semantic definition** (metrics, dimensions, relationships, business descriptions)
+4. Publish to **multiple downstream targets** — starting with Snowflake Cortex Agents, extending to PowerBI, Tableau, Looker, dbt Semantic Layer, and more
 
-**Key Constraint:** Gold layer only - no transformations, no DBT generation. Direct semantic layer on clean data.
+**Key Constraint:** Gold layer only — no transformations, no DBT generation. Direct semantic layer on clean data.
+
+**Strategic Position:** ekaiX is an **AI-powered semantic layer generator**, not just a Cortex Agent builder. The conversational AI discovery + requirements capture is the defensible moat. The semantic definition ekaiX produces is the **single source of truth** — each publish target is a format adapter. Same metrics, dimensions, relationships, business descriptions — different output serialization.
 
 ### Product Differentiation
 
 This is **NOT** the full ekai platform. This is a focused entry point for:
-- Enterprises with mature medallion architecture
+- Enterprises with mature medallion architecture (gold layer ready)
 - Business analysts (not data engineers)
-- Fast path to Snowflake Intelligence (hours not days)
+- Fast path from gold layer to any BI tool or Snowflake Intelligence (hours not days)
 - Simplified workflow (conversation not multi-step wizards)
+- **Tool-agnostic semantic layer** — define once, publish everywhere (Cortex, PowerBI, Tableau, Looker, dbt)
+
+**Why this matters:** Most organizations use 2-3 BI tools simultaneously. ekaiX ensures consistent metric definitions across all of them from a single conversational workflow. The AI-driven discovery + requirements capture is the moat — no other tool goes from "connect your data" to "here's your semantic model for PowerBI and Cortex" through natural conversation.
 
 ---
 
@@ -230,7 +235,7 @@ Every stored procedure and query executes with `EXECUTE AS CALLER`:
   - Requirements Agent (BRD capture through conversation)
   - Generation Agent (semantic view YAML creation)
   - Validation Agent (test query execution)
-  - Publishing Agent (Cortex Agent deployment)
+  - Publishing Agent (multi-target publishing: Cortex Agent, PowerBI, Tableau, Looker, dbt, etc.)
   - Explorer Agent (ad-hoc user queries)
 
 **LLM Integration:**
@@ -245,9 +250,13 @@ Every stored procedure and query executes with `EXECUTE AS CALLER`:
 - `query_information_schema` - Schema metadata discovery
 - `profile_table` - Statistical profiling of tables
 - `execute_rrc_query` - Run query with user's permissions
-- `create_semantic_view` - Deploy semantic view YAML
-- `create_cortex_agent` - Deploy Cortex Agent
+- `create_semantic_view` - Deploy semantic view YAML to Snowflake
+- `create_cortex_agent` - Deploy Cortex Agent to Snowflake Intelligence
 - `grant_agent_access` - Grant access to user's role
+- `export_powerbi_model` - Generate PowerBI semantic model (.bim) from universal definition
+- `export_tableau_datasource` - Generate Tableau data source (.tds) from universal definition
+- `export_lookml` - Generate LookML model from universal definition
+- `export_dbt_semantic` - Generate dbt Semantic Layer (MetricFlow) YAML from universal definition
 - `validate_sql` - Dry-run SQL compilation
 
 **Neo4j Tools:**
@@ -623,7 +632,7 @@ EXECUTE AS CALLER
 - Cardinality checks
 - Return validation results
 
-**Publishing Procedure:**
+**Publishing Procedure (Cortex Agent — Priority 1):**
 ```sql
 CREATE PROCEDURE ekaiX.publish_cortex_agent(
   semantic_view_yaml STRING,
@@ -639,6 +648,40 @@ EXECUTE AS OWNER
 - Create Cortex Agent with semantic view reference
 - Grant access to caller's role
 - Return agent FQN and Intelligence URL
+
+### Multi-Target Publishing Architecture
+
+ekaiX maintains a **universal semantic definition** (internal format) that captures metrics, dimensions, time dimensions, relationships, filters, and business descriptions in a tool-agnostic structure. Each publish target has a dedicated **format adapter** that serializes this definition into the target-specific format.
+
+**Universal Semantic Definition (Internal):**
+The generation agent produces a canonical semantic definition stored in PostgreSQL (`semantic_views` table). This definition contains all business logic, column mappings, aggregation rules, join conditions, and descriptions independent of any target format.
+
+**Publish Targets (Priority Order):**
+
+| Target | Format | Adapter | Priority |
+|--------|--------|---------|----------|
+| Snowflake Cortex Agent | Semantic View YAML + `CREATE CORTEX AGENT` | `publish_cortex_agent` | P0 — First implementation |
+| PowerBI | Semantic Model (.bim / TMDL) | `export_powerbi_model` | P1 — Largest BI market |
+| Tableau | Data Source (.tds / .tdsx) | `export_tableau_datasource` | P1 — Enterprise BI |
+| Looker | LookML (.lkml) | `export_lookml` | P2 — Google Cloud shops |
+| dbt Semantic Layer | MetricFlow YAML | `export_dbt_semantic` | P2 — Data engineering teams |
+| SQL Views + Data Dictionary | `CREATE VIEW` + Markdown docs | `export_sql_views` | P2 — Universal fallback |
+
+**Each adapter must:**
+1. Read the universal semantic definition from PostgreSQL
+2. Map metrics → target-specific measure/metric definitions
+3. Map dimensions → target-specific dimension/attribute definitions
+4. Map relationships → target-specific join syntax
+5. Map filters → target-specific filter expressions
+6. Serialize to the target format
+7. Provide a downloadable artifact (file) or direct deployment (Cortex Agent)
+
+**Publishing UI:**
+The publish step in the chat workspace presents a target selector:
+- User chooses one or more targets from the supported list
+- For Cortex Agent: direct deployment to Snowflake Intelligence
+- For BI tools: generates downloadable artifact files (stored in MinIO, accessible via Artifacts panel)
+- All targets use the same underlying semantic definition — consistency guaranteed
 
 ### Cortex AI Integration
 
@@ -668,9 +711,11 @@ SELECT SNOWFLAKE.CORTEX.PARSE_DOCUMENT(
 - Error handling for Cortex API failures
 - Model fallback (GPT-4 if Claude unavailable)
 
-### Semantic View Format
+### Semantic Definition Format
 
-**Snowflake Semantic View YAML Specification:**
+ekaiX generates a **universal semantic definition** that is stored internally and then serialized to target-specific formats by publish adapters. The primary (P0) target is Snowflake Semantic View YAML.
+
+**Snowflake Semantic View YAML Specification (P0 Target):**
 
 Must generate valid semantic view YAML that directly references gold layer tables (no transformations).
 
@@ -713,7 +758,7 @@ filters:
   - expr: "status != 'CANCELLED'"
 ```
 
-### Cortex Agent Configuration
+### Cortex Agent Configuration (Publish Target: Snowflake)
 
 **Created via:**
 ```sql
@@ -726,6 +771,8 @@ WITH
 ```
 
 **Agent inherits RCR permissions** - different users see different results based on their data access.
+
+**Note:** This is one of multiple publish targets. The same semantic definition can also be exported to PowerBI, Tableau, Looker, dbt, and SQL views. See "Multi-Target Publishing Architecture" above.
 
 ---
 
@@ -748,9 +795,9 @@ Your role:
 Your capabilities:
 - Discover and profile database schemas
 - Capture business requirements through interactive interview
-- Generate semantic view YAML specifications
+- Generate universal semantic definitions (metrics, dimensions, relationships)
 - Validate generated models with test queries
-- Publish Cortex Agents to Snowflake Intelligence
+- Publish to multiple targets: Snowflake Cortex Agents, PowerBI, Tableau, Looker, dbt, SQL views
 - Query external systems (Google Drive, Confluence, etc.) for business context
 
 Key principles:
@@ -2312,8 +2359,14 @@ try {
 - [ ] Can modify requirements mid-conversation
 - [ ] Can preview results
 - [ ] Can export preview
-- [ ] Can publish to Snowflake Intelligence
-- [ ] Published agent works
+- [ ] Can publish to Snowflake Intelligence (Cortex Agent)
+- [ ] Published Cortex Agent works
+- [ ] Can export PowerBI semantic model (.bim)
+- [ ] Can export Tableau data source (.tds)
+- [ ] Can export Looker LookML
+- [ ] Can export dbt Semantic Layer YAML
+- [ ] Can export SQL views + data dictionary
+- [ ] Exported artifacts are downloadable from Artifacts panel
 - [ ] Can share data product
 - [ ] Can delete data product
 - [ ] Can view audit trail
@@ -2368,8 +2421,10 @@ try {
   - BRD capture: <15 min
   - Generation + validation: <5 min
   - Publishing: <3 min
-- Generated semantic views work correctly >90% of time
+- Generated semantic definitions work correctly >90% of time
 - Published Cortex Agents accessible via Snowflake Intelligence
+- Exported BI artifacts (PowerBI, Tableau, Looker, dbt) are valid and importable in their respective tools
+- User can select one or more publish targets before publishing
 - User approval required before publish
 
 **Quality Success:**
