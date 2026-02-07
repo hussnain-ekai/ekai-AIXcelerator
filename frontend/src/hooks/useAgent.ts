@@ -5,7 +5,7 @@ import { connectSSE } from '@/lib/sse';
 import type { SSEHandlers } from '@/lib/sse';
 import { api } from '@/lib/api';
 import { useChatStore } from '@/stores/chatStore';
-import type { AgentPhase, ArtifactType } from '@/stores/chatStore';
+import type { AgentPhase, ArtifactType, ChatMessageAttachment } from '@/stores/chatStore';
 
 interface AgentResponse {
   session_id: string;
@@ -18,9 +18,25 @@ interface UseAgentOptions {
 }
 
 interface UseAgentReturn {
-  sendMessage: (content: string) => Promise<void>;
+  sendMessage: (content: string, files?: File[]) => Promise<void>;
+  retryMessage: (opts: { messageId?: string; editedContent?: string; originalContent?: string }) => Promise<void>;
   interrupt: () => Promise<void>;
   isConnected: boolean;
+}
+
+/** Convert a File to base64 string. */
+async function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result as string;
+      // Strip the data URL prefix (e.g. "data:image/png;base64,")
+      const base64 = result.split(',')[1] ?? '';
+      resolve(base64);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
 }
 
 function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
@@ -150,15 +166,32 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
   );
 
   const sendMessage = useCallback(
-    async (content: string) => {
+    async (content: string, files?: File[]) => {
       // Don't show internal trigger messages in the chat
       const isInternalTrigger = content === '__START_DISCOVERY__';
+
+      // Build attachment metadata for display in chat
+      const chatAttachments: ChatMessageAttachment[] = [];
+      if (files && files.length > 0) {
+        for (const file of files) {
+          const att: ChatMessageAttachment = {
+            filename: file.name,
+            contentType: file.type,
+          };
+          if (file.type.startsWith('image/')) {
+            att.thumbnailUrl = URL.createObjectURL(file);
+          }
+          chatAttachments.push(att);
+        }
+      }
+
       if (!isInternalTrigger) {
         addMessage({
           id: crypto.randomUUID(),
           role: 'user',
           content,
           timestamp: new Date().toISOString(),
+          attachments: chatAttachments.length > 0 ? chatAttachments : undefined,
         });
       }
 
@@ -172,18 +205,55 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
         setSessionId(sid);
       }
 
+      // Encode files to base64 for the AI service
+      const fileContents: { filename: string; content_type: string; base64_data: string }[] = [];
+      if (files && files.length > 0) {
+        for (const file of files) {
+          const base64 = await fileToBase64(file);
+          fileContents.push({
+            filename: file.name,
+            content_type: file.type,
+            base64_data: base64,
+          });
+        }
+      }
+
       const response = await api.post<AgentResponse>(
         `/agent/message`,
         {
           session_id: sid,
           message: content,
           data_product_id: dataProductId,
+          ...(fileContents.length > 0 ? { file_contents: fileContents } : {}),
         },
       );
 
       connectToStream(response.session_id);
     },
     [dataProductId, sessionId, addMessage, setStreaming, setSessionId, connectToStream],
+  );
+
+  const retryMessage = useCallback(
+    async (opts: { messageId?: string; editedContent?: string; originalContent?: string }) => {
+      const sid = useChatStore.getState().sessionId;
+      if (!sid) return;
+
+      setStreaming(true);
+
+      const response = await api.post<AgentResponse>(
+        `/agent/retry`,
+        {
+          session_id: sid,
+          data_product_id: dataProductId,
+          message_id: opts.messageId,
+          edited_content: opts.editedContent,
+          original_content: opts.originalContent,
+        },
+      );
+
+      connectToStream(response.session_id);
+    },
+    [dataProductId, setStreaming, connectToStream],
   );
 
   const interrupt = useCallback(async () => {
@@ -201,7 +271,7 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
     };
   }, []);
 
-  return { sendMessage, interrupt, isConnected };
+  return { sendMessage, retryMessage, interrupt, isConnected };
 }
 
 export { useAgent };

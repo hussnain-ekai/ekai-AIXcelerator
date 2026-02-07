@@ -251,7 +251,7 @@ async def set_llm_config(req: LLMConfigRequest) -> LLMConfigResponse:
         # Rebuild orchestrator with new model
         from agents.orchestrator import reset_orchestrator
 
-        reset_orchestrator()
+        await reset_orchestrator()
 
         # Persist to PostgreSQL so config survives restarts
         try:
@@ -284,7 +284,7 @@ async def set_llm_config(req: LLMConfigRequest) -> LLMConfigResponse:
         try:
             from agents.orchestrator import reset_orchestrator
 
-            reset_orchestrator()
+            await reset_orchestrator()
         except Exception:
             pass
 

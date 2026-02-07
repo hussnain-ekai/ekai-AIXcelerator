@@ -56,7 +56,9 @@ export default function ChatWorkspacePage({
   const { id } = use(params);
   const { data: dataProduct } = useDataProduct(id);
   const { isHydrated } = useSessionRecovery(dataProduct);
-  const { sendMessage, isConnected } = useAgent({ dataProductId: id });
+  const { sendMessage, retryMessage, interrupt, isConnected } = useAgent({ dataProductId: id });
+  const truncateAfter = useChatStore((state) => state.truncateAfter);
+  const editMessage = useChatStore((state) => state.editMessage);
   const messages = useChatStore((state) => state.messages);
   const isStreaming = useChatStore((state) => state.isStreaming);
   const currentPhase = useChatStore((state) => state.currentPhase);
@@ -147,10 +149,50 @@ export default function ChatWorkspacePage({
   const { data: brdData, isLoading: brdLoading } = useBRD(id, activePanel === 'brd');
 
   const handleSendMessage = useCallback(
-    (content: string) => {
-      void sendMessage(content);
+    (content: string, files?: File[]) => {
+      void sendMessage(content, files);
     },
     [sendMessage],
+  );
+
+  const handleStop = useCallback(() => {
+    void interrupt();
+  }, [interrupt]);
+
+  const handleEditMessage = useCallback(
+    (messageId: string, newContent: string) => {
+      // Capture original content BEFORE editing the store
+      const msg = useChatStore.getState().messages.find((m) => m.id === messageId);
+      const originalContent = msg?.content ?? '';
+      editMessage(messageId, newContent);
+      truncateAfter(messageId);
+      void retryMessage({ messageId, editedContent: newContent, originalContent });
+    },
+    [editMessage, truncateAfter, retryMessage],
+  );
+
+  const handleRetryMessage = useCallback(
+    (messageId: string) => {
+      const msgs = useChatStore.getState().messages;
+      const msgIndex = msgs.findIndex((m) => m.id === messageId);
+      const msg = msgs[msgIndex];
+      if (!msg) return;
+
+      if (msg.role === 'user') {
+        const originalContent = msg.content;
+        truncateAfter(messageId);
+        void retryMessage({ messageId, originalContent });
+      } else if (msg.role === 'assistant') {
+        // Find the preceding user message and retry from there
+        const prevUser = msgs.slice(0, msgIndex).reverse().find((m) => m.role === 'user');
+        if (prevUser) {
+          const originalContent = prevUser.content;
+          truncateAfter(prevUser.id);
+          void retryMessage({ messageId: prevUser.id, originalContent });
+        }
+      }
+    },
+    [truncateAfter, retryMessage],
   );
 
   const handleStartDiscovery = useCallback(() => {
@@ -312,12 +354,16 @@ export default function ChatWorkspacePage({
         messages={messages}
         isStreaming={isStreaming}
         onOpenArtifact={handleOpenPanel}
+        onEditMessage={handleEditMessage}
+        onRetryMessage={handleRetryMessage}
       />
 
       {/* Chat input */}
       <ChatInput
         onSend={handleSendMessage}
+        onStop={handleStop}
         disabled={isStreaming || isConnected}
+        isStreaming={isStreaming}
       />
 
       {/* Data source settings slide-over */}

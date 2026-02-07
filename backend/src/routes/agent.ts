@@ -1,21 +1,11 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 
 import { config } from '../config.js';
-import { redisService } from '../services/redisService.js';
-import { postgresService } from '../services/postgresService.js';
 import {
   sendMessageSchema,
   sessionIdParamSchema,
+  retrySchema,
 } from '../schemas/agent.js';
-
-interface MessageHistoryRow {
-  id: string;
-  session_id: string;
-  role: string;
-  content: string;
-  tool_calls: unknown[] | null;
-  created_at: string;
-}
 
 export async function agentRoutes(app: FastifyInstance): Promise<void> {
   /**
@@ -34,7 +24,7 @@ export async function agentRoutes(app: FastifyInstance): Promise<void> {
         });
       }
 
-      const { session_id, message, data_product_id, attachments } = parseResult.data;
+      const { session_id, message, data_product_id, attachments, file_contents } = parseResult.data;
       const { snowflakeUser } = request.user;
 
       request.log.info(
@@ -56,6 +46,7 @@ export async function agentRoutes(app: FastifyInstance): Promise<void> {
               message,
               data_product_id: data_product_id ?? '',
               attachments,
+              file_contents,
               user: snowflakeUser,
             }),
           },
@@ -271,7 +262,7 @@ export async function agentRoutes(app: FastifyInstance): Promise<void> {
 
   /**
    * GET /agent/history/:sessionId
-   * Get conversation history for a session. Tries Redis first, falls back to PostgreSQL.
+   * Get conversation history for a session from the AI service's LangGraph checkpointer.
    */
   app.get(
     '/history/:sessionId',
@@ -290,47 +281,159 @@ export async function agentRoutes(app: FastifyInstance): Promise<void> {
       const { sessionId } = paramResult.data;
       const { snowflakeUser } = request.user;
 
-      // Try Redis cache first
-      try {
-        const redisClient = await redisService.getClient();
-        const cached = await redisClient.get(`agent:history:${sessionId}`);
-        if (cached) {
-          const parsed = JSON.parse(cached) as { messages?: unknown[]; data_product_id?: string } | unknown[];
-          // Handle both formats: { messages: [...] } and direct array [...]
-          const messages = Array.isArray(parsed) ? parsed : (parsed.messages ?? []);
-          return reply.send({
-            session_id: sessionId,
-            messages,
-            data_product_id: Array.isArray(parsed) ? undefined : parsed.data_product_id,
-          });
-        }
-      } catch (err: unknown) {
-        request.log.warn({ err }, 'Redis unavailable, falling back to PostgreSQL');
-      }
-
-      // Fall back to PostgreSQL — look up from the data product's state JSONB
-      // which stores the session_id, then query the data product for its full state
-      const result = await postgresService.query(
-        `SELECT state
-         FROM data_products
-         WHERE state->>'session_id' = $1`,
-        [sessionId],
-        snowflakeUser,
+      request.log.info(
+        { sessionId, user: snowflakeUser },
+        'Fetching history from AI service checkpointer',
       );
 
-      const row = result.rows[0] as { state: Record<string, unknown> } | undefined;
+      try {
+        const aiResponse = await fetch(
+          `${config.AI_SERVICE_URL}/agent/history/${sessionId}`,
+          {
+            headers: {
+              'X-Snowflake-User': snowflakeUser,
+            },
+          },
+        );
 
-      if (!row) {
-        return reply.status(404).send({
-          error: 'NOT_FOUND',
-          message: 'Session not found',
+        if (!aiResponse.ok) {
+          const errorBody = (await aiResponse.json().catch(() => null)) as Record<string, unknown> | null;
+          return reply.status(aiResponse.status).send({
+            error: 'AI_SERVICE_ERROR',
+            message:
+              (errorBody?.message as string | undefined) ??
+              'Failed to fetch history',
+          });
+        }
+
+        const responseData = (await aiResponse.json()) as Record<string, unknown>;
+        return reply.send(responseData);
+      } catch (err: unknown) {
+        request.log.error({ err }, 'Failed to reach AI service for history');
+        return reply.status(502).send({
+          error: 'AI_SERVICE_UNAVAILABLE',
+          message: 'Unable to reach the AI service',
+        });
+      }
+    },
+  );
+
+  /**
+   * POST /agent/retry
+   * Retry or edit a message using LangGraph checkpoint time-travel.
+   */
+  app.post(
+    '/retry',
+    async (request: FastifyRequest, reply) => {
+      const parseResult = retrySchema.safeParse(request.body);
+      if (!parseResult.success) {
+        return reply.status(400).send({
+          error: 'VALIDATION_ERROR',
+          message: 'Invalid request body',
+          details: parseResult.error.flatten().fieldErrors,
         });
       }
 
-      // The messages may be stored in the state JSONB
-      const messages = (row.state.messages ?? []) as MessageHistoryRow[];
+      const { session_id, data_product_id, message_id, edited_content, original_content } = parseResult.data;
+      const { snowflakeUser } = request.user;
 
-      return reply.send({ data: messages });
+      request.log.info(
+        { session_id, data_product_id, user: snowflakeUser },
+        'Retrying message via AI service',
+      );
+
+      try {
+        const aiResponse = await fetch(
+          `${config.AI_SERVICE_URL}/agent/retry`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Snowflake-User': snowflakeUser,
+            },
+            body: JSON.stringify({
+              session_id,
+              data_product_id,
+              message_id,
+              edited_content,
+              original_content,
+            }),
+          },
+        );
+
+        if (!aiResponse.ok) {
+          const errorBody = (await aiResponse.json().catch(() => null)) as Record<string, unknown> | null;
+          return reply.status(aiResponse.status).send({
+            error: 'AI_SERVICE_ERROR',
+            message:
+              (errorBody?.message as string | undefined) ??
+              'AI service returned an error',
+            details: errorBody,
+          });
+        }
+
+        const responseData = (await aiResponse.json()) as Record<string, unknown>;
+        return reply.send(responseData);
+      } catch (err: unknown) {
+        request.log.error({ err }, 'Failed to reach AI service for retry');
+        return reply.status(502).send({
+          error: 'AI_SERVICE_UNAVAILABLE',
+          message: 'Unable to reach the AI service',
+        });
+      }
+    },
+  );
+
+  /**
+   * GET /agent/checkpoints/:sessionId
+   * List checkpoints for a session.
+   */
+  app.get(
+    '/checkpoints/:sessionId',
+    async (
+      request: FastifyRequest<{ Params: { sessionId: string } }>,
+      reply,
+    ) => {
+      const paramResult = sessionIdParamSchema.safeParse(request.params);
+      if (!paramResult.success) {
+        return reply.status(400).send({
+          error: 'VALIDATION_ERROR',
+          message: 'Invalid session ID',
+        });
+      }
+
+      const { sessionId } = paramResult.data;
+      const { snowflakeUser } = request.user;
+
+      try {
+        const aiResponse = await fetch(
+          `${config.AI_SERVICE_URL}/agent/checkpoints/${sessionId}`,
+          {
+            headers: {
+              'X-Snowflake-User': snowflakeUser,
+            },
+          },
+        );
+
+        if (!aiResponse.ok) {
+          const errorBody = (await aiResponse.json().catch(() => null)) as Record<string, unknown> | null;
+          return reply.status(aiResponse.status).send({
+            error: 'AI_SERVICE_ERROR',
+            message:
+              (errorBody?.message as string | undefined) ??
+              'Failed to fetch checkpoints',
+          });
+        }
+
+        const responseData = (await aiResponse.json()) as Record<string, unknown>;
+        return reply.send(responseData);
+      } catch (err: unknown) {
+        request.log.error({ err }, 'Failed to reach AI service for checkpoints');
+        return reply.status(502).send({
+          error: 'AI_SERVICE_UNAVAILABLE',
+          message: 'Unable to reach the AI service',
+        });
+      }
     },
   );
 }

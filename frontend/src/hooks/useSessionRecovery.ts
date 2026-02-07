@@ -9,6 +9,7 @@ import type { DataProduct } from '@/hooks/useDataProducts';
 interface HistoryResponse {
   session_id: string;
   messages: Array<{
+    id?: string;
     role: 'user' | 'assistant' | 'system';
     content: string;
     timestamp?: string;
@@ -89,7 +90,7 @@ function useSessionRecovery(dataProduct: DataProduct | undefined): UseSessionRec
           const chatMessages: ChatMessage[] = historyMessages
             .filter((msg) => !msg.content.includes('[INTERNAL CONTEXT'))
             .map((msg, idx) => ({
-              id: `recovered-${idx}-${Date.now()}`,
+              id: msg.id ?? `recovered-${idx}-${Date.now()}`,
               role: msg.role,
               content: msg.content,
               timestamp: msg.timestamp ?? new Date().toISOString(),

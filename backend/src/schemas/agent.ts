@@ -15,9 +15,31 @@ export const sendMessageSchema = z.object({
     )
     .optional()
     .default([]),
+  file_contents: z
+    .array(
+      z.object({
+        filename: z.string(),
+        content_type: z.string(),
+        base64_data: z.string(),
+      }),
+    )
+    .optional()
+    .default([]),
 });
 
 export type SendMessageInput = z.infer<typeof sendMessageSchema>;
+
+// --- Retry ---
+
+export const retrySchema = z.object({
+  session_id: z.string().uuid(),
+  data_product_id: z.string().uuid(),
+  message_id: z.string().optional(),
+  edited_content: z.string().max(10000).optional(),
+  original_content: z.string().max(50000).optional(),
+});
+
+export type RetryInput = z.infer<typeof retrySchema>;
 
 // --- Session ID param ---
 

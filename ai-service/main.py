@@ -108,11 +108,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception as e:
         logger.warning("Failed to restore LLM overrides: %s", e)
 
-    # Initialize the orchestrator agent
+    # Initialize the checkpointer and orchestrator agent
     try:
-        from agents.orchestrator import get_orchestrator
-        get_orchestrator()
-        logger.info("Deep Agents orchestrator initialized")
+        from agents.orchestrator import get_checkpointer, get_orchestrator
+        await get_checkpointer()
+        await get_orchestrator()
+        logger.info("Deep Agents orchestrator initialized (with PostgreSQL checkpointer)")
     except Exception as e:
         logger.error("Orchestrator init failed: %s", e)
 
@@ -121,6 +122,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # --- Shutdown: Close all connections ---
     logger.info("Shutting down %s", SERVICE_NAME)
 
+    try:
+        from agents.orchestrator import close_checkpointer
+        await close_checkpointer()
+    except Exception:
+        pass
     try:
         await snowflake_service.close()
     except Exception:

@@ -111,6 +111,24 @@ async def save_brd(
 
 
 @tool
+async def get_latest_brd(data_product_id: str) -> str:
+    """Retrieve the most recent BRD for a data product.
+
+    Args:
+        data_product_id: UUID of the data product.
+    """
+    pool = await _get_pool()
+    rows = await pg_service.query(
+        pool,
+        "SELECT brd_json, version FROM business_requirements WHERE data_product_id = $1::uuid ORDER BY version DESC LIMIT 1",
+        data_product_id,
+    )
+    if not rows:
+        return json.dumps({"status": "not_found", "message": "No BRD found for this data product"})
+    return json.dumps({"status": "ok", "version": rows[0]["version"], "brd_json": rows[0]["brd_json"]})
+
+
+@tool
 async def save_semantic_view(
     data_product_id: str,
     yaml_content: str,

@@ -49,6 +49,7 @@ StreamEventType = Literal[
     "phase_change",
     "artifact",
     "approval_request",
+    "approval_response",
     "error",
     "done",
     "pipeline_progress",
@@ -68,6 +69,14 @@ class AgentStreamEvent(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class FileContent(BaseModel):
+    """Base64-encoded file content attached to a user message."""
+
+    filename: str
+    content_type: str
+    base64_data: str
+
+
 class InvokeRequest(BaseModel):
     """Request body for POST /agent/message."""
 
@@ -75,6 +84,17 @@ class InvokeRequest(BaseModel):
     data_product_id: UUID
     message: str = Field(min_length=1, max_length=10_000)
     attachments: list[MessageAttachment] = Field(default_factory=list)
+    file_contents: list[FileContent] = Field(default_factory=list)
+
+
+class RetryRequest(BaseModel):
+    """Request body for POST /agent/retry."""
+
+    session_id: str
+    data_product_id: UUID
+    message_id: str | None = None
+    edited_content: str | None = None
+    original_content: str | None = None
 
 
 class InvokeResponse(BaseModel):

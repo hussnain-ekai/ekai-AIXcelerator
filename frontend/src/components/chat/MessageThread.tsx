@@ -1,7 +1,22 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
-import { Box, CircularProgress, Paper, Typography } from '@mui/material';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  Box,
+  Chip,
+  CircularProgress,
+  IconButton,
+  Paper,
+  TextField,
+  Tooltip,
+  Typography,
+} from '@mui/material';
+import CheckOutlined from '@mui/icons-material/CheckOutlined';
+import CloseOutlined from '@mui/icons-material/CloseOutlined';
+import ContentCopyOutlined from '@mui/icons-material/ContentCopyOutlined';
+import EditOutlined from '@mui/icons-material/EditOutlined';
+import InsertDriveFileOutlined from '@mui/icons-material/InsertDriveFileOutlined';
+import RefreshOutlined from '@mui/icons-material/RefreshOutlined';
 import type { ChatMessage, ArtifactType } from '@/stores/chatStore';
 import { useChatStore } from '@/stores/chatStore';
 import { ArtifactCard } from './ArtifactCard';
@@ -11,6 +26,8 @@ interface MessageThreadProps {
   messages: ChatMessage[];
   isStreaming: boolean;
   onOpenArtifact?: (type: ArtifactType) => void;
+  onEditMessage?: (messageId: string, newContent: string) => void;
+  onRetryMessage?: (messageId: string) => void;
 }
 
 const GOLD = '#D4A843';
@@ -84,13 +101,37 @@ function getToolDisplayName(toolName: string): string {
   return TOOL_DISPLAY_NAMES[toolName] ?? 'Working';
 }
 
+/* ------------------------------------------------------------------ */
+/*  Action button shared styles                                        */
+/* ------------------------------------------------------------------ */
+
+const ACTION_ICON_SX = {
+  fontSize: 16,
+  color: 'text.secondary',
+} as const;
+
+const ACTION_BTN_SX = {
+  p: 0.5,
+  '&:hover': { bgcolor: 'action.hover' },
+} as const;
+
+/* ------------------------------------------------------------------ */
+/*  AgentMessage                                                       */
+/* ------------------------------------------------------------------ */
+
 function AgentMessage({
   message,
   onOpenArtifact,
+  onRetry,
+  isStreaming,
 }: {
   message: ChatMessage;
   onOpenArtifact?: (type: ArtifactType) => void;
+  onRetry?: (messageId: string) => void;
+  isStreaming: boolean;
 }): React.ReactNode {
+  const [copied, setCopied] = useState(false);
+
   // Collect artifact cards to show: explicit refs take priority, then timestamp-based
   const artifacts = useChatStore((state) => state.artifacts);
   let inlineArtifacts: { type: ArtifactType; title: string }[] = [];
@@ -131,8 +172,27 @@ function AgentMessage({
     }
   }
 
+  const handleCopy = useCallback(() => {
+    void navigator.clipboard.writeText(rawText);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  }, [rawText]);
+
+  const handleRetry = useCallback(() => {
+    onRetry?.(message.id);
+  }, [onRetry, message.id]);
+
   return (
-    <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', maxWidth: '75%' }}>
+    <Box
+      sx={{
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'flex-start',
+        maxWidth: '75%',
+        '& .message-actions': { opacity: 0, transition: 'opacity 150ms' },
+        '&:hover .message-actions': { opacity: 1 },
+      }}
+    >
       <Typography
         variant="caption"
         sx={{ fontWeight: 700, color: GOLD, mb: 0.5 }}
@@ -185,18 +245,106 @@ function AgentMessage({
           </Box>
         )}
       </Paper>
+      {/* Action buttons */}
+      <Box
+        className="message-actions"
+        sx={{ display: 'flex', gap: 0.5, mt: 0.5, ml: 0.5 }}
+      >
+        <Tooltip title={copied ? 'Copied' : 'Copy'} placement="top">
+          <IconButton onClick={handleCopy} sx={ACTION_BTN_SX} size="small">
+            {copied
+              ? <CheckOutlined sx={{ ...ACTION_ICON_SX, color: 'success.main' }} />
+              : <ContentCopyOutlined sx={ACTION_ICON_SX} />
+            }
+          </IconButton>
+        </Tooltip>
+        <Tooltip title="Retry" placement="top">
+          <span>
+            <IconButton
+              onClick={handleRetry}
+              disabled={isStreaming}
+              sx={ACTION_BTN_SX}
+              size="small"
+            >
+              <RefreshOutlined sx={ACTION_ICON_SX} />
+            </IconButton>
+          </span>
+        </Tooltip>
+      </Box>
     </Box>
   );
 }
 
-function UserMessage({ message }: { message: ChatMessage }): React.ReactNode {
+/* ------------------------------------------------------------------ */
+/*  UserMessage                                                        */
+/* ------------------------------------------------------------------ */
+
+function UserMessage({
+  message,
+  onEdit,
+  onRetry,
+  isStreaming,
+}: {
+  message: ChatMessage;
+  onEdit?: (messageId: string, newContent: string) => void;
+  onRetry?: (messageId: string) => void;
+  isStreaming: boolean;
+}): React.ReactNode {
+  const [isEditing, setIsEditing] = useState(false);
+  const [editText, setEditText] = useState('');
+
   // Extract text from content (defensive handling for structured content)
   const contentText = typeof message.content === 'string'
     ? message.content
     : (message.content as {text?: string})?.text ?? JSON.stringify(message.content);
 
+  const handleStartEdit = useCallback(() => {
+    setEditText(contentText);
+    setIsEditing(true);
+  }, [contentText]);
+
+  const handleCancelEdit = useCallback(() => {
+    setIsEditing(false);
+    setEditText('');
+  }, []);
+
+  const handleSaveEdit = useCallback(() => {
+    const trimmed = editText.trim();
+    if (trimmed.length === 0 || trimmed === contentText) {
+      setIsEditing(false);
+      return;
+    }
+    onEdit?.(message.id, trimmed);
+    setIsEditing(false);
+  }, [editText, contentText, onEdit, message.id]);
+
+  const handleRetry = useCallback(() => {
+    onRetry?.(message.id);
+  }, [onRetry, message.id]);
+
+  const handleEditKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        handleSaveEdit();
+      }
+      if (e.key === 'Escape') {
+        handleCancelEdit();
+      }
+    },
+    [handleSaveEdit, handleCancelEdit],
+  );
+
   return (
-    <Box sx={{ display: 'flex', justifyContent: 'flex-end' }}>
+    <Box
+      sx={{
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'flex-end',
+        '& .message-actions': { opacity: 0, transition: 'opacity 150ms' },
+        '&:hover .message-actions': { opacity: 1 },
+      }}
+    >
       <Paper
         elevation={0}
         sx={{
@@ -208,10 +356,98 @@ function UserMessage({ message }: { message: ChatMessage }): React.ReactNode {
           maxWidth: '75%',
         }}
       >
-        <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>
-          {contentText}
-        </Typography>
+        {isEditing ? (
+          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+            <TextField
+              value={editText}
+              onChange={(e) => setEditText(e.target.value)}
+              onKeyDown={handleEditKeyDown}
+              multiline
+              maxRows={6}
+              size="small"
+              fullWidth
+              autoFocus
+              sx={{ '& .MuiOutlinedInput-root': { borderRadius: 1 } }}
+            />
+            <Box sx={{ display: 'flex', gap: 0.5, justifyContent: 'flex-end' }}>
+              <IconButton onClick={handleCancelEdit} size="small" sx={ACTION_BTN_SX}>
+                <CloseOutlined sx={ACTION_ICON_SX} />
+              </IconButton>
+              <IconButton onClick={handleSaveEdit} size="small" sx={ACTION_BTN_SX}>
+                <CheckOutlined sx={{ ...ACTION_ICON_SX, color: 'primary.main' }} />
+              </IconButton>
+            </Box>
+          </Box>
+        ) : (
+          <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>
+            {contentText}
+          </Typography>
+        )}
+        {/* Attachment chips */}
+        {message.attachments && message.attachments.length > 0 && (
+          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5, mt: 1 }}>
+            {message.attachments.map((att, idx) => (
+              att.thumbnailUrl ? (
+                <Box
+                  key={idx}
+                  component="img"
+                  src={att.thumbnailUrl}
+                  alt={att.filename}
+                  sx={{
+                    width: 64,
+                    height: 64,
+                    objectFit: 'cover',
+                    borderRadius: 1,
+                    border: 1,
+                    borderColor: 'divider',
+                  }}
+                />
+              ) : (
+                <Chip
+                  key={idx}
+                  icon={<InsertDriveFileOutlined sx={{ fontSize: 16 }} />}
+                  label={att.filename}
+                  size="small"
+                  variant="outlined"
+                  sx={{ maxWidth: 200 }}
+                />
+              )
+            ))}
+          </Box>
+        )}
       </Paper>
+      {/* Action buttons */}
+      {!isEditing && (
+        <Box
+          className="message-actions"
+          sx={{ display: 'flex', gap: 0.5, mt: 0.5, mr: 0.5 }}
+        >
+          <Tooltip title="Edit" placement="top">
+            <span>
+              <IconButton
+                onClick={handleStartEdit}
+                disabled={isStreaming}
+                sx={ACTION_BTN_SX}
+                size="small"
+              >
+                <EditOutlined sx={ACTION_ICON_SX} />
+              </IconButton>
+            </span>
+          </Tooltip>
+          <Tooltip title="Retry" placement="top">
+            <span>
+              <IconButton
+                onClick={handleRetry}
+                disabled={isStreaming}
+                sx={ACTION_BTN_SX}
+                size="small"
+              >
+                <RefreshOutlined sx={ACTION_ICON_SX} />
+              </IconButton>
+            </span>
+          </Tooltip>
+        </Box>
+      )}
     </Box>
   );
 }
@@ -243,15 +479,35 @@ function SystemMessage({ message }: { message: ChatMessage }): React.ReactNode {
 function MessageBubble({
   message,
   onOpenArtifact,
+  onEditMessage,
+  onRetryMessage,
+  isStreaming,
 }: {
   message: ChatMessage;
   onOpenArtifact?: (type: ArtifactType) => void;
+  onEditMessage?: (messageId: string, newContent: string) => void;
+  onRetryMessage?: (messageId: string) => void;
+  isStreaming: boolean;
 }): React.ReactNode {
   switch (message.role) {
     case 'assistant':
-      return <AgentMessage message={message} onOpenArtifact={onOpenArtifact} />;
+      return (
+        <AgentMessage
+          message={message}
+          onOpenArtifact={onOpenArtifact}
+          onRetry={onRetryMessage}
+          isStreaming={isStreaming}
+        />
+      );
     case 'user':
-      return <UserMessage message={message} />;
+      return (
+        <UserMessage
+          message={message}
+          onEdit={onEditMessage}
+          onRetry={onRetryMessage}
+          isStreaming={isStreaming}
+        />
+      );
     case 'system':
       return <SystemMessage message={message} />;
     default:
@@ -263,6 +519,8 @@ export function MessageThread({
   messages,
   isStreaming,
   onOpenArtifact,
+  onEditMessage,
+  onRetryMessage,
 }: MessageThreadProps): React.ReactNode {
   const bottomRef = useRef<HTMLDivElement>(null);
   const pipelineProgress = useChatStore((state) => state.pipelineProgress);
@@ -308,6 +566,9 @@ export function MessageThread({
           key={message.id}
           message={message}
           onOpenArtifact={onOpenArtifact}
+          onEditMessage={onEditMessage}
+          onRetryMessage={onRetryMessage}
+          isStreaming={isStreaming}
         />
       ))}
 

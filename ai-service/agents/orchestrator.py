@@ -13,7 +13,6 @@ agent that delegates to specialized subagents based on conversation phase:
 from __future__ import annotations
 
 import logging
-from functools import lru_cache
 from typing import Any
 
 from langgraph.graph.state import CompiledStateGraph
@@ -61,6 +60,7 @@ def _load_tools() -> None:
         update_erd,
     )
     from tools.postgres_tools import (
+        get_latest_brd,
         load_workspace_state,
         log_agent_action,
         save_brd,
@@ -86,6 +86,7 @@ def _load_tools() -> None:
         query_erd_graph,
         save_brd,
         upload_artifact,
+        get_latest_brd,
     ]
 
     # Generation Agent tools
@@ -200,8 +201,61 @@ def _build_subagents(model: Any) -> list[dict[str, Any]]:
     ]
 
 
-@lru_cache(maxsize=1)
-def get_orchestrator() -> CompiledStateGraph:
+# Module-level singletons (async init — can't use @lru_cache)
+_orchestrator: CompiledStateGraph | None = None
+_checkpointer: Any = None  # AsyncPostgresSaver
+_checkpointer_pool: Any = None  # psycopg_pool.AsyncConnectionPool
+
+
+async def get_checkpointer() -> Any:
+    """Return (and lazily create) the shared AsyncPostgresSaver checkpointer.
+
+    Uses a psycopg AsyncConnectionPool for connection management.
+    Creates checkpoint tables on first call.
+    """
+    global _checkpointer, _checkpointer_pool
+
+    if _checkpointer is not None:
+        return _checkpointer
+
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+    from psycopg_pool import AsyncConnectionPool
+
+    from config import get_settings
+
+    settings = get_settings()
+    # Convert asyncpg-style URL to psycopg-style (postgresql:// → postgresql://)
+    # Both use the same scheme, but psycopg needs the conninfo format
+    conn_string = settings.database_url
+    if conn_string.startswith("postgres://"):
+        conn_string = "postgresql://" + conn_string[len("postgres://"):]
+
+    _checkpointer_pool = AsyncConnectionPool(
+        conninfo=conn_string,
+        min_size=2,
+        max_size=5,
+        open=False,
+        kwargs={"autocommit": True, "prepare_threshold": 0},
+    )
+    await _checkpointer_pool.open()
+
+    _checkpointer = AsyncPostgresSaver(_checkpointer_pool)
+    await _checkpointer.setup()
+    logger.info("PostgreSQL checkpointer initialized (checkpoint tables ready)")
+    return _checkpointer
+
+
+async def close_checkpointer() -> None:
+    """Close the checkpointer's connection pool. Called on shutdown."""
+    global _checkpointer, _checkpointer_pool
+    if _checkpointer_pool is not None:
+        await _checkpointer_pool.close()
+        logger.info("Checkpointer connection pool closed")
+    _checkpointer = None
+    _checkpointer_pool = None
+
+
+async def get_orchestrator() -> CompiledStateGraph:
     """Create and cache the Deep Agents orchestrator.
 
     Returns a compiled LangGraph graph configured with:
@@ -209,7 +263,13 @@ def get_orchestrator() -> CompiledStateGraph:
     - 6 specialized subagents (all using the same model as orchestrator)
     - All 19 LangChain tools
     - Langfuse tracing for monitoring LLM usage
+    - PostgreSQL checkpointer for persistent conversation state
     """
+    global _orchestrator
+
+    if _orchestrator is not None:
+        return _orchestrator
+
     from deepagents import create_deep_agent
 
     from config import get_effective_settings
@@ -217,6 +277,7 @@ def get_orchestrator() -> CompiledStateGraph:
 
     settings = get_effective_settings()
     model = get_chat_model()
+    checkpointer = await get_checkpointer()
 
     # Pass the same model to all subagents to avoid creating separate model instances
     subagents = _build_subagents(model)
@@ -239,17 +300,20 @@ def get_orchestrator() -> CompiledStateGraph:
         tools=[],  # No tools - orchestrator delegates to subagents
         subagents=subagents,
         name="ekaix-orchestrator",
+        checkpointer=checkpointer,
     )
 
-    logger.info("Deep Agents orchestrator compiled successfully")
+    _orchestrator = agent
+    logger.info("Deep Agents orchestrator compiled successfully (with PostgreSQL checkpointer)")
     return agent
 
 
-def reset_orchestrator() -> CompiledStateGraph:
+async def reset_orchestrator() -> CompiledStateGraph:
     """Clear the cached orchestrator and rebuild it with current settings.
 
     Call this after applying LLM config overrides so the new model is used.
     """
-    get_orchestrator.cache_clear()
+    global _orchestrator
+    _orchestrator = None
     logger.info("Orchestrator cache cleared — rebuilding with current settings")
-    return get_orchestrator()
+    return await get_orchestrator()

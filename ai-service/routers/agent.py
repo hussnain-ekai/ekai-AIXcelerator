@@ -1,6 +1,7 @@
 """Agent conversation endpoints — message handling, SSE streaming, and control actions."""
 
 import asyncio
+import base64
 import json
 import logging
 from collections.abc import AsyncGenerator
@@ -15,9 +16,9 @@ from config import get_settings
 from models.schemas import (
     AgentStreamEvent,
     ApproveRequest,
-    InterruptRequest,
     InvokeRequest,
     InvokeResponse,
+    RetryRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,7 +56,10 @@ async def send_message(request: InvokeRequest) -> InvokeResponse:
     _active_streams[session_id] = queue
 
     # Launch the agent invocation in the background
-    asyncio.create_task(_run_agent(session_id, request.message, str(request.data_product_id), queue))
+    asyncio.create_task(
+        _run_agent(session_id, request.message, str(request.data_product_id), queue,
+                   file_contents=request.file_contents)
+    )
 
     return InvokeResponse(
         session_id=session_id,
@@ -307,15 +311,125 @@ RULES:
     return summary
 
 
+def _build_multimodal_content(
+    text: str,
+    file_contents: list | None = None,
+) -> str | list[dict]:
+    """Build HumanMessage content using standard LangChain content blocks.
+
+    Uses the native LangChain multimodal format (langchain-google-genai v4+):
+      - Text files (CSV, TXT, JSON): decoded to UTF-8, appended as text.
+      - Images:  ``{"type": "image_url", ...}`` with base64 data URI.
+      - PDFs:    ``{"type": "file", "base64": ..., "mime_type": ...}``.
+      - Audio:   ``{"type": "media", "data": ..., "mime_type": ...}``.
+      - Video:   ``{"type": "media", "data": ..., "mime_type": ...}``.
+      - Other:   ``{"type": "media", "data": ..., "mime_type": ...}``.
+
+    Returns a plain string when all attachments are text-decodable (no
+    multimodal blocks needed). Returns a list of content block dicts when
+    binary attachments (images, PDFs, audio, video) are present.
+
+    The orchestrator LLM (Gemini) processes binary attachments natively.
+    When delegating to subagents via Deep Agents ``task()``, the orchestrator
+    includes relevant file content in the task description text.
+    """
+    if not file_contents:
+        return text
+
+    from models.schemas import FileContent
+
+    logger.info("Building multimodal content: %d file(s) attached", len(file_contents))
+    for fc in file_contents:
+        if isinstance(fc, FileContent):
+            logger.info("  File: %s (%s, %d bytes base64)",
+                        fc.filename, fc.content_type, len(fc.base64_data))
+
+    # Separate text-decodable files from binary files
+    text_parts: list[str] = []
+    binary_blocks: list[dict] = []
+
+    for fc in file_contents:
+        if not isinstance(fc, FileContent):
+            continue
+
+        mime = fc.content_type or "application/octet-stream"
+
+        # --- Images: image_url with base64 data URI ---
+        if mime.startswith("image/"):
+            binary_blocks.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{fc.base64_data}"},
+            })
+
+        # --- PDFs / documents: file block with base64 + mime_type ---
+        elif mime == "application/pdf":
+            binary_blocks.append({
+                "type": "file",
+                "base64": fc.base64_data,
+                "mime_type": mime,
+            })
+
+        # --- Audio / video: media block ---
+        elif mime.startswith("audio/") or mime.startswith("video/"):
+            binary_blocks.append({
+                "type": "media",
+                "data": fc.base64_data,
+                "mime_type": mime,
+            })
+
+        # --- Text-decodable files (CSV, TXT, JSON, XML, etc.) ---
+        elif mime.startswith("text/") or mime in (
+            "application/json",
+            "application/xml",
+            "application/csv",
+        ):
+            try:
+                decoded = base64.b64decode(fc.base64_data).decode("utf-8")
+                text_parts.append(f"[Attached file: {fc.filename}]\n{decoded[:50000]}")
+            except Exception:
+                text_parts.append(f"[Attached file: {fc.filename} — could not decode as text]")
+
+        # --- Unknown binary: try text decode, fall back to media block ---
+        else:
+            try:
+                decoded = base64.b64decode(fc.base64_data).decode("utf-8")
+                text_parts.append(f"[Attached file: {fc.filename}]\n{decoded[:50000]}")
+            except Exception:
+                binary_blocks.append({
+                    "type": "media",
+                    "data": fc.base64_data,
+                    "mime_type": mime,
+                })
+
+    # If no binary attachments, return a plain string (most compatible,
+    # survives Deep Agents task() delegation without losing content)
+    if not binary_blocks:
+        combined = text
+        for tp in text_parts:
+            combined += f"\n\n{tp}"
+        return combined
+
+    # Build multimodal content blocks
+    blocks: list[dict] = [{"type": "text", "text": text}]
+    for tp in text_parts:
+        blocks.append({"type": "text", "text": tp})
+    blocks.extend(binary_blocks)
+    logger.info("Multimodal content: %d blocks (%s)",
+                len(blocks), [b["type"] for b in blocks])
+    return blocks
+
+
 async def _run_agent(
     session_id: str,
     message: str,
     data_product_id: str,
     queue: asyncio.Queue[dict | None],
+    file_contents: list | None = None,
 ) -> None:
     """Run the orchestrator agent and push events to the SSE queue."""
-    # Collect messages for persistence
-    collected_messages: list[dict] = []
+    # Local assistant text buffer for SSE streaming and safety net (BRD detection).
+    # Chat history persistence is handled by LangGraph's PostgreSQL checkpointer.
+    _assistant_texts: list[str] = []
     current_assistant_content = ""
     # Track which LLM run_id is currently streaming to detect when a new
     # agent starts speaking (prevents concatenating subagent + orchestrator output)
@@ -399,21 +513,6 @@ async def _run_agent(
                 )
                 logger.info("Pipeline complete, summary length: %d chars", len(actual_message))
 
-        # Add user message to collection
-        if message.strip() == DISCOVERY_TRIGGER:
-            # Save the discovery context so subsequent calls see field analysis & data_product_id
-            collected_messages.append({
-                "role": "user",
-                "content": actual_message,
-                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
-            })
-        else:
-            collected_messages.append({
-                "role": "user",
-                "content": message,
-                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
-            })
-
         # Langfuse tracing is now handled at the model level in services/llm.py
         # Each LLM call will be automatically traced with input/output
         settings = get_effective_settings()
@@ -436,32 +535,41 @@ async def _run_agent(
         else:
             set_data_isolation_context(database=None, tables=None)
 
-        agent = get_orchestrator()
+        agent = await get_orchestrator()
         config = {
             "configurable": {"thread_id": session_id},
             "recursion_limit": _settings.agent_recursion_limit,  # Shared between orchestrator + subagents
         }
 
-        # Load previous conversation from Redis so subagents see full context
-        # (No checkpointer — each invocation starts fresh, so we replay history)
-        history_messages = []
-        try:
-            from services import redis as redis_service
-            client = await redis_service.get_client(settings.redis_url)
-            history_key = f"agent:history:{session_id}"
-            existing = await redis_service.get_json(client, history_key)
-            if existing:
-                for msg in existing.get("messages", []):
-                    role = msg.get("role", "")
-                    content = msg.get("content", "")
-                    if role == "user":
-                        history_messages.append(HumanMessage(content=content))
-                    elif role == "assistant":
-                        history_messages.append(AIMessage(content=content))
-        except Exception as e:
-            logger.warning("Failed to load history for session %s: %s", session_id, e)
+        # Fix empty-content AI messages in checkpoint — Gemini rejects messages
+        # with empty parts.  These occur when the orchestrator calls tools
+        # (e.g. task) with no text content.
+        from langchain_core.messages import RemoveMessage as _RM
 
-        input_messages = {"messages": history_messages + [HumanMessage(content=actual_message)]}
+        _chk_state = await agent.aget_state(config)
+        _chk_msgs = (_chk_state.values.get("messages", [])
+                     if _chk_state and _chk_state.values else [])
+        _patches: list = []
+        for _m in _chk_msgs:
+            if _m.type == "ai":
+                _c = _m.content
+                _is_empty = (not _c or _c == [] or _c == "" or
+                             (isinstance(_c, list) and len(_c) == 0))
+                if _is_empty:
+                    if getattr(_m, "tool_calls", None):
+                        _patches.append(AIMessage(content=".", id=_m.id,
+                                                  tool_calls=_m.tool_calls))
+                    else:
+                        _patches.append(_RM(id=_m.id))
+        if _patches:
+            await agent.aupdate_state(config, {"messages": _patches})
+            logger.info("Patched %d empty AI messages in checkpoint for session %s",
+                        len(_patches), session_id)
+
+        # With PostgreSQL checkpointer, LangGraph automatically restores
+        # conversation history for this thread_id. We only send the new message.
+        content = _build_multimodal_content(actual_message, file_contents)
+        input_messages = {"messages": [HumanMessage(content=content)]}
 
         # Stream events from the agent
         async for event in agent.astream_events(input_messages, config=config, version="v2"):
@@ -478,12 +586,8 @@ async def _run_agent(
                         if _current_run_id is not None and current_assistant_content.strip():
                             # Save content for deduplication before closing
                             _previous_run_content = current_assistant_content.strip()
-                            # Persist this run's content as a separate message
-                            collected_messages.append({
-                                "role": "assistant",
-                                "content": current_assistant_content,
-                                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
-                            })
+                            # Save for safety net (BRD detection)
+                            _assistant_texts.append(current_assistant_content)
                             current_assistant_content = ""  # Reset for new run
                             await queue.put({
                                 "type": "message_done",
@@ -693,21 +797,17 @@ async def _run_agent(
             current_assistant_content += _current_run_buffer
             _current_run_buffer = ""
 
-        # Add final assistant message to collection if we have content
+        # Add final assistant content to local buffer for safety net
         if current_assistant_content.strip():
-            collected_messages.append({
-                "role": "assistant",
-                "content": current_assistant_content,
-                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
-            })
+            _assistant_texts.append(current_assistant_content)
 
         # --- Safety net: save BRD if requirements agent produced text but didn't call save_brd ---
         if _requirements_phase_ran and not _brd_tool_called:
             # Find the longest assistant message — likely the BRD
             brd_content = ""
-            for msg in collected_messages:
-                if msg["role"] == "assistant" and len(msg["content"]) > len(brd_content):
-                    brd_content = msg["content"]
+            for text in _assistant_texts:
+                if len(text) > len(brd_content):
+                    brd_content = text
             # Only save if it looks like a BRD (> 2000 chars AND contains BRD section markers)
             _BRD_MARKERS = ("SECTION 1:", "EXECUTIVE SUMMARY", "METRICS AND CALCULATIONS",
                             "DATA PRODUCT:", "---BEGIN BRD---", "SECTION 2:")
@@ -760,48 +860,25 @@ async def _run_agent(
                     has_brd_markers,
                 )
 
-        # Persist messages to Redis for session recovery
-        if collected_messages:
-            try:
-                from services import redis as redis_service
-                from services.postgres import get_pool, execute
-                from config import get_settings
+        # Update data product state with session_id so frontend knows which thread to recover.
+        # Chat history is now persisted automatically by LangGraph's PostgreSQL checkpointer.
+        try:
+            from services.postgres import get_pool, execute
+            from config import get_settings
 
-                settings = get_settings()
-                client = await redis_service.get_client(settings.redis_url)
-                history_key = f"agent:history:{session_id}"
-
-                # Load existing history and append new messages
-                existing = await redis_service.get_json(client, history_key)
-                existing_messages = existing.get("messages", []) if existing else []
-                all_messages = existing_messages + collected_messages
-
-                await redis_service.set_json(
-                    client,
-                    history_key,
-                    {"messages": all_messages, "data_product_id": data_product_id},
-                    ttl=_settings.session_ttl_seconds,  # Use configured TTL
-                )
-                logger.info(
-                    "Persisted %d messages to Redis for session %s (total: %d)",
-                    len(collected_messages),
-                    session_id,
-                    len(all_messages),
-                )
-
-                # Also update data product state with session_id for recovery on page load
-                pool = await get_pool(settings.database_url)
-                await execute(
-                    pool,
-                    """UPDATE data_products
-                       SET state = jsonb_set(state, '{session_id}', $1::jsonb)
-                       WHERE id = $2::uuid""",
-                    f'"{session_id}"',
-                    data_product_id,
-                )
-                logger.info("Updated data product %s with session_id %s", data_product_id, session_id)
-            except Exception as e:
-                logger.warning("Failed to persist messages to Redis: %s", e)
+            settings = get_settings()
+            pool = await get_pool(settings.database_url)
+            await execute(
+                pool,
+                """UPDATE data_products
+                   SET state = jsonb_set(state, '{session_id}', $1::jsonb)
+                   WHERE id = $2::uuid""",
+                f'"{session_id}"',
+                data_product_id,
+            )
+            logger.info("Updated data product %s with session_id %s", data_product_id, session_id)
+        except Exception as e:
+            logger.warning("Failed to update data product session_id: %s", e)
 
         # Signal stream end
         await queue.put({
@@ -871,18 +948,17 @@ async def stream_response(session_id: str) -> StreamingResponse:
     )
 
 
-@router.post("/interrupt")
-async def interrupt_agent(request: InterruptRequest) -> dict[str, str]:
+@router.post("/interrupt/{session_id}")
+async def interrupt_agent(session_id: str) -> dict[str, str]:
     """Interrupt a running agent session."""
-    session_id = request.session_id
-    logger.info("Interrupt requested for session %s: %s", session_id, request.reason)
+    logger.info("Interrupt requested for session %s", session_id)
 
     # Push an error event and close the stream
     queue = _active_streams.get(session_id)
     if queue:
         await queue.put({
             "type": "error",
-            "data": {"message": f"Interrupted: {request.reason}"},
+            "data": {"message": "Interrupted by user"},
         })
         await queue.put({
             "type": "done",
@@ -915,23 +991,303 @@ async def approve_action(request: ApproveRequest) -> dict[str, str]:
     return {"status": status, "session_id": request.session_id}
 
 
+@router.post("/retry")
+async def retry_message(request: RetryRequest) -> InvokeResponse:
+    """Retry or edit a message using LangGraph checkpoint time-travel.
+
+    Finds the appropriate checkpoint, forks from it, and re-runs the agent.
+    For edits, replaces the user message content before re-running.
+    """
+    session_id = request.session_id
+    message_id = str(uuid4())
+    logger.info(
+        "Retry requested for session %s (target_message=%s, edited=%s)",
+        session_id,
+        request.message_id,
+        request.edited_content is not None,
+    )
+
+    queue: asyncio.Queue[dict | None] = asyncio.Queue()
+    _active_streams[session_id] = queue
+
+    asyncio.create_task(
+        _run_agent_from_checkpoint(
+            session_id=session_id,
+            data_product_id=str(request.data_product_id),
+            target_message_id=request.message_id,
+            edited_content=request.edited_content,
+            original_content=request.original_content,
+            queue=queue,
+        )
+    )
+
+    return InvokeResponse(
+        session_id=session_id,
+        message_id=message_id,
+        status="processing",
+    )
+
+
+async def _run_agent_from_checkpoint(
+    session_id: str,
+    data_product_id: str,
+    target_message_id: str | None,
+    edited_content: str | None,
+    original_content: str | None,
+    queue: asyncio.Queue[dict | None],
+) -> None:
+    """Run the agent from a specific point for retry/edit.
+
+    Uses LangGraph's aupdate_state + RemoveMessage to trim messages
+    after the target point, then re-invokes the agent normally.
+    This avoids checkpoint forking issues with Gemini's empty-parts restriction.
+    """
+    try:
+        from agents.orchestrator import get_orchestrator
+        from langchain_core.messages import RemoveMessage
+        from tools.snowflake_tools import set_data_isolation_context
+
+        # Set up data isolation
+        dp_info = await _get_data_product_info(data_product_id)
+        if dp_info:
+            set_data_isolation_context(database=dp_info["database"], tables=dp_info["tables"])
+        else:
+            set_data_isolation_context(database=None, tables=None)
+
+        agent = await get_orchestrator()
+        config = {"configurable": {"thread_id": session_id}}
+
+        def _normalize_content(content: str | list) -> str:
+            """Normalize message content (str or list of blocks) to a plain string."""
+            if isinstance(content, list):
+                return "".join(
+                    block.get("text", "") if isinstance(block, dict) else str(block)
+                    for block in content
+                )
+            return content
+
+        # Get current state
+        current_state = await agent.aget_state(config)
+        all_messages = (current_state.values.get("messages", [])
+                        if current_state and current_state.values else [])
+
+        if not all_messages:
+            await queue.put({
+                "type": "error",
+                "data": {"message": "No messages found to retry."},
+            })
+            await queue.put({"type": "done", "data": {"message": "Retry failed"}})
+            await queue.put(None)
+            return
+
+        # Resolve the target message ID
+        real_msg_id = target_message_id
+        if target_message_id and target_message_id.startswith("recovered-"):
+            parts = target_message_id.split("-")
+            try:
+                visible_idx = int(parts[1])
+                visible_count = 0
+                for msg in all_messages:
+                    content_str = _normalize_content(msg.content) if hasattr(msg, "content") else ""
+                    if "[INTERNAL CONTEXT" in content_str:
+                        continue
+                    if msg.type not in ("human", "ai"):
+                        continue
+                    if visible_count == visible_idx:
+                        real_msg_id = msg.id
+                        break
+                    visible_count += 1
+            except (ValueError, IndexError):
+                pass
+
+        # Find the target message in the state and determine what to replay
+        replay_content: str | None = None
+        cut_index: int | None = None  # Index AFTER which to remove messages
+
+        if real_msg_id:
+            for i, msg in enumerate(all_messages):
+                if msg.id == real_msg_id:
+                    if msg.type == "human":
+                        # User message retry/edit: keep everything BEFORE this msg,
+                        # remove this msg and everything after, then re-send
+                        replay_content = edited_content or _normalize_content(msg.content)
+                        cut_index = i  # Remove from index i onwards
+                    else:
+                        # Agent message retry: find preceding user message,
+                        # remove from that user msg onwards
+                        for j in range(i, -1, -1):
+                            if all_messages[j].type == "human":
+                                replay_content = _normalize_content(all_messages[j].content)
+                                cut_index = j
+                                break
+                    break
+        else:
+            # No message_id: retry the last user message
+            for i in range(len(all_messages) - 1, -1, -1):
+                if all_messages[i].type == "human":
+                    replay_content = _normalize_content(all_messages[i].content)
+                    cut_index = i
+                    break
+
+        # Fallback: if ID-based match failed, try matching by content.
+        # Frontend-generated UUIDs (crypto.randomUUID) don't match LangGraph's
+        # internal message IDs, so we match by content as a fallback.
+        if cut_index is None and original_content:
+            search_content = original_content[:300]
+            for i, msg in enumerate(all_messages):
+                if msg.type == "human":
+                    msg_text = _normalize_content(msg.content)
+                    if msg_text[:300] == search_content:
+                        replay_content = edited_content or msg_text
+                        cut_index = i
+                        logger.info("Retry: matched message by content at index %d", i)
+                        break
+
+        # Last resort: use the last human message
+        if cut_index is None:
+            for i in range(len(all_messages) - 1, -1, -1):
+                if all_messages[i].type == "human":
+                    replay_content = edited_content or _normalize_content(all_messages[i].content)
+                    cut_index = i
+                    logger.info("Retry: fell back to last human message at index %d", i)
+                    break
+
+        if replay_content is None or cut_index is None:
+            await queue.put({
+                "type": "error",
+                "data": {"message": "Could not find the message to retry."},
+            })
+            await queue.put({"type": "done", "data": {"message": "Retry failed"}})
+            await queue.put(None)
+            return
+
+        # Remove messages from cut_index onwards using RemoveMessage
+        msgs_to_remove = all_messages[cut_index:]
+        if msgs_to_remove:
+            remove_ops = [RemoveMessage(id=m.id) for m in msgs_to_remove]
+            await agent.aupdate_state(config, {"messages": remove_ops})
+            logger.info("Retry: removed %d messages from index %d", len(msgs_to_remove), cut_index)
+
+        # Fix empty-content AI messages — Gemini rejects messages with empty parts.
+        # These occur when the orchestrator calls tools (e.g. task) with no text content.
+        refreshed_state = await agent.aget_state(config)
+        remaining_msgs = (refreshed_state.values.get("messages", [])
+                          if refreshed_state and refreshed_state.values else [])
+        patches = []
+        extra_removes = []
+        for m in remaining_msgs:
+            if m.type == "ai":
+                c = m.content
+                is_empty = (not c or c == [] or c == "" or
+                            (isinstance(c, list) and len(c) == 0))
+                if is_empty:
+                    if getattr(m, "tool_calls", None):
+                        # Has tool calls — patch content with placeholder
+                        patches.append(AIMessage(
+                            content=".",
+                            id=m.id,
+                            tool_calls=m.tool_calls,
+                        ))
+                    else:
+                        # No content AND no tool calls — remove entirely
+                        extra_removes.append(RemoveMessage(id=m.id))
+        updates = patches + extra_removes
+        if updates:
+            await agent.aupdate_state(config, {"messages": updates})
+            logger.info("Retry: fixed %d patched + %d removed empty AI messages", len(patches), len(extra_removes))
+
+        logger.info("Retry: replaying %d chars for session %s", len(replay_content), session_id)
+
+        # Now run the agent normally — the state has been trimmed
+        await _run_agent(
+            session_id=session_id,
+            message=replay_content,
+            data_product_id=data_product_id,
+            queue=queue,
+        )
+
+    except Exception as e:
+        logger.exception("Retry failed for session %s: %s", session_id, e)
+        await queue.put({
+            "type": "error",
+            "data": {"message": f"Retry failed: {e}"},
+        })
+        await queue.put({"type": "done", "data": {"message": "Retry failed"}})
+        await queue.put(None)
+
+
+@router.get("/checkpoints/{session_id}")
+async def list_checkpoints(session_id: str) -> dict:
+    """List checkpoints for a session (for retry/edit message mapping)."""
+    try:
+        from agents.orchestrator import get_orchestrator
+
+        agent = await get_orchestrator()
+        config = {"configurable": {"thread_id": session_id}}
+        checkpoints = []
+        async for state in agent.aget_state_history(config, limit=50):
+            messages = state.values.get("messages", [])
+            last_msg_id = messages[-1].id if messages else None
+            checkpoints.append({
+                "checkpoint_id": state.config["configurable"].get("checkpoint_id"),
+                "message_count": len(messages),
+                "last_message_id": last_msg_id,
+                "created_at": state.created_at,
+                "next": list(state.next) if state.next else [],
+            })
+        return {"session_id": session_id, "checkpoints": checkpoints}
+    except Exception as e:
+        logger.error("Failed to list checkpoints for session %s: %s", session_id, e)
+        return {"session_id": session_id, "checkpoints": [], "error": str(e)}
+
+
 @router.get("/history/{session_id}")
 async def get_history(session_id: str) -> dict:
-    """Get conversation history for a session."""
+    """Get conversation history from LangGraph's PostgreSQL checkpointer."""
     try:
-        from services import redis as redis_service
-        from config import get_settings
+        from agents.orchestrator import get_orchestrator
 
-        settings = get_settings()
-        client = await redis_service.get_client(settings.redis_url)
-        key = f"agent:history:{session_id}"
-        history = await redis_service.get_json(client, key)
-        if history:
-            return {
-                "session_id": session_id,
-                "messages": history.get("messages", []),
-                "data_product_id": history.get("data_product_id"),
-            }
+        agent = await get_orchestrator()
+        config = {"configurable": {"thread_id": session_id}}
+        state = await agent.aget_state(config)
+        if state and state.values and "messages" in state.values:
+            messages = []
+            for msg in state.values["messages"]:
+                if not hasattr(msg, "content") or not hasattr(msg, "type"):
+                    continue
+                # Skip system messages
+                if msg.type == "system":
+                    continue
+                content = msg.content
+                # Normalize list/dict content to string
+                if isinstance(content, list):
+                    text_parts = [
+                        block.get("text", "") if isinstance(block, dict) else str(block)
+                        for block in content
+                    ]
+                    content = "".join(text_parts)
+                elif isinstance(content, dict):
+                    content = content.get("text", str(content))
+                # Skip empty or placeholder messages (tool-call-only turns, retry patches)
+                if not content or not content.strip() or content.strip() == ".":
+                    continue
+                # Map roles: human -> user, everything else (ai, tool) -> assistant
+                # Deep Agents stores subagent responses as tool messages
+                role = "user" if msg.type == "human" else "assistant"
+                messages.append({"role": role, "content": content, "id": msg.id})
+
+            # Deduplicate messages with identical role+content (keep first occurrence).
+            # Non-adjacent duplicates can occur from failed retry attempts that
+            # appended duplicate HumanMessages to the checkpoint state.
+            seen: set[str] = set()
+            deduped: list[dict] = []
+            for m in messages:
+                fingerprint = f"{m['role']}:{m['content'][:500]}"
+                if fingerprint in seen:
+                    continue
+                seen.add(fingerprint)
+                deduped.append(m)
+            return {"session_id": session_id, "messages": deduped}
     except Exception as e:
         logger.error("Failed to get history for session %s: %s", session_id, e)
 

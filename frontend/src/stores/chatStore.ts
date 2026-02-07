@@ -4,6 +4,12 @@ type MessageRole = 'user' | 'assistant' | 'system';
 type AgentPhase = 'discovery' | 'requirements' | 'generation' | 'validation' | 'publishing' | 'explorer' | 'idle';
 type ArtifactType = 'erd' | 'yaml' | 'brd' | 'data_quality' | 'data_preview';
 
+interface ChatMessageAttachment {
+  filename: string;
+  contentType: string;
+  thumbnailUrl?: string;
+}
+
 interface ChatMessage {
   id: string;
   role: MessageRole;
@@ -13,6 +19,8 @@ interface ChatMessage {
   isStreaming?: boolean;
   /** Artifact types to render as clickable cards inline with this message. */
   artifactRefs?: ArtifactType[];
+  /** File attachments on user messages. */
+  attachments?: ChatMessageAttachment[];
 }
 
 interface ToolCall {
@@ -61,6 +69,8 @@ interface ChatState {
   addArtifact: (artifact: ChatArtifact) => void;
   setActivePanel: (panel: ArtifactType | null) => void;
   setPipelineProgress: (progress: PipelineProgress | null) => void;
+  truncateAfter: (messageId: string) => void;
+  editMessage: (messageId: string, newContent: string) => void;
   clearMessages: () => void;
   reset: () => void;
   hydrateFromHistory: (messages: ChatMessage[], sessionId: string, phase: AgentPhase) => void;
@@ -154,6 +164,21 @@ export const useChatStore = create<ChatState>()((set) => ({
   setPipelineProgress: (progress: PipelineProgress | null) =>
     set({ pipelineProgress: progress }),
 
+  truncateAfter: (messageId: string) =>
+    set((state) => {
+      const idx = state.messages.findIndex((m) => m.id === messageId);
+      if (idx === -1) return state;
+      return { messages: state.messages.slice(0, idx + 1) };
+    }),
+
+  editMessage: (messageId: string, newContent: string) =>
+    set((state) => {
+      const messages = state.messages.map((m) =>
+        m.id === messageId ? { ...m, content: newContent } : m,
+      );
+      return { messages };
+    }),
+
   clearMessages: () =>
     set({
       messages: [],
@@ -180,6 +205,7 @@ export const useChatStore = create<ChatState>()((set) => ({
 
 export type {
   ChatMessage,
+  ChatMessageAttachment,
   ToolCall,
   ChatArtifact,
   ChatState,
