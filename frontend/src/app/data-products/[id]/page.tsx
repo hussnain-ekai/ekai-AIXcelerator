@@ -77,10 +77,14 @@ export default function ChatWorkspacePage({
   const { data: persistedArtifacts } = useArtifacts(id);
   const addMessage = useChatStore((state) => state.addMessage);
 
+  const pipelineRunning = useChatStore((state) => state.pipelineRunning);
+
   useEffect(() => {
     // Wait for BOTH artifacts to load AND session recovery to finish
-    // so we don't inject messages that get overwritten by hydrateFromHistory
-    if (artifactsHydratedRef.current || !persistedArtifacts?.data || !isHydrated) return;
+    // so we don't inject messages that get overwritten by hydrateFromHistory.
+    // Also skip while pipeline is running — avoids showing stale artifacts from
+    // a previous discovery run before the new pipeline produces fresh ones.
+    if (artifactsHydratedRef.current || !persistedArtifacts?.data || !isHydrated || pipelineRunning) return;
     artifactsHydratedRef.current = true;
 
     const TYPE_MAP: Record<string, ArtifactType> = {
@@ -123,7 +127,8 @@ export default function ChatWorkspacePage({
     // message is in the thread, prepend one so artifact cards always appear first
     if (hasDiscoveryArtifacts) {
       const msgs = useChatStore.getState().messages;
-      const hasDiscoveryMsg = msgs.some((m) => m.artifactRefs && m.artifactRefs.length > 0);
+      const discoveryText = "I've reviewed your data tables, mapped the relationships between them, and checked the overall data quality.";
+      const hasDiscoveryMsg = msgs.some((m) => m.content === discoveryText || (m.artifactRefs && m.artifactRefs.length > 0));
       if (!hasDiscoveryMsg) {
         const discoveryMsg = {
           id: crypto.randomUUID(),
@@ -137,7 +142,7 @@ export default function ChatWorkspacePage({
         }));
       }
     }
-  }, [persistedArtifacts, addArtifact, addMessage, isHydrated]);
+  }, [persistedArtifacts, addArtifact, addMessage, isHydrated, pipelineRunning]);
 
   // Fetch detail data on-demand when panels open
   const { data: erdData } = useERDData(id, activePanel === 'erd');
@@ -199,13 +204,15 @@ export default function ChatWorkspacePage({
     void sendMessage('__START_DISCOVERY__');
   }, [sendMessage]);
 
+  const setPipelineRunningAction = useChatStore((state) => state.setPipelineRunning);
   const handleRerunDiscovery = useCallback(() => {
     clearMessages();
-    discoveryTriggeredRef.current = false;
+    discoveryTriggeredRef.current = true; // prevent auto-trigger from also firing
     artifactsHydratedRef.current = false;
-    // clearMessages resets isHydrated to false; re-enable so auto-trigger fires
-    setHydrated(true);
-  }, [clearMessages, setHydrated]);
+    setPipelineRunningAction(true); // Block artifact hydration immediately
+    // Send re-run trigger directly — bypasses cache in the pipeline
+    void sendMessage('__RERUN_DISCOVERY__');
+  }, [clearMessages, sendMessage, setPipelineRunningAction]);
 
   // Auto-trigger discovery when no messages and data product exists
   // Wait for hydration to complete before deciding - prevents re-triggering on navigation
@@ -409,7 +416,7 @@ export default function ChatWorkspacePage({
       <YAMLViewer
         open={activePanel === 'yaml'}
         onClose={handleClosePanel}
-        yaml={yamlData?.yaml ?? ''}
+        yaml={yamlData?.yaml_content ?? ''}
       />
 
       {/* Data preview detail panel */}

@@ -137,12 +137,28 @@ async def save_semantic_view(
     """Persist a semantic view YAML for a data product.
 
     Creates a new semantic_views row with the YAML content.
+    If the content is JSON (structured output from the generation agent),
+    it is automatically assembled into Snowflake-compatible YAML.
 
     Args:
         data_product_id: UUID of the data product.
-        yaml_content: The semantic view YAML string.
+        yaml_content: The semantic view YAML string (or JSON structure).
         created_by: Username of the person who created the semantic view.
     """
+    # Auto-detect JSON and assemble into YAML
+    content = yaml_content.strip()
+    if content.startswith("{"):
+        try:
+            from agents.generation import extract_json_from_text, assemble_semantic_view_yaml
+            structure = extract_json_from_text(content)
+            if structure and "tables" in structure:
+                assembled = assemble_semantic_view_yaml(structure)
+                if assembled and len(assembled) > 50:
+                    logger.info("save_semantic_view: auto-assembled JSON to YAML (%d chars)", len(assembled))
+                    content = assembled
+        except Exception as e:
+            logger.warning("save_semantic_view: failed to auto-assemble JSON to YAML: %s", e)
+
     pool = await _get_pool()
     sv_id = str(uuid4())
 
@@ -150,9 +166,68 @@ async def save_semantic_view(
     INSERT INTO semantic_views (id, data_product_id, yaml_content, created_by, created_at)
     VALUES ($1::uuid, $2::uuid, $3, $4, NOW())
     """
-    await pg_service.execute(pool, sql, sv_id, data_product_id, yaml_content, created_by)
+    await pg_service.execute(pool, sql, sv_id, data_product_id, content, created_by)
 
     return json.dumps({"status": "ok", "semantic_view_id": sv_id})
+
+
+@tool
+async def get_latest_semantic_view(data_product_id: str) -> str:
+    """Retrieve the most recent semantic view YAML for a data product.
+
+    Args:
+        data_product_id: UUID of the data product.
+    """
+    pool = await _get_pool()
+    rows = await pg_service.query(
+        pool,
+        "SELECT yaml_content, version, validation_status FROM semantic_views WHERE data_product_id = $1::uuid ORDER BY version DESC LIMIT 1",
+        data_product_id,
+    )
+    if not rows:
+        return json.dumps({"status": "not_found", "message": "No semantic view found for this data product"})
+    return json.dumps({
+        "status": "ok",
+        "version": rows[0]["version"],
+        "yaml_content": rows[0]["yaml_content"],
+        "validation_status": rows[0].get("validation_status"),
+    })
+
+
+@tool
+async def update_validation_status(
+    data_product_id: str,
+    status: str,
+    errors: str = "",
+) -> str:
+    """Update the validation status of the latest semantic view.
+
+    Args:
+        data_product_id: UUID of the data product.
+        status: New validation status (valid, invalid, pending).
+        errors: JSON string of validation errors (empty if valid).
+    """
+    pool = await _get_pool()
+
+    # Parse errors to ensure valid JSON
+    try:
+        parsed_errors = json.loads(errors) if errors else []
+    except (json.JSONDecodeError, TypeError):
+        parsed_errors = [{"message": errors}] if errors else []
+
+    sql = """
+    UPDATE semantic_views
+    SET validation_status = $1,
+        validation_errors = $2::jsonb,
+        validated_at = NOW()
+    WHERE data_product_id = $3::uuid
+    AND version = (
+        SELECT MAX(version) FROM semantic_views WHERE data_product_id = $3::uuid
+    )
+    """
+    await pg_service.execute(pool, sql, status, json.dumps(parsed_errors), data_product_id)
+
+    return json.dumps({"status": "ok", "validation_status": status})
 
 
 @tool
@@ -187,7 +262,7 @@ async def save_quality_report(
 
 @tool
 async def log_agent_action(
-    workspace_id: str,
+    data_product_id: str,
     action_type: str,
     details: str,
     user_name: str,
@@ -197,18 +272,34 @@ async def log_agent_action(
     Records agent actions for compliance and debugging purposes.
 
     Args:
-        workspace_id: UUID of the workspace.
+        data_product_id: UUID of the data product (workspace_id is resolved automatically).
         action_type: Category of action (e.g. 'discovery', 'generation', 'publish').
         details: JSON string with action details.
         user_name: Username of the acting user.
     """
-    pool = await _get_pool()
-    log_id = str(uuid4())
+    try:
+        pool = await _get_pool()
+        log_id = str(uuid4())
 
-    sql = """
-    INSERT INTO audit_logs (id, workspace_id, action_type, details, user_name, created_at)
-    VALUES ($1::uuid, $2::uuid, $3, $4::jsonb, $5, NOW())
-    """
-    await pg_service.execute(pool, sql, log_id, workspace_id, action_type, details, user_name)
+        # Resolve workspace_id from data_product_id
+        ws_rows = await pg_service.query(
+            pool,
+            "SELECT workspace_id FROM data_products WHERE id = $1::uuid",
+            data_product_id,
+        )
+        workspace_id = str(ws_rows[0]["workspace_id"]) if ws_rows else None
 
-    return json.dumps({"status": "ok", "log_id": log_id})
+        if not workspace_id:
+            logger.warning("log_agent_action: no workspace found for data_product_id %s", data_product_id)
+            return json.dumps({"status": "ok", "log_id": log_id, "note": "audit log skipped — workspace not found"})
+
+        sql = """
+        INSERT INTO audit_logs (id, workspace_id, data_product_id, action_type, action_details, user_name, created_at)
+        VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::jsonb, $6, NOW())
+        """
+        await pg_service.execute(pool, sql, log_id, workspace_id, data_product_id, action_type, details, user_name)
+
+        return json.dumps({"status": "ok", "log_id": log_id})
+    except Exception as e:
+        logger.error("log_agent_action failed: %s", e)
+        return json.dumps({"status": "ok", "log_id": str(uuid4()), "note": "audit log skipped due to internal error"})

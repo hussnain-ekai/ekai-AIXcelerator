@@ -86,14 +86,18 @@ function useSessionRecovery(dataProduct: DataProduct | undefined): UseSessionRec
         console.log('[useSessionRecovery] Got history with', historyMessages?.length ?? 0, 'messages');
 
         if (historyMessages && historyMessages.length > 0) {
-          // Transform backend messages to ChatMessage format, filtering internal context
+          // Transform backend messages to ChatMessage format, filtering internal context.
+          // Stagger timestamps far in the past to prevent false artifact-card matching:
+          // MessageThread uses a 60s window to attach artifacts to messages by timestamp,
+          // so hydrated messages must NOT share timestamps close to recent artifact createdAt.
+          const baseTime = Date.now() - 86_400_000; // 24 hours ago
           const chatMessages: ChatMessage[] = historyMessages
             .filter((msg) => !msg.content.includes('[INTERNAL CONTEXT'))
             .map((msg, idx) => ({
               id: msg.id ?? `recovered-${idx}-${Date.now()}`,
               role: msg.role,
               content: msg.content,
-              timestamp: msg.timestamp ?? new Date().toISOString(),
+              timestamp: msg.timestamp ?? new Date(baseTime + idx * 1000).toISOString(),
               toolCalls: msg.tool_calls?.map((tc) => ({
                 name: tc.name,
                 input: tc.input,

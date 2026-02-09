@@ -28,6 +28,8 @@ const GRAY_TEXT = '#9E9E9E';
 type StepStatus = 'completed' | 'active' | 'future';
 
 function getPhaseIndex(phase: AgentPhase): number {
+  // 'explorer' comes after publishing — all 5 phases are complete
+  if (phase === 'explorer') return PHASES.length;
   const index = PHASES.findIndex((p) => p.key === phase);
   return index >= 0 ? index : -1;
 }
@@ -40,6 +42,7 @@ function getStepStatus(stepIndex: number, activeIndex: number): StepStatus {
 
 function StepCircle({ status }: { status: StepStatus }): React.ReactNode {
   const size = 28;
+  const transition = 'all 0.4s ease';
 
   if (status === 'completed') {
     return (
@@ -52,6 +55,7 @@ function StepCircle({ status }: { status: StepStatus }): React.ReactNode {
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
+          transition,
         }}
       >
         <CheckIcon sx={{ fontSize: 16, color: '#1A1A1E' }} />
@@ -67,6 +71,8 @@ function StepCircle({ status }: { status: StepStatus }): React.ReactNode {
           height: size,
           borderRadius: '50%',
           bgcolor: GOLD,
+          transition,
+          boxShadow: `0 0 0 4px rgba(212, 168, 67, 0.25)`,
         }}
       />
     );
@@ -81,6 +87,7 @@ function StepCircle({ status }: { status: StepStatus }): React.ReactNode {
         bgcolor: 'transparent',
         border: 2,
         borderColor: GRAY,
+        transition,
       }}
     />
   );
@@ -94,6 +101,7 @@ function ConnectorLine({ status }: { status: StepStatus }): React.ReactNode {
         height: 2,
         bgcolor: status === 'completed' ? GOLD : GRAY,
         mx: 1,
+        transition: 'background-color 0.4s ease',
       }}
     />
   );
@@ -129,7 +137,7 @@ export function PhaseStepper({ currentPhase }: PhaseStepperProps): React.ReactNo
               <StepCircle status={status} />
               <Typography
                 variant="caption"
-                sx={{ mt: 0.5, fontWeight: 600, color: textColor }}
+                sx={{ mt: 0.5, fontWeight: 600, color: textColor, transition: 'color 0.4s ease' }}
               >
                 {phase.label}
               </Typography>

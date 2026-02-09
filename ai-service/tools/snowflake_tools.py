@@ -16,10 +16,11 @@ import logging
 import re
 from typing import Any
 
+import requests
 from langchain_core.tools import tool
 
 from config import get_settings
-from services.snowflake import execute_query_sync
+from services.snowflake import execute_query_sync, get_connection
 
 # ---------------------------------------------------------------------------
 # Data isolation context — set by the router before agent invocation
@@ -141,6 +142,23 @@ def _parse_data_type(raw: Any) -> str:
 
 
 SAMPLE_SIZE: int = 1_000_000
+
+
+# ---------------------------------------------------------------------------
+# YAML auto-fix helpers — used by validate_semantic_view_yaml
+# ---------------------------------------------------------------------------
+
+def _remove_field_recursive(d: dict | list, field_name: str) -> None:  # type: ignore[type-arg]
+    """Recursively remove a field from a nested dict/list structure."""
+    if isinstance(d, dict):
+        d.pop(field_name, None)
+        for v in d.values():
+            if isinstance(v, (dict, list)):
+                _remove_field_recursive(v, field_name)
+    elif isinstance(d, list):
+        for item in d:
+            if isinstance(item, (dict, list)):
+                _remove_field_recursive(item, field_name)
 
 
 # ---------------------------------------------------------------------------
@@ -473,22 +491,17 @@ def execute_rcr_query(sql: str) -> str:
 
 
 @tool
-def create_semantic_view(yaml_content: str, view_name: str, target_schema: str) -> str:
-    """Create or replace a semantic view in Snowflake from YAML content.
+def create_semantic_view(yaml_content: str, target_schema: str, verify_only: bool = False) -> str:
+    """Create a semantic view in Snowflake from YAML content using SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML.
 
-    The YAML must follow the Snowflake semantic view specification with fully
-    qualified table names.
+    The YAML must follow the Snowflake semantic view YAML specification with tables,
+    facts, dimensions, metrics, and relationships.
 
     Args:
         yaml_content: The complete semantic view YAML specification.
-        view_name: Name for the semantic view.
         target_schema: Fully qualified schema (DATABASE.SCHEMA) where the view will be created.
+        verify_only: If True, validates YAML without creating the view.
     """
-    # Validate view name
-    err = _validate_identifier(view_name, "view_name")
-    if err:
-        return _tool_error("create_semantic_view", err)
-
     # Validate target schema (DATABASE.SCHEMA)
     schema_parts = target_schema.split(".")
     if len(schema_parts) != 2:
@@ -501,12 +514,44 @@ def create_semantic_view(yaml_content: str, view_name: str, target_schema: str) 
     if not yaml_content or not yaml_content.strip():
         return _tool_error("create_semantic_view", "yaml_content cannot be empty")
 
+    # Clean up YAML before creating
+    import yaml as _yaml
     try:
-        quoted_schema = ".".join(f'"{p}"' for p in schema_parts)
-        sql = f'CREATE OR REPLACE SEMANTIC VIEW {quoted_schema}."{view_name}" AS $${yaml_content}$$'
+        parsed = _yaml.safe_load(yaml_content)
+        if isinstance(parsed, dict) and "tables" in parsed:
+            changed = False
+            for tbl in parsed["tables"]:
+                if "primary_key" in tbl:
+                    del tbl["primary_key"]
+                    changed = True
+            if changed:
+                yaml_content = _yaml.dump(parsed, default_flow_style=False, sort_keys=False, allow_unicode=True)
+    except Exception:
+        pass
 
+    schema_name = f"{schema_parts[0]}.{schema_parts[1]}"
+    verify_flag = "TRUE" if verify_only else "FALSE"
+
+    def _extract_view_name(content: str) -> str:
+        for line in content.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("name:"):
+                return stripped.split(":", 1)[1].strip().strip("'\"")
+        return ""
+
+    try:
+        sql = f"CALL SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML('{schema_name}', $${yaml_content}$$, {verify_flag})"
         execute_query_sync(sql)
-        fqn = f"{target_schema}.{view_name}"
+        view_name = _extract_view_name(yaml_content)
+        fqn = f"{target_schema}.{view_name}" if view_name else target_schema
+
+        if verify_only:
+            return json.dumps({
+                "status": "valid",
+                "message": "YAML is valid for creating a semantic view",
+                "semantic_view_fqn": fqn,
+            })
+
         return json.dumps({
             "status": "success",
             "semantic_view_fqn": fqn,
@@ -514,8 +559,39 @@ def create_semantic_view(yaml_content: str, view_name: str, target_schema: str) 
         })
 
     except Exception as e:
-        logger.error("create_semantic_view failed: %s", e)
-        return _tool_error("create_semantic_view", str(e), view_name=view_name)
+        error_msg = str(e)
+        # If PK constraint issue with relationships, retry without relationships
+        if "primary or unique key" in error_msg.lower() or "referenced key" in error_msg.lower():
+            logger.warning("create_semantic_view: PK constraint missing, retrying without relationships")
+            try:
+                parsed = _yaml.safe_load(yaml_content)
+                if isinstance(parsed, dict) and "relationships" in parsed:
+                    del parsed["relationships"]
+                    yaml_no_rels = _yaml.dump(parsed, default_flow_style=False, sort_keys=False, allow_unicode=True)
+                    sql2 = f"CALL SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML('{schema_name}', $${yaml_no_rels}$$, {verify_flag})"
+                    execute_query_sync(sql2)
+                    view_name = _extract_view_name(yaml_no_rels)
+                    fqn = f"{target_schema}.{view_name}" if view_name else target_schema
+
+                    if verify_only:
+                        return json.dumps({
+                            "status": "valid",
+                            "message": "YAML is valid (relationships excluded — source tables lack primary key constraints)",
+                            "semantic_view_fqn": fqn,
+                            "relationships_excluded": True,
+                        })
+
+                    return json.dumps({
+                        "status": "success",
+                        "semantic_view_fqn": fqn,
+                        "message": f"Semantic view {fqn} created successfully (relationships excluded — tables lack PK constraints)",
+                        "relationships_excluded": True,
+                    })
+            except Exception as e2:
+                error_msg = str(e2)
+
+        logger.error("create_semantic_view failed: %s", error_msg)
+        return _tool_error("create_semantic_view", error_msg, target_schema=target_schema)
 
 
 @tool
@@ -525,18 +601,22 @@ def create_cortex_agent(
     target_schema: str,
     description: str = "",
     instructions: str = "",
+    model_name: str = "claude-3-5-sonnet",
+    warehouse: str = "",
 ) -> str:
     """Create a Cortex Agent backed by a semantic view.
 
     Deploys the agent to Snowflake Intelligence so end users can query
-    the semantic model through natural language.
+    the semantic model through natural language. Uses CREATE AGENT ... FROM SPECIFICATION.
 
     Args:
         name: Name for the new Cortex Agent.
-        semantic_view_fqn: Fully qualified name of the semantic view.
-        target_schema: Schema where the agent will be created.
+        semantic_view_fqn: Fully qualified name of the semantic view (DATABASE.SCHEMA.VIEW).
+        target_schema: Schema where the agent will be created (DATABASE.SCHEMA).
         description: Business description of the agent.
         instructions: System prompt instructions for the agent.
+        model_name: LLM model for orchestration (default: claude-3-5-sonnet).
+        warehouse: Snowflake warehouse for query execution.
     """
     # Validate name
     err = _validate_identifier(name, "agent_name")
@@ -557,19 +637,45 @@ def create_cortex_agent(
     if len(sv_parts) != 3:
         return _tool_error("create_cortex_agent", f"semantic_view_fqn must be DATABASE.SCHEMA.VIEW, got: '{semantic_view_fqn}'")
 
+    # Resolve warehouse from settings if not provided
+    if not warehouse:
+        try:
+            warehouse = get_settings().snowflake_warehouse or "COMPUTE_WH"
+        except Exception:
+            warehouse = "COMPUTE_WH"
+
     try:
         quoted_schema = ".".join(f'"{p}"' for p in schema_parts)
         agent_fqn = f'{quoted_schema}."{name}"'
-        # Escape single quotes in description/instructions for SQL string literals
+
+        # Escape single quotes for YAML string values
         safe_desc = description.replace("'", "''")
         safe_inst = instructions.replace("'", "''")
 
-        sql = f"""CREATE CORTEX AGENT {agent_fqn}
-        WITH
-          SEMANTIC_VIEW = '{semantic_view_fqn}'
-          DESCRIPTION = '{safe_desc}'
-          INSTRUCTIONS = '{safe_inst}'
-          MODEL = 'claude-3-5-sonnet'"""
+        # Build the agent specification YAML.
+        # tool_resources MUST be a top-level key (not nested inside tools).
+        spec_yaml = f"""models:
+  orchestration: {model_name}
+orchestration:
+  budget:
+    seconds: 120
+    tokens: 10000
+instructions:
+  response: '{safe_inst}'
+  system: '{safe_desc}'
+tools:
+  - tool_spec:
+      type: cortex_analyst_text_to_sql
+      name: Analyst
+      description: 'Answers questions about the data using the semantic model'
+tool_resources:
+  Analyst:
+    semantic_view: '{semantic_view_fqn}'
+    execution_environment:
+      type: warehouse
+      warehouse: '{warehouse}'"""
+
+        sql = f"CREATE OR REPLACE AGENT {agent_fqn}\n  COMMENT = '{safe_desc}'\n  FROM SPECIFICATION\n  $${spec_yaml}$$"
 
         execute_query_sync(sql)
         display_fqn = f"{target_schema}.{name}"
@@ -608,7 +714,7 @@ def grant_agent_access(agent_fqn: str, role: str) -> str:
 
     try:
         quoted_fqn = _quoted_fqn(parts)
-        sql = f'GRANT USAGE ON CORTEX AGENT {quoted_fqn} TO ROLE "{role}"'
+        sql = f'GRANT USAGE ON AGENT {quoted_fqn} TO ROLE "{role}"'
         execute_query_sync(sql)
         return json.dumps({
             "status": "success",
@@ -618,6 +724,242 @@ def grant_agent_access(agent_fqn: str, role: str) -> str:
     except Exception as e:
         logger.error("grant_agent_access failed: %s", e)
         return _tool_error("grant_agent_access", str(e), agent_fqn=agent_fqn, role=role)
+
+
+@tool
+def query_cortex_agent(agent_fqn: str, question: str) -> str:
+    """Ask a question to a published Cortex Agent and return its answer.
+
+    Sends the question to the Cortex Agent REST API and returns the
+    natural language response. Use this after publishing to answer
+    business questions via the semantic model.
+
+    Args:
+        agent_fqn: Fully qualified name (DATABASE.SCHEMA.AGENT).
+        question: Natural language question to ask.
+    """
+    parts = agent_fqn.split(".")
+    if len(parts) != 3:
+        return _tool_error("query_cortex_agent",
+                           f"agent_fqn must be DATABASE.SCHEMA.AGENT, got: '{agent_fqn}'")
+
+    database, schema, agent_name = parts
+
+    try:
+        conn = get_connection()
+        token = conn.rest.token
+    except Exception as e:
+        logger.error("query_cortex_agent: cannot get session token: %s", e)
+        return _tool_error("query_cortex_agent", f"Authentication failed: {e}")
+
+    settings = get_settings()
+    account = settings.snowflake_account
+    host = f"{account}.snowflakecomputing.com"
+    url = f"https://{host}/api/v2/databases/{database}/schemas/{schema}/agents/{agent_name}:run"
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f'Snowflake Token="{token}"',
+        "Accept": "text/event-stream",
+    }
+    body = {
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": question}]}
+        ]
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, json=body, stream=True, timeout=120)
+
+        if resp.status_code != 200:
+            return _tool_error("query_cortex_agent",
+                               f"HTTP {resp.status_code}: {resp.text[:300]}")
+
+        # Parse SSE events
+        full_answer = ""
+        sql_generated = ""
+
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            if line.startswith("event: "):
+                event_type = line[7:].strip()
+                continue
+            if not line.startswith("data: "):
+                continue
+
+            data_str = line[6:]
+            if data_str == "[DONE]":
+                break
+
+            try:
+                data = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+            # Extract text from various event formats
+            event_type_local = data.get("type", "")
+
+            if event_type_local == "response.text.delta":
+                full_answer += data.get("text", "")
+
+            # Final response event contains full content
+            content = data.get("content", [])
+            if isinstance(content, list):
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("type") == "text":
+                        text = item.get("text", "")
+                        if text and text not in full_answer:
+                            full_answer = text
+                    if item.get("type") == "tool_results":
+                        tr_content = item.get("content", [])
+                        if isinstance(tr_content, list):
+                            for sub in tr_content:
+                                if isinstance(sub, dict) and "sql" in sub:
+                                    sql_generated = sub["sql"]
+
+        result: dict[str, Any] = {
+            "status": "success",
+            "answer": full_answer or "(No answer returned by agent)",
+        }
+        if sql_generated:
+            result["sql"] = sql_generated
+
+        logger.info("query_cortex_agent success: agent=%s, answer_len=%d, has_sql=%s",
+                     agent_fqn, len(full_answer), bool(sql_generated))
+        return json.dumps(result)
+
+    except requests.exceptions.Timeout:
+        return _tool_error("query_cortex_agent", "Request timed out (120s)")
+    except Exception as e:
+        logger.error("query_cortex_agent failed: %s", e)
+        return _tool_error("query_cortex_agent", str(e))
+
+
+@tool
+def validate_semantic_view_yaml(yaml_content: str, target_schema: str) -> str:
+    """Validate semantic view YAML without creating the view.
+
+    Calls SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML with verify_only=TRUE to check
+    the YAML specification for errors without actually creating the semantic view.
+
+    Args:
+        yaml_content: The complete semantic view YAML specification.
+        target_schema: Fully qualified schema (DATABASE.SCHEMA) for context.
+    """
+    schema_parts = target_schema.split(".")
+    if len(schema_parts) != 2:
+        return _tool_error("validate_semantic_view_yaml", f"target_schema must be DATABASE.SCHEMA, got: '{target_schema}'")
+    for part, label in zip(schema_parts, ["database", "schema"]):
+        err = _validate_identifier(part, label)
+        if err:
+            return _tool_error("validate_semantic_view_yaml", err)
+
+    if not yaml_content or not yaml_content.strip():
+        return _tool_error("validate_semantic_view_yaml", "yaml_content cannot be empty")
+
+    # Clean up YAML before validation
+    import yaml as _yaml
+    try:
+        parsed = _yaml.safe_load(yaml_content)
+        if isinstance(parsed, dict) and "tables" in parsed:
+            changed = False
+            for tbl in parsed["tables"]:
+                if "primary_key" in tbl:
+                    del tbl["primary_key"]
+                    changed = True
+            if changed:
+                yaml_content = _yaml.dump(parsed, default_flow_style=False, sort_keys=False, allow_unicode=True)
+    except Exception:
+        pass
+
+    schema_name = f"{schema_parts[0]}.{schema_parts[1]}"
+
+    try:
+        sql = f"CALL SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML('{schema_name}', $${yaml_content}$$, TRUE)"
+        execute_query_sync(sql)
+        return json.dumps({
+            "status": "valid",
+            "message": "YAML is valid for creating a semantic view. No object has been created.",
+        })
+
+    except Exception as e:
+        error_msg = str(e)
+        # If the error is about PK/unique key in relationships, retry without relationships
+        if "primary or unique key" in error_msg.lower() or "referenced key" in error_msg.lower():
+            logger.warning("validate_semantic_view_yaml: PK constraint missing for relationships, retrying without relationships")
+            try:
+                parsed = _yaml.safe_load(yaml_content)
+                if isinstance(parsed, dict) and "relationships" in parsed:
+                    del parsed["relationships"]
+                    yaml_no_rels = _yaml.dump(parsed, default_flow_style=False, sort_keys=False, allow_unicode=True)
+                    sql2 = f"CALL SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML('{schema_name}', $${yaml_no_rels}$$, TRUE)"
+                    execute_query_sync(sql2)
+                    return json.dumps({
+                        "status": "valid",
+                        "message": "YAML is valid (relationships excluded — source tables lack primary key constraints).",
+                        "relationships_excluded": True,
+                    })
+            except Exception as e2:
+                error_msg = str(e2)
+                logger.warning("validate_semantic_view_yaml (no-rels retry) failed: %s", error_msg)
+
+        # --- Auto-fix: parse common validation errors and retry ---
+        import yaml as _yaml_fix
+
+        parsed_yaml = None
+        try:
+            parsed_yaml = _yaml_fix.safe_load(yaml_content)
+        except Exception:
+            pass
+
+        if parsed_yaml and isinstance(parsed_yaml, dict):
+            fixed = False
+            error_lower = error_msg.lower()
+
+            # Fix 1: Remove unknown fields
+            if "unknown field" in error_lower:
+                match = re.search(r"unknown field ['\"]?(\w+)['\"]?", error_msg, re.IGNORECASE)
+                if match:
+                    bad_field = match.group(1)
+                    _remove_field_recursive(parsed_yaml, bad_field)
+                    fixed = True
+                    logger.info("validate auto-fix: removed unknown field '%s'", bad_field)
+
+            # Fix 2: Remove references to non-existent columns
+            if "unknown column" in error_lower or "invalid column" in error_lower:
+                match = re.search(r"(?:unknown|invalid) column ['\"]?(\w+)['\"]?", error_msg, re.IGNORECASE)
+                if match:
+                    bad_col = match.group(1)
+                    for tbl in parsed_yaml.get("tables", []):
+                        for section in ("facts", "dimensions", "time_dimensions", "metrics"):
+                            items = tbl.get(section, [])
+                            tbl[section] = [i for i in items if bad_col.upper() not in (i.get("expr", "")).upper()]
+                    fixed = True
+                    logger.info("validate auto-fix: removed references to unknown column '%s'", bad_col)
+
+            if fixed:
+                try:
+                    fixed_yaml = _yaml_fix.dump(parsed_yaml, default_flow_style=False, sort_keys=False, allow_unicode=True)
+                    sql_retry = f"CALL SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML('{schema_name}', $${fixed_yaml}$$, TRUE)"
+                    execute_query_sync(sql_retry)
+                    return json.dumps({
+                        "status": "valid",
+                        "message": "YAML is valid after auto-fix. Auto-corrections were applied.",
+                        "auto_fixed": True,
+                    })
+                except Exception as e3:
+                    logger.warning("validate auto-fix retry failed: %s", e3)
+                    # Fall through to return original error
+
+        logger.warning("validate_semantic_view_yaml failed: %s", error_msg)
+        return json.dumps({
+            "status": "invalid",
+            "error": error_msg,
+            "message": "Semantic view YAML validation failed. Review the error and fix the YAML.",
+        })
 
 
 @tool

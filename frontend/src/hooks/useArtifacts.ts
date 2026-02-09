@@ -53,11 +53,17 @@ function useQualityReport(dataProductId: string | null, enabled = false) {
   });
 }
 
+interface SemanticViewRow {
+  yaml_content: string;
+  version?: number;
+  validation_status?: string;
+}
+
 function useYAMLContent(dataProductId: string | null, enabled = false) {
-  return useQuery<{ yaml: string }>({
+  return useQuery<SemanticViewRow>({
     queryKey: ['artifacts', 'yaml', dataProductId],
     queryFn: () =>
-      api.get<{ yaml: string }>(`/artifacts/${dataProductId}/yaml`),
+      api.get<SemanticViewRow>(`/artifacts/${dataProductId}/yaml`),
     enabled: enabled && dataProductId !== null && dataProductId.length > 0,
   });
 }

@@ -59,6 +59,8 @@ interface ChatState {
   activePanel: ArtifactType | null;
   isHydrated: boolean;
   pipelineProgress: PipelineProgress | null;
+  /** True while discovery pipeline is running — blocks artifact hydration from DB. */
+  pipelineRunning: boolean;
   addMessage: (message: ChatMessage) => void;
   updateLastAssistantMessage: (content: string) => void;
   finalizeLastMessage: () => void;
@@ -69,6 +71,7 @@ interface ChatState {
   addArtifact: (artifact: ChatArtifact) => void;
   setActivePanel: (panel: ArtifactType | null) => void;
   setPipelineProgress: (progress: PipelineProgress | null) => void;
+  setPipelineRunning: (running: boolean) => void;
   truncateAfter: (messageId: string) => void;
   editMessage: (messageId: string, newContent: string) => void;
   clearMessages: () => void;
@@ -86,6 +89,7 @@ const INITIAL_STATE = {
   activePanel: null as ArtifactType | null,
   isHydrated: false,
   pipelineProgress: null as PipelineProgress | null,
+  pipelineRunning: false,
 };
 
 export const useChatStore = create<ChatState>()((set) => ({
@@ -116,6 +120,23 @@ export const useChatStore = create<ChatState>()((set) => ({
       const lastMessage = messages[lastIndex];
 
       if (lastMessage && lastMessage.role === 'assistant' && lastMessage.isStreaming) {
+        // Dedup: if this message duplicates the previous finalized assistant message, remove it
+        for (let i = lastIndex - 1; i >= 0; i--) {
+          const prev = messages[i];
+          if (prev.role === 'assistant' && !prev.isStreaming) {
+            const prevText = prev.content.trim();
+            const currText = lastMessage.content.trim();
+            if (
+              prevText.length > 50 &&
+              currText.length > 50 &&
+              prevText.slice(0, 200) === currText.slice(0, 200)
+            ) {
+              messages.splice(lastIndex, 1);
+              return { messages };
+            }
+            break;
+          }
+        }
         messages[lastIndex] = { ...lastMessage, isStreaming: false };
       }
 
@@ -150,11 +171,15 @@ export const useChatStore = create<ChatState>()((set) => ({
 
   addArtifact: (artifact: ChatArtifact) =>
     set((state) => {
-      // Deduplicate: skip if same id or same type already exists
-      const exists = state.artifacts.some(
-        (a) => a.id === artifact.id || a.type === artifact.type,
-      );
-      if (exists) return state;
+      // If same id exists, skip entirely
+      if (state.artifacts.some((a) => a.id === artifact.id)) return state;
+      // If same type exists, replace it with the newer version
+      const existingIdx = state.artifacts.findIndex((a) => a.type === artifact.type);
+      if (existingIdx !== -1) {
+        const updated = [...state.artifacts];
+        updated[existingIdx] = artifact;
+        return { artifacts: updated };
+      }
       return { artifacts: [...state.artifacts, artifact] };
     }),
 
@@ -163,6 +188,9 @@ export const useChatStore = create<ChatState>()((set) => ({
 
   setPipelineProgress: (progress: PipelineProgress | null) =>
     set({ pipelineProgress: progress }),
+
+  setPipelineRunning: (running: boolean) =>
+    set({ pipelineRunning: running }),
 
   truncateAfter: (messageId: string) =>
     set((state) => {

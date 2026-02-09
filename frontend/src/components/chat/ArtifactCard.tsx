@@ -26,7 +26,8 @@ const ARTIFACT_META: Record<ArtifactType, { icon: typeof SchemaIcon; label: stri
 };
 
 export function ArtifactCard({ type, title, description, onClick }: ArtifactCardProps): React.ReactNode {
-  const meta = ARTIFACT_META[type] ?? ARTIFACT_META.erd;
+  const meta = ARTIFACT_META[type];
+  if (!meta) return null; // Skip unknown artifact types
   const Icon = meta.icon;
   const displayTitle = title !== type.toUpperCase() ? title : meta.label;
   const displayDesc = description ?? meta.description;

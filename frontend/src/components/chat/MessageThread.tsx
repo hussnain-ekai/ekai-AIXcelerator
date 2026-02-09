@@ -45,37 +45,47 @@ function isHiddenMessage(message: ChatMessage): boolean {
 }
 
 /**
- * Condense messages that contain large code blocks (e.g. full YAML dumps).
- * Returns the summary text before the first code fence, stripping markdown.
- * If no code fence, returns original content unchanged.
+ * Condense messages that contain large code blocks (e.g. full YAML dumps)
+ * or raw BRD text (between ---BEGIN BRD--- and ---END BRD--- markers).
+ * Returns the summary text, stripping the large embedded content.
  */
 function condenseContent(content: string): { text: string; hasCodeBlock: boolean } {
-  const fenceIndex = content.indexOf('```');
-  if (fenceIndex === -1 || content.length < 500) {
-    return { text: content, hasCodeBlock: false };
+  let text = content;
+  let condensed = false;
+
+  // Strip BRD inline text — show only the summary before it
+  const brdStart = text.indexOf('---BEGIN BRD---');
+  if (brdStart !== -1) {
+    const brdEnd = text.indexOf('---END BRD---');
+    const before = text.slice(0, brdStart).trim();
+    const after = brdEnd !== -1 ? text.slice(brdEnd + '---END BRD---'.length).trim() : '';
+    text = before + (after ? '\n\n' + after : '');
+    condensed = true;
   }
 
-  // Extract text before the first code fence
-  let summary = content.slice(0, fenceIndex).trim();
+  // Strip code blocks (YAML dumps etc.)
+  const fenceIndex = text.indexOf('```');
+  if (fenceIndex !== -1 && text.length >= 500) {
+    let summary = text.slice(0, fenceIndex).trim();
+    summary = summary.replace(/\*\*(.*?)\*\*/g, '$1');
+    summary = summary.replace(/^#{1,6}\s+/gm, '');
 
-  // Strip markdown formatting: **bold**, ### headings
-  summary = summary.replace(/\*\*(.*?)\*\*/g, '$1');
-  summary = summary.replace(/^#{1,6}\s+/gm, '');
-
-  // If there's meaningful text after the last code fence, append it
-  const lastFenceEnd = content.lastIndexOf('```');
-  if (lastFenceEnd > fenceIndex) {
-    const afterCode = content.slice(lastFenceEnd + 3).trim();
-    // Only append if it's not too long and adds value
-    if (afterCode.length > 0 && afterCode.length < 500) {
-      const cleaned = afterCode.replace(/\*\*(.*?)\*\*/g, '$1').replace(/^#{1,6}\s+/gm, '');
-      if (cleaned.length > 0) {
-        summary = summary + '\n\n' + cleaned;
+    const lastFenceEnd = text.lastIndexOf('```');
+    if (lastFenceEnd > fenceIndex) {
+      const afterCode = text.slice(lastFenceEnd + 3).trim();
+      if (afterCode.length > 0 && afterCode.length < 500) {
+        const cleaned = afterCode.replace(/\*\*(.*?)\*\*/g, '$1').replace(/^#{1,6}\s+/gm, '');
+        if (cleaned.length > 0) {
+          summary = summary + '\n\n' + cleaned;
+        }
       }
     }
+
+    text = summary || 'Artifact generated.';
+    condensed = true;
   }
 
-  return { text: summary || 'Artifact generated.', hasCodeBlock: true };
+  return { text, hasCodeBlock: condensed };
 }
 
 const TOOL_DISPLAY_NAMES: Record<string, string> = {
@@ -95,6 +105,13 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   create_cortex_agent: 'Publishing agent',
   grant_agent_access: 'Setting up access',
   log_agent_action: 'Recording action',
+  query_cortex_agent: 'Asking the published agent',
+  fetch_documentation: 'Reading documentation',
+  list_cortex_agents: 'Checking for published agents',
+  validate_semantic_view_yaml: 'Validating model',
+  get_latest_semantic_view: 'Loading semantic model',
+  update_validation_status: 'Updating status',
+  get_latest_brd: 'Loading requirements',
 };
 
 function getToolDisplayName(toolName: string): string {
@@ -234,9 +251,9 @@ function AgentMessage({
         {/* Inline artifact cards — clickable, opens right panel */}
         {inlineArtifacts.length > 0 && onOpenArtifact && (
           <Box sx={{ mt: 1.5 }}>
-            {inlineArtifacts.map((a) => (
+            {inlineArtifacts.map((a, idx) => (
               <ArtifactCard
-                key={a.type}
+                key={`${a.type}-${idx}`}
                 type={a.type}
                 title={a.title}
                 onClick={() => onOpenArtifact(a.type)}

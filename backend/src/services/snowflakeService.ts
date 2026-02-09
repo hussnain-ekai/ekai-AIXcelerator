@@ -13,14 +13,10 @@ snowflake.configure({ ocspFailOpen: true });
 let connection: snowflake.Connection | null = null;
 let connectionPromise: Promise<snowflake.Connection> | null = null;
 
-function getConnection(): Promise<snowflake.Connection> {
-  if (connection !== null) {
-    return Promise.resolve(connection);
-  }
-
-  if (connectionPromise !== null) {
-    return connectionPromise;
-  }
+function createNewConnection(): Promise<snowflake.Connection> {
+  // Clear any stale cached state
+  connection = null;
+  connectionPromise = null;
 
   connectionPromise = new Promise<snowflake.Connection>((resolve, reject) => {
     const conn = snowflake.createConnection({
@@ -47,15 +43,33 @@ function getConnection(): Promise<snowflake.Connection> {
   return connectionPromise;
 }
 
-/**
- * Execute a SQL query against Snowflake and return rows.
- */
-async function executeQuery(
-  sql: string,
-  binds: snowflake.Binds = [],
-): Promise<SnowflakeQueryResult> {
-  const conn = await getConnection();
+function getConnection(): Promise<snowflake.Connection> {
+  // If we have a cached connection, verify it's still alive
+  if (connection !== null) {
+    if (connection.isUp()) {
+      return Promise.resolve(connection);
+    }
+    // Connection is stale/terminated — discard and reconnect
+    connection = null;
+    connectionPromise = null;
+  }
 
+  // If a connection attempt is already in progress, reuse it
+  if (connectionPromise !== null) {
+    return connectionPromise;
+  }
+
+  return createNewConnection();
+}
+
+/**
+ * Execute a single query attempt against Snowflake.
+ */
+function executeQueryOnce(
+  conn: snowflake.Connection,
+  sql: string,
+  binds: snowflake.Binds,
+): Promise<SnowflakeQueryResult> {
   return new Promise<SnowflakeQueryResult>((resolve, reject) => {
     conn.execute({
       sqlText: sql,
@@ -72,6 +86,31 @@ async function executeQuery(
       },
     });
   });
+}
+
+/**
+ * Execute a SQL query against Snowflake and return rows.
+ * Automatically reconnects once if the connection has been terminated.
+ */
+async function executeQuery(
+  sql: string,
+  binds: snowflake.Binds = [],
+): Promise<SnowflakeQueryResult> {
+  const conn = await getConnection();
+
+  try {
+    return await executeQueryOnce(conn, sql, binds);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    // If the connection was terminated, reconnect and retry once
+    if (message.includes('terminated connection')) {
+      connection = null;
+      connectionPromise = null;
+      const freshConn = await createNewConnection();
+      return executeQueryOnce(freshConn, sql, binds);
+    }
+    throw err;
+  }
 }
 
 async function healthCheck(): Promise<boolean> {

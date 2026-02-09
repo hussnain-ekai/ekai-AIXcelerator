@@ -53,6 +53,7 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
     setPhase,
     addArtifact,
     setPipelineProgress,
+    setPipelineRunning,
   } = useChatStore();
 
   const connectToStream = useCallback(
@@ -86,7 +87,29 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
           // Tool results are processed as part of the streaming response
         },
         onPhaseChange: (_from: string, to: string) => {
+          // Only inject a transition message when the phase ACTUALLY changes.
+          // Skip if we're re-entering the same phase (e.g. requirements Q&A → BRD).
+          const prevPhase = useChatStore.getState().currentPhase;
           setPhase(to as AgentPhase);
+
+          if (to === prevPhase) return;
+
+          const PHASE_LABELS: Record<string, string> = {
+            requirements: 'Moving on to capture your business requirements...',
+            generation: 'Generating your semantic model...',
+            validation: 'Validating the semantic model against your data...',
+            publishing: 'Preparing to publish your model...',
+          };
+          const label = PHASE_LABELS[to];
+          if (label) {
+            finalizeLastMessage();
+            addMessage({
+              id: crypto.randomUUID(),
+              role: 'assistant',
+              content: label,
+              timestamp: new Date().toISOString(),
+            });
+          }
         },
         onArtifact: (artifactId: string, artifactType: string) => {
           addArtifact({
@@ -109,16 +132,42 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
           const isComplete = data.step === 'artifacts' && data.status === 'completed';
 
           if (isComplete) {
-            // Pipeline finished — inject a proper chat message with artifact cards
-            setPipelineProgress(null);
-            addMessage({
-              id: crypto.randomUUID(),
-              role: 'assistant',
-              content: "I've reviewed your data tables, mapped the relationships between them, and checked the overall data quality.",
-              timestamp: new Date().toISOString(),
-              artifactRefs: ['erd', 'data_quality'],
+            // Show "Analysis complete" state briefly before clearing
+            setPipelineProgress({
+              step: 'artifacts',
+              label: 'Analysis complete',
+              status: 'completed',
+              detail: '',
+              current: data.total_steps,
+              total: data.total_steps,
+              stepIndex: data.total_steps - 1,
+              totalSteps: data.total_steps,
+              overallPct: 100,
             });
+
+            // After 1.2s, remove progress and inject discovery message with artifacts
+            setTimeout(() => {
+              setPipelineProgress(null);
+              setPipelineRunning(false);
+              // Dedup: skip if last message already has this content
+              const msgs = useChatStore.getState().messages;
+              const lastMsg = msgs[msgs.length - 1];
+              const discoveryText = "I've reviewed your data tables, mapped the relationships between them, and checked the overall data quality.";
+              if (!lastMsg || lastMsg.content !== discoveryText) {
+                addMessage({
+                  id: crypto.randomUUID(),
+                  role: 'assistant',
+                  content: discoveryText,
+                  timestamp: new Date().toISOString(),
+                  artifactRefs: ['erd', 'data_quality'],
+                });
+              }
+            }, 1200);
           } else {
+            // Mark pipeline as running on first progress event
+            if (!useChatStore.getState().pipelineRunning) {
+              setPipelineRunning(true);
+            }
             setPipelineProgress({
               step: data.step,
               label: data.label,
@@ -135,6 +184,7 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
         onError: (_code: string, message: string) => {
           setStreaming(false);
           setPipelineProgress(null);
+          setPipelineRunning(false);
           addMessage({
             id: crypto.randomUUID(),
             role: 'system',
@@ -146,6 +196,7 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
           setStreaming(false);
           setIsConnected(false);
           setPipelineProgress(null);
+          setPipelineRunning(false);
         },
       };
 
@@ -162,13 +213,14 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
       setPhase,
       addArtifact,
       setPipelineProgress,
+      setPipelineRunning,
     ],
   );
 
   const sendMessage = useCallback(
     async (content: string, files?: File[]) => {
       // Don't show internal trigger messages in the chat
-      const isInternalTrigger = content === '__START_DISCOVERY__';
+      const isInternalTrigger = content === '__START_DISCOVERY__' || content === '__RERUN_DISCOVERY__';
 
       // Build attachment metadata for display in chat
       const chatAttachments: ChatMessageAttachment[] = [];
@@ -198,10 +250,12 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
       setStreaming(true);
 
       // Use existing session ID from store (may have been recovered from history)
-      // or generate a new one for fresh sessions
+      // or generate a new one for fresh sessions.
+      // Always read from getState() — the closure's `sessionId` can be stale
+      // after clearMessages() resets it in the same render cycle.
       const existingSessionId = useChatStore.getState().sessionId;
-      const sid = existingSessionId ?? sessionId ?? crypto.randomUUID();
-      if (!sessionId) {
+      const sid = existingSessionId ?? crypto.randomUUID();
+      if (!existingSessionId) {
         setSessionId(sid);
       }
 
@@ -230,7 +284,7 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
 
       connectToStream(response.session_id);
     },
-    [dataProductId, sessionId, addMessage, setStreaming, setSessionId, connectToStream],
+    [dataProductId, addMessage, setStreaming, setSessionId, connectToStream],
   );
 
   const retryMessage = useCallback(

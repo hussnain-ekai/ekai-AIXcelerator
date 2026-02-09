@@ -89,7 +89,6 @@ VALIDATION_CONFIG = {
     "tools": [
         "validate_sql",
         "execute_rcr_query",
-        "save_semantic_view",
         "upload_artifact",
     ],
 }

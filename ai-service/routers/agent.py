@@ -24,8 +24,32 @@ from models.schemas import (
 logger = logging.getLogger(__name__)
 _settings = get_settings()
 
+
+def _sanitize_error_for_user(exc: Exception) -> str:
+    """Convert internal errors to user-friendly messages.
+
+    Business analysts should never see raw DB errors, stack traces, or
+    technical identifiers. The full error is logged server-side already.
+    """
+    msg = str(exc)
+    lower = msg.lower()
+
+    if "foreignkeyviolation" in lower or "foreign key constraint" in lower:
+        return "A data reference issue occurred. The operation was logged — please try again."
+    if "uniqueviolation" in lower or "unique constraint" in lower:
+        return "This record already exists. The operation has been noted."
+    if "connection" in lower and ("refused" in lower or "timeout" in lower):
+        return "A service connection issue occurred. Please try again in a moment."
+    if "snowflake" in lower and ("timeout" in lower or "warehouse" in lower):
+        return "The data warehouse is temporarily unavailable. Please try again."
+
+    # Generic fallback — never expose raw exception text
+    return "Something went wrong while processing your request. Please try again or contact support."
+
+
 # Discovery trigger constant
 DISCOVERY_TRIGGER = "__START_DISCOVERY__"
+RERUN_DISCOVERY_TRIGGER = "__RERUN_DISCOVERY__"
 
 router = APIRouter(prefix="/agent", tags=["Agent"])
 
@@ -434,16 +458,26 @@ async def _run_agent(
     # Track which LLM run_id is currently streaming to detect when a new
     # agent starts speaking (prevents concatenating subagent + orchestrator output)
     _current_run_id: str | None = None
-    # Deduplication: suppress orchestrator output after subagent has spoken
-    _previous_run_content: str = ""
-    _current_run_buffer: str = ""
-    _current_run_suppressed: bool = False
-    _DEDUP_CHARS: int = 80  # Characters to compare for deduplication
+    # Orchestrator output gating: only emit tokens from subagent runs (inside task tool).
+    # The orchestrator is a router — it delegates to subagents via the `task` tool.
+    # All user-facing text comes from subagents; orchestrator text is suppressed.
+    # Discovery runs inline (no task call) — orchestrator output IS the user-facing output.
+    # For all other phases, only subagent output (inside task) is shown.
+    _inside_task: bool = False  # Set to True for discovery below; toggled by task tool for other phases
     _subagent_completed: bool = False  # True after a `task` tool returns
+    _previous_run_content: str = ""  # Last subagent run's text (for safety net)
+    # Per-run dedup: buffer initial tokens to detect duplicate LLM runs within a task
+    _DEDUP_CHECK_LEN = 80
+    _run_token_buffer: list[str] = []
+    _run_dedup_resolved: bool = True  # True once dedup check is done or not needed
+    _run_suppressed: bool = False  # True if current run is a duplicate
     # Safety net: track whether save_brd was called during this invocation
     _brd_tool_called: bool = False
     _brd_artifact_uploaded: bool = False
     _requirements_phase_ran: bool = False
+    # Safety net: track whether save_semantic_view was called during generation
+    _yaml_tool_called: bool = False
+    _generation_phase_ran: bool = False
     # Phase tracking: detect subagent transitions
     _SUBAGENT_PHASE_MAP: dict[str, str] = {
         "discovery-agent": "discovery",
@@ -461,8 +495,11 @@ async def _run_agent(
 
         # Check if this is a discovery trigger
         actual_message = message
-        if message.strip() == DISCOVERY_TRIGGER:
-            logger.info("Discovery trigger detected for session %s, running pipeline...", session_id)
+        is_discovery = message.strip() in (DISCOVERY_TRIGGER, RERUN_DISCOVERY_TRIGGER)
+        force_rerun = message.strip() == RERUN_DISCOVERY_TRIGGER
+        if is_discovery:
+            _inside_task = True  # Discovery: orchestrator interprets summary directly
+            logger.info("Discovery trigger detected for session %s (force=%s), running pipeline...", session_id, force_rerun)
             # Emit phase change to discovery
             _current_phase = "discovery"
             await queue.put({
@@ -486,6 +523,7 @@ async def _run_agent(
                     database=dp_info["database"],
                     schemas=dp_info["schemas"],
                     queue=queue,
+                    force=force_rerun,
                 )
 
                 # 2b. Ensure artifact events are emitted (cache path skips step 7)
@@ -577,26 +615,46 @@ async def _run_agent(
             data = event.get("data", {})
 
             if kind == "on_chat_model_stream":
-                # Token streaming — detect run boundaries to separate messages
+                # Token streaming — only emit tokens from subagent runs.
+                # The orchestrator is a router; its text is always suppressed.
                 run_id = event.get("run_id", "")
                 chunk = data.get("chunk")
                 if chunk and hasattr(chunk, "content") and chunk.content:
                     # If a new LLM run starts, emit message_done to close previous bubble
                     if run_id and run_id != _current_run_id:
+                        # Flush any dedup buffer from the ending run
+                        if _run_token_buffer and not _run_suppressed:
+                            buffered_text = "".join(_run_token_buffer)
+                            # Short message that didn't reach threshold — check if duplicate
+                            if _previous_run_content and _previous_run_content.startswith(buffered_text.strip()):
+                                _run_suppressed = True
+                                logger.info("Suppressing short duplicate subagent run")
+                            else:
+                                current_assistant_content = buffered_text
+                                for tok in _run_token_buffer:
+                                    await queue.put({
+                                        "type": "token",
+                                        "data": {"content": tok},
+                                    })
+                            _run_token_buffer = []
+
                         if _current_run_id is not None and current_assistant_content.strip():
-                            # Save content for deduplication before closing
                             _previous_run_content = current_assistant_content.strip()
-                            # Save for safety net (BRD detection)
                             _assistant_texts.append(current_assistant_content)
-                            current_assistant_content = ""  # Reset for new run
+                            current_assistant_content = ""
                             await queue.put({
                                 "type": "message_done",
                                 "data": {"content": ""},
                             })
                         _current_run_id = run_id
-                        _current_run_buffer = ""
-                        # If a subagent already completed, suppress orchestrator's follow-up
-                        _current_run_suppressed = _subagent_completed
+                        # Reset per-run dedup state
+                        _run_token_buffer = []
+                        _run_suppressed = False
+                        _run_dedup_resolved = not (_inside_task and bool(_previous_run_content))
+
+                    # Gate: only emit tokens from subagent runs (inside task tool)
+                    if not _inside_task:
+                        continue
 
                     # Extract text from structured content blocks if needed
                     content = chunk.content
@@ -609,39 +667,36 @@ async def _run_agent(
                     elif isinstance(content, dict):
                         content = content.get("text", str(content))
 
-                    # --- Deduplication: suppress orchestrator echoing subagent ---
-                    if _current_run_suppressed:
-                        # Already determined this run is a duplicate, skip
+                    # If current run is already marked as duplicate, suppress
+                    if _run_suppressed:
                         continue
 
-                    if _previous_run_content and len(_previous_run_content) > _DEDUP_CHARS:
-                        _current_run_buffer += content
-                        if len(_current_run_buffer) >= _DEDUP_CHARS:
-                            # Compare first N chars to detect duplicate
-                            prev_snippet = _previous_run_content[:_DEDUP_CHARS]
-                            curr_snippet = _current_run_buffer.strip()[:_DEDUP_CHARS]
-                            if prev_snippet == curr_snippet:
-                                _current_run_suppressed = True
-                                logger.info(
-                                    "Suppressed duplicate orchestrator response for session %s",
-                                    session_id,
-                                )
-                                continue
+                    # Dedup check: buffer initial tokens and compare with previous run
+                    if not _run_dedup_resolved:
+                        _run_token_buffer.append(content)
+                        buffered_text = "".join(_run_token_buffer)
+                        if len(buffered_text) >= _DEDUP_CHECK_LEN:
+                            _run_dedup_resolved = True
+                            if _previous_run_content.startswith(buffered_text.strip()):
+                                _run_suppressed = True
+                                logger.info("Suppressing duplicate subagent run (prefix matches previous)")
                             else:
-                                # Not a duplicate — flush buffer and continue
-                                current_assistant_content += _current_run_buffer
-                                await queue.put({
-                                    "type": "token",
-                                    "data": {"content": _current_run_buffer},
-                                })
-                                _previous_run_content = ""  # Stop dedup checks
-                                continue
-                        else:
-                            # Still buffering, don't emit yet
-                            continue
+                                # Not a duplicate — flush buffered tokens
+                                current_assistant_content = buffered_text
+                                for tok in _run_token_buffer:
+                                    await queue.put({
+                                        "type": "token",
+                                        "data": {"content": tok},
+                                    })
+                                _run_token_buffer = []
+                        continue
 
                     # Normal path — emit token
                     current_assistant_content += content
+
+                    # Suppress [INTERNAL] sections that LLMs sometimes leak
+                    if "[INTERNAL" in current_assistant_content:
+                        continue
 
                     await queue.put({
                         "type": "token",
@@ -659,25 +714,29 @@ async def _run_agent(
                     if art_type == "brd":
                         _brd_artifact_uploaded = True
                     if art_type:
+                        # Map backend artifact types to frontend types
+                        _ARTIFACT_TYPE_MAP = {"quality_report": "data_quality"}
+                        mapped_type = _ARTIFACT_TYPE_MAP.get(art_type, art_type)
                         await queue.put({
                             "type": "artifact",
                             "data": {
                                 "artifact_id": str(uuid4()),
-                                "artifact_type": art_type,
+                                "artifact_type": mapped_type,
                             },
                         })
-                        logger.info("Emitted artifact event from tool_start: type=%s", art_type)
+                        logger.info("Emitted artifact event from tool_start: type=%s", mapped_type)
 
                 # Detect subagent delegation via the `task` tool and emit phase_change
                 # Deep Agents uses a `task` tool with `subagent_type` parameter
                 if tool_name == "task" and isinstance(tool_input, dict):
-                    # Reset suppression flag — a new subagent is starting
+                    _inside_task = True  # Enable token emission for subagent
                     _subagent_completed = False
-                    _current_run_suppressed = False
                     subagent_type = tool_input.get("subagent_type", "")
                     phase_name = _SUBAGENT_PHASE_MAP.get(subagent_type)
                     if phase_name == "requirements":
                         _requirements_phase_ran = True
+                    if phase_name == "generation":
+                        _generation_phase_ran = True
                     if phase_name and phase_name != _current_phase:
                         old_phase = _current_phase
                         _current_phase = phase_name
@@ -687,17 +746,22 @@ async def _run_agent(
                         })
                         logger.info("Phase change: %s → %s (session %s)", old_phase, phase_name, session_id)
 
-                await queue.put({
-                    "type": "tool_call",
-                    "data": {
-                        "tool": tool_name,
-                        "input": tool_input if isinstance(tool_input, dict) else str(tool_input),
-                    },
-                })
+                # Skip tool_call event for internal `task` tool — phase_change events handle this
+                if tool_name != "task":
+                    await queue.put({
+                        "type": "tool_call",
+                        "data": {
+                            "tool": tool_name,
+                            "input": tool_input if isinstance(tool_input, dict) else str(tool_input),
+                        },
+                    })
 
             elif kind == "on_tool_end":
                 tool_name = event.get("name", "unknown")
                 output = data.get("output", "")
+                # Extract content from ToolMessage objects (LangChain may return these)
+                if hasattr(output, "content"):
+                    output = output.content
                 # Truncate long outputs
                 truncate_len = _settings.tool_output_truncate_length
                 output_str = str(output)[:truncate_len] if output else ""
@@ -707,34 +771,21 @@ async def _run_agent(
                     _brd_tool_called = True
                     logger.info("save_brd completed for session %s", session_id)
 
-                # Mark when a subagent completes so we suppress orchestrator echo
-                if tool_name == "task":
-                    _subagent_completed = True
-                    logger.info("Subagent completed for session %s — will suppress orchestrator echo", session_id)
+                # Track save_semantic_view for generation safety net
+                if tool_name == "save_semantic_view":
+                    _yaml_tool_called = True
+                    logger.info("save_semantic_view completed for session %s", session_id)
 
-                # Detect artifact creation and emit artifact event
+                # Mark when a subagent completes and close the task gate
+                if tool_name == "task":
+                    _inside_task = False
+                    _subagent_completed = True
+                    logger.info("Subagent completed for session %s", session_id)
+
+                # Artifact event already emitted from on_tool_start (more reliable).
+                # Log the output for debugging but don't emit a second artifact event.
                 if tool_name == "upload_artifact" and output_str:
                     logger.info("upload_artifact output (type=%s): %s", type(output).__name__, output_str[:200])
-                    try:
-                        result = json.loads(output_str)
-                        if result.get("status") == "ok":
-                            path = result.get("path", "")
-                            parts = path.split("/")
-                            # path format: {data_product_id}/{artifact_type}/v{version}/{filename}
-                            if len(parts) >= 2:
-                                artifact_type = parts[1]
-                                await queue.put({
-                                    "type": "artifact",
-                                    "data": {
-                                        "artifact_id": result.get("artifact_id", str(uuid4())),
-                                        "artifact_type": artifact_type,
-                                    },
-                                })
-                                logger.info("Emitted artifact event: type=%s", artifact_type)
-                    except (json.JSONDecodeError, IndexError) as e:
-                        logger.warning("Failed to parse upload_artifact output: %s", e)
-                        # Fallback: check tool input for artifact_type
-                        pass
 
                 await queue.put({
                     "type": "tool_result",
@@ -745,32 +796,9 @@ async def _run_agent(
                 })
 
             elif kind == "on_chain_end" and event.get("name") == "ekaix-orchestrator":
-                # Final response — skip if we already streamed content via on_chat_model_stream.
-                # The stream handler already sent all tokens to the client in real time.
-                if current_assistant_content.strip():
-                    # Content was already streamed, don't duplicate
-                    pass
-                else:
-                    # Fallback: if nothing was streamed, emit the final messages
-                    output = data.get("output", {})
-                    if isinstance(output, dict):
-                        messages = output.get("messages", [])
-                        for msg in messages:
-                            if isinstance(msg, AIMessage) and msg.content:
-                                content = msg.content
-                                if isinstance(content, list):
-                                    text_parts = [
-                                        block.get("text", "") if isinstance(block, dict) else str(block)
-                                        for block in content
-                                    ]
-                                    content = "".join(text_parts)
-                                elif isinstance(content, dict):
-                                    content = content.get("text", str(content))
-                                current_assistant_content += content
-                                await queue.put({
-                                    "type": "token",
-                                    "data": {"content": content},
-                                })
+                # Final orchestrator response — suppress entirely.
+                # All user-facing content comes from subagent runs (inside task tool).
+                pass
 
     except ValueError as e:
         # LangChain raises ValueError("No generations found in stream") when an LLM
@@ -782,20 +810,20 @@ async def _run_agent(
             logger.exception("Agent execution failed for session %s: %s", session_id, e)
             await queue.put({
                 "type": "error",
-                "data": {"message": f"{type(e).__name__}: {e}"},
+                "data": {"message": _sanitize_error_for_user(e)},
             })
     except Exception as e:
         logger.exception("Agent execution failed for session %s: %s", session_id, e)
         await queue.put({
             "type": "error",
-            "data": {"message": f"{type(e).__name__}: {e}"},
+            "data": {"message": _sanitize_error_for_user(e)},
         })
 
     finally:
-        # Flush any remaining dedup buffer content that wasn't emitted
-        if _current_run_buffer and not _current_run_suppressed:
-            current_assistant_content += _current_run_buffer
-            _current_run_buffer = ""
+        # Flush any remaining dedup buffer from the last run
+        if _run_token_buffer and not _run_suppressed:
+            current_assistant_content = "".join(_run_token_buffer)
+            _run_token_buffer = []
 
         # Add final assistant content to local buffer for safety net
         if current_assistant_content.strip():
@@ -858,6 +886,64 @@ async def _run_agent(
                     "Safety net: skipped — no BRD content detected (longest msg: %d chars, markers: %s)",
                     len(brd_content),
                     has_brd_markers,
+                )
+
+        # --- Safety net: save YAML if generation agent produced JSON but didn't call save_semantic_view ---
+        if _generation_phase_ran and not _yaml_tool_called:
+            # Look for JSON structure in assistant messages
+            yaml_content = ""
+            for text in _assistant_texts:
+                if '"tables"' in text and ('"facts"' in text or '"dimensions"' in text):
+                    try:
+                        from agents.generation import extract_json_from_text, assemble_semantic_view_yaml
+                        structure = extract_json_from_text(text)
+                        if structure and "tables" in structure:
+                            yaml_content = assemble_semantic_view_yaml(structure)
+                            break
+                    except Exception as e:
+                        logger.warning("Generation safety net: failed to assemble YAML from JSON: %s", e)
+
+            if yaml_content and len(yaml_content) > 100:
+                logger.warning(
+                    "Safety net: generation agent did not call save_semantic_view for session %s — saving programmatically",
+                    session_id,
+                )
+                try:
+                    from tools.postgres_tools import _get_pool
+                    from services import postgres as _pg_svc
+                    from uuid import uuid4 as _uuid4
+
+                    pool = await _get_pool()
+                    sv_id = str(_uuid4())
+                    sql = """
+                    INSERT INTO semantic_views (id, data_product_id, yaml_content, created_by, created_at)
+                    VALUES ($1::uuid, $2::uuid, $3, $4, NOW())
+                    """
+                    await _pg_svc.execute(pool, sql, sv_id, data_product_id, yaml_content, "ai-agent")
+                    logger.info("Safety net: YAML saved to PostgreSQL (sv_id=%s)", sv_id)
+                    _yaml_tool_called = True
+
+                    # Upload as artifact
+                    from tools.minio_tools import upload_artifact_programmatic
+                    await upload_artifact_programmatic(
+                        data_product_id=data_product_id,
+                        artifact_type="yaml",
+                        filename="semantic-view.yaml",
+                        content=yaml_content,
+                    )
+                    logger.info("Safety net: YAML artifact uploaded for %s", data_product_id)
+                    await queue.put({
+                        "type": "artifact",
+                        "data": {
+                            "artifact_id": sv_id,
+                            "artifact_type": "yaml",
+                        },
+                    })
+                except Exception as e:
+                    logger.error("Safety net: failed to save YAML: %s", e)
+            else:
+                logger.info(
+                    "Generation safety net: skipped — no valid JSON structure found in assistant output",
                 )
 
         # Update data product state with session_id so frontend knows which thread to recover.
@@ -1210,7 +1296,7 @@ async def _run_agent_from_checkpoint(
         logger.exception("Retry failed for session %s: %s", session_id, e)
         await queue.put({
             "type": "error",
-            "data": {"message": f"Retry failed: {e}"},
+            "data": {"message": _sanitize_error_for_user(e)},
         })
         await queue.put({"type": "done", "data": {"message": "Retry failed"}})
         await queue.put(None)
@@ -1241,6 +1327,104 @@ async def list_checkpoints(session_id: str) -> dict:
         return {"session_id": session_id, "checkpoints": [], "error": str(e)}
 
 
+async def _infer_phase(session_id: str, all_messages: list) -> str:
+    """Infer the current pipeline phase from tool calls AND database state.
+
+    Strategy:
+    1. Check tool calls in checkpoint messages (most reliable for current session)
+    2. Fall back to querying the database for artifacts/semantic views
+       (handles cases where checkpoints were truncated or rebuilt)
+
+    Phase mapping (ordered by pipeline progress):
+      create_cortex_agent / grant_agent_access → explorer (publishing done)
+      update_validation_status                 → publishing (validation done)
+      save_semantic_view                       → generation (YAML generated)
+      save_brd                                 → requirements (BRD done)
+      otherwise                                → discovery
+    """
+    phase_rank = {
+        "discovery": 0,
+        "requirements": 1,
+        "generation": 2,
+        "publishing": 3,
+        "explorer": 4,
+    }
+    tool_to_phase = {
+        "save_brd": "requirements",
+        "save_semantic_view": "generation",
+        "update_validation_status": "publishing",
+        "create_cortex_agent": "explorer",
+        "grant_agent_access": "explorer",
+    }
+
+    best_phase = "discovery"
+    best_rank = 0
+
+    # 1. Scan checkpoint messages for tool calls
+    for msg in all_messages:
+        tool_calls = getattr(msg, "tool_calls", None) or []
+        for tc in tool_calls:
+            name = tc.get("name", "") if isinstance(tc, dict) else getattr(tc, "name", "")
+            mapped = tool_to_phase.get(name)
+            if mapped and phase_rank.get(mapped, 0) > best_rank:
+                best_phase = mapped
+                best_rank = phase_rank[mapped]
+
+    # 2. If checkpoint alone suggests early phase, cross-check with database
+    #    (covers truncated checkpoints from service restarts/testing)
+    if best_rank < phase_rank["generation"]:
+        try:
+            from services import postgres as pg_service
+            pool = pg_service._pool
+
+            # Look up data_product_id from session_id
+            dp_rows = await pg_service.query(
+                pool,
+                "SELECT id FROM data_products WHERE state->>'session_id' = $1 LIMIT 1",
+                session_id,
+            )
+            if dp_rows:
+                dp_id = str(dp_rows[0]["id"])
+
+                # Check for semantic views (most definitive)
+                sv_rows = await pg_service.query(
+                    pool,
+                    "SELECT validation_status FROM semantic_views WHERE data_product_id = $1::uuid ORDER BY version DESC LIMIT 1",
+                    dp_id,
+                )
+                if sv_rows:
+                    status = sv_rows[0].get("validation_status")
+                    if status == "valid":
+                        # Check if Cortex Agent was also created (artifacts with type 'yaml' after validation)
+                        # Use audit_logs or just assume publishing since we have valid yaml
+                        log_rows = await pg_service.query(
+                            pool,
+                            "SELECT 1 FROM audit_logs WHERE data_product_id = $1::uuid AND action_type = 'publish' LIMIT 1",
+                            dp_id,
+                        )
+                        if log_rows:
+                            best_phase = "explorer"
+                        else:
+                            best_phase = "publishing"
+                    elif status == "invalid":
+                        best_phase = "generation"
+                    else:
+                        best_phase = "generation"
+                else:
+                    # No semantic view — check for BRD
+                    brd_rows = await pg_service.query(
+                        pool,
+                        "SELECT 1 FROM business_requirements WHERE data_product_id = $1::uuid LIMIT 1",
+                        dp_id,
+                    )
+                    if brd_rows:
+                        best_phase = "requirements"
+        except Exception as e:
+            logger.warning("Phase inference DB fallback failed: %s", e)
+
+    return best_phase
+
+
 @router.get("/history/{session_id}")
 async def get_history(session_id: str) -> dict:
     """Get conversation history from LangGraph's PostgreSQL checkpointer."""
@@ -1251,8 +1435,9 @@ async def get_history(session_id: str) -> dict:
         config = {"configurable": {"thread_id": session_id}}
         state = await agent.aget_state(config)
         if state and state.values and "messages" in state.values:
+            raw_messages = state.values["messages"]
             messages = []
-            for msg in state.values["messages"]:
+            for msg in raw_messages:
                 if not hasattr(msg, "content") or not hasattr(msg, "type"):
                     continue
                 # Skip system messages
@@ -1287,8 +1472,12 @@ async def get_history(session_id: str) -> dict:
                     continue
                 seen.add(fingerprint)
                 deduped.append(m)
-            return {"session_id": session_id, "messages": deduped}
+
+            # Infer the pipeline phase from tool calls + database state
+            phase = await _infer_phase(session_id, raw_messages)
+
+            return {"session_id": session_id, "messages": deduped, "phase": phase}
     except Exception as e:
         logger.error("Failed to get history for session %s: %s", session_id, e)
 
-    return {"session_id": session_id, "messages": []}
+    return {"session_id": session_id, "messages": [], "phase": "discovery"}

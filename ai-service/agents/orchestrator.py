@@ -3,7 +3,7 @@
 Uses `create_deep_agent` from the deepagents library to build a LangGraph-based
 agent that delegates to specialized subagents based on conversation phase:
     - Discovery: Profiles schemas, detects PKs/FKs, builds ERD
-    - Requirements: Interactive BRD capture (max 15 turns)
+    - Requirements: Adaptive BRD capture (confidence-based, 1-4 question rounds)
     - Generation: Creates semantic view YAML from BRD
     - Validation: Tests generated YAML against real data via RCR
     - Publishing: Deploys semantic view + Cortex Agent
@@ -50,7 +50,9 @@ def _load_tools() -> None:
         execute_rcr_query,
         grant_agent_access,
         profile_table,
+        query_cortex_agent,
         query_information_schema,
+        validate_semantic_view_yaml,
         validate_sql,
     )
     from tools.neo4j_tools import (
@@ -61,12 +63,14 @@ def _load_tools() -> None:
     )
     from tools.postgres_tools import (
         get_latest_brd,
+        get_latest_semantic_view,
         load_workspace_state,
         log_agent_action,
         save_brd,
         save_quality_report,
         save_semantic_view,
         save_workspace_state,
+        update_validation_status,
     )
     from tools.minio_tools import (
         list_artifacts,
@@ -89,28 +93,38 @@ def _load_tools() -> None:
         get_latest_brd,
     ]
 
+    from tools.web_tools import fetch_documentation
+
     # Generation Agent tools
     _generation_tools = [
+        get_latest_brd,
+        get_latest_semantic_view,
         query_erd_graph,
-        load_workspace_state,
         save_semantic_view,
         upload_artifact,
+        execute_rcr_query,
+        fetch_documentation,
     ]
 
-    # Validation Agent tools
+    # Validation Agent tools (no upload_artifact — validation only validates, doesn't create artifacts)
     _validation_tools = [
+        get_latest_semantic_view,
+        get_latest_brd,
+        validate_semantic_view_yaml,
         validate_sql,
         execute_rcr_query,
-        save_semantic_view,
-        upload_artifact,
+        update_validation_status,
+        fetch_documentation,
     ]
 
     # Publishing Agent tools
     _publishing_tools = [
+        get_latest_semantic_view,
         create_semantic_view,
         create_cortex_agent,
         grant_agent_access,
         log_agent_action,
+        upload_artifact,
     ]
 
     # Explorer Agent tools
@@ -118,6 +132,9 @@ def _load_tools() -> None:
         execute_rcr_query,
         query_erd_graph,
         profile_table,
+        query_cortex_agent,
+        get_latest_semantic_view,
+        get_latest_brd,
     ]
 
 
@@ -144,9 +161,10 @@ def _build_subagents(model: Any) -> list[dict[str, Any]]:
         {
             "name": "requirements-agent",
             "description": (
-                "Captures business requirements through sharp clarifying questions, "
+                "Captures business requirements through intelligent clarifying questions, "
                 "then generates a comprehensive Business Requirements Document. "
-                "Asks 3-5 specific questions, then produces and saves the full BRD. "
+                "Adaptively decides when enough information has been gathered — "
+                "may ask 1-4 rounds of questions before generating the BRD. "
                 "Use immediately after the user responds to the discovery analysis — "
                 "do NOT wait for the user to explicitly ask for requirements."
             ),
