@@ -3,11 +3,12 @@ import { api } from '@/lib/api';
 import type { ERDNode, ERDEdge } from '@/components/panels/ERDDiagramPanel';
 import type { QualityReport } from '@/components/panels/DataQualityReport';
 import type { BRDResponse } from '@/components/panels/BRDViewer';
+import type { DataDescriptionResponse } from '@/components/panels/DataDescriptionViewer';
 
 interface Artifact {
   id: string;
   data_product_id: string;
-  artifact_type: 'erd' | 'yaml' | 'brd' | 'quality_report' | 'document' | 'export';
+  artifact_type: 'erd' | 'yaml' | 'brd' | 'quality_report' | 'document' | 'export' | 'data_description';
   version?: number;
   filename?: string;
   file_size_bytes?: number;
@@ -77,5 +78,14 @@ function useBRD(dataProductId: string | null, enabled = false) {
   });
 }
 
-export { useArtifacts, useERDData, useQualityReport, useYAMLContent, useBRD };
+function useDataDescription(dataProductId: string | null, enabled = false) {
+  return useQuery<DataDescriptionResponse>({
+    queryKey: ['artifacts', 'data-description', dataProductId],
+    queryFn: () =>
+      api.get<DataDescriptionResponse>(`/artifacts/${dataProductId}/data-description`),
+    enabled: enabled && dataProductId !== null && dataProductId.length > 0,
+  });
+}
+
+export { useArtifacts, useERDData, useQualityReport, useYAMLContent, useBRD, useDataDescription };
 export type { Artifact, ArtifactsResponse, ERDResponse };

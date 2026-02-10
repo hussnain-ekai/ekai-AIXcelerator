@@ -6,6 +6,7 @@ import AssessmentIcon from '@mui/icons-material/Assessment';
 import CodeIcon from '@mui/icons-material/Code';
 import DescriptionIcon from '@mui/icons-material/Description';
 import TableChartIcon from '@mui/icons-material/TableChart';
+import LibraryBooksIcon from '@mui/icons-material/LibraryBooks';
 import type { ArtifactType } from '@/stores/chatStore';
 
 interface ArtifactCardProps {
@@ -23,6 +24,7 @@ const ARTIFACT_META: Record<ArtifactType, { icon: typeof SchemaIcon; label: stri
   yaml: { icon: CodeIcon, label: 'Semantic View YAML', description: 'Generated semantic model definition' },
   brd: { icon: DescriptionIcon, label: 'Business Requirements', description: 'Structured requirements document' },
   data_preview: { icon: TableChartIcon, label: 'Data Preview', description: 'Sample query results' },
+  data_description: { icon: LibraryBooksIcon, label: 'Data Description', description: 'Business context and domain analysis' },
 };
 
 export function ArtifactCard({ type, title, description, onClick }: ArtifactCardProps): React.ReactNode {

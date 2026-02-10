@@ -25,10 +25,12 @@ import { DataQualityReport } from '@/components/panels/DataQualityReport';
 import { YAMLViewer } from '@/components/panels/YAMLViewer';
 import { BRDViewer } from '@/components/panels/BRDViewer';
 import { DataPreview } from '@/components/panels/DataPreview';
+import { DataDescriptionViewer } from '@/components/panels/DataDescriptionViewer';
 import { useDataProduct } from '@/hooks/useDataProducts';
 import { useAgent } from '@/hooks/useAgent';
 import { useSessionRecovery } from '@/hooks/useSessionRecovery';
-import { useArtifacts, useERDData, useQualityReport, useYAMLContent, useBRD } from '@/hooks/useArtifacts';
+import { useArtifacts, useERDData, useQualityReport, useYAMLContent, useBRD, useDataDescription } from '@/hooks/useArtifacts';
+import { useQueryClient } from '@tanstack/react-query';
 import { useChatStore } from '@/stores/chatStore';
 import type { ArtifactType } from '@/stores/chatStore';
 
@@ -42,6 +44,7 @@ function phaseForArtifactType(type: ArtifactType): 'DISCOVERY' | 'REQUIREMENTS' 
     case 'erd':
     case 'data_quality':
     case 'data_preview':
+    case 'data_description':
       return 'DISCOVERY';
     case 'brd':
       return 'REQUIREMENTS';
@@ -68,6 +71,7 @@ export default function ChatWorkspacePage({
   const activePanel = useChatStore((state) => state.activePanel);
   const setActivePanel = useChatStore((state) => state.setActivePanel);
   const addArtifact = useChatStore((state) => state.addArtifact);
+  const queryClient = useQueryClient();
   const [tablesOpen, setTablesOpen] = useState(false);
   const [artifactsPanelOpen, setArtifactsPanelOpen] = useState(false);
   const discoveryTriggeredRef = useRef(false);
@@ -80,11 +84,20 @@ export default function ChatWorkspacePage({
   const pipelineRunning = useChatStore((state) => state.pipelineRunning);
 
   useEffect(() => {
-    // Wait for BOTH artifacts to load AND session recovery to finish
-    // so we don't inject messages that get overwritten by hydrateFromHistory.
-    // Also skip while pipeline is running — avoids showing stale artifacts from
-    // a previous discovery run before the new pipeline produces fresh ones.
-    if (artifactsHydratedRef.current || !persistedArtifacts?.data || !isHydrated || pipelineRunning) return;
+    // Hydrate artifacts from PostgreSQL ONLY on page reload with existing conversation.
+    // Two guards prevent loading stale artifacts during a fresh/re-run discovery:
+    //   1. messages.length === 0: blocks before auto-trigger fires (same render cycle race)
+    //   2. discoveryTriggeredRef: blocks after pipeline adds completion message
+    // On page reload with recovered messages, both guards are false → hydration proceeds.
+    const currentMessages = useChatStore.getState().messages;
+    if (
+      artifactsHydratedRef.current ||
+      !persistedArtifacts?.data ||
+      !isHydrated ||
+      pipelineRunning ||
+      discoveryTriggeredRef.current ||
+      currentMessages.length === 0
+    ) return;
     artifactsHydratedRef.current = true;
 
     const TYPE_MAP: Record<string, ArtifactType> = {
@@ -93,6 +106,7 @@ export default function ChatWorkspacePage({
       brd: 'brd',
       quality_report: 'data_quality',
       document: 'data_preview',
+      data_description: 'data_description',
     };
     const TITLE_MAP: Record<string, string> = {
       erd: 'ERD Diagram',
@@ -100,12 +114,13 @@ export default function ChatWorkspacePage({
       brd: 'Business Requirements',
       quality_report: 'Data Quality Report',
       document: 'Data Preview',
+      data_description: 'Data Description',
     };
 
     let hasDiscoveryArtifacts = false;
     for (const a of persistedArtifacts.data) {
       const mappedType = TYPE_MAP[a.artifact_type] ?? 'erd';
-      if (mappedType === 'erd' || mappedType === 'data_quality') {
+      if (mappedType === 'erd' || mappedType === 'data_quality' || mappedType === 'data_description') {
         hasDiscoveryArtifacts = true;
       }
       const alreadyExists = useChatStore.getState().artifacts.some(
@@ -127,15 +142,15 @@ export default function ChatWorkspacePage({
     // message is in the thread, prepend one so artifact cards always appear first
     if (hasDiscoveryArtifacts) {
       const msgs = useChatStore.getState().messages;
-      const discoveryText = "I've reviewed your data tables, mapped the relationships between them, and checked the overall data quality.";
+      const discoveryText = "I've analyzed your data tables and checked the overall data quality.";
       const hasDiscoveryMsg = msgs.some((m) => m.content === discoveryText || (m.artifactRefs && m.artifactRefs.length > 0));
       if (!hasDiscoveryMsg) {
         const discoveryMsg = {
           id: crypto.randomUUID(),
           role: 'assistant' as const,
-          content: "I've reviewed your data tables, mapped the relationships between them, and checked the overall data quality.",
+          content: "I've analyzed your data tables and checked the overall data quality.",
           timestamp: new Date(Date.now() - 1000).toISOString(),
-          artifactRefs: ['erd' as const, 'data_quality' as const],
+          artifactRefs: ['data_quality' as const],
         };
         useChatStore.setState((state) => ({
           messages: [discoveryMsg, ...state.messages],
@@ -152,6 +167,7 @@ export default function ChatWorkspacePage({
   );
   const { data: yamlData } = useYAMLContent(id, activePanel === 'yaml');
   const { data: brdData, isLoading: brdLoading } = useBRD(id, activePanel === 'brd');
+  const { data: dataDescriptionData, isLoading: dataDescriptionLoading } = useDataDescription(id, activePanel === 'data_description');
 
   const handleSendMessage = useCallback(
     (content: string, files?: File[]) => {
@@ -210,9 +226,11 @@ export default function ChatWorkspacePage({
     discoveryTriggeredRef.current = true; // prevent auto-trigger from also firing
     artifactsHydratedRef.current = false;
     setPipelineRunningAction(true); // Block artifact hydration immediately
+    // Invalidate React Query artifact caches so stale BRD/YAML/ERD don't persist
+    void queryClient.invalidateQueries({ queryKey: ['artifacts', id] });
     // Send re-run trigger directly — bypasses cache in the pipeline
     void sendMessage('__RERUN_DISCOVERY__');
-  }, [clearMessages, sendMessage, setPipelineRunningAction]);
+  }, [clearMessages, sendMessage, setPipelineRunningAction, queryClient, id]);
 
   // Auto-trigger discovery when no messages and data product exists
   // Wait for hydration to complete before deciding - prevents re-triggering on navigation
@@ -424,6 +442,14 @@ export default function ChatWorkspacePage({
         open={activePanel === 'data_preview'}
         onClose={handleClosePanel}
         data={null}
+      />
+
+      {/* Data Description viewer panel */}
+      <DataDescriptionViewer
+        open={activePanel === 'data_description'}
+        onClose={handleClosePanel}
+        dataDescription={dataDescriptionData ?? null}
+        isLoading={dataDescriptionLoading}
       />
     </Box>
   );

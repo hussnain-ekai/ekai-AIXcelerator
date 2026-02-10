@@ -28,6 +28,7 @@ CONTENT_TYPES: dict[str, str] = {
     "yaml": "text/yaml",
     "brd": "application/json",
     "quality_report": "application/json",
+    "data_description": "application/json",
 }
 
 
@@ -98,10 +99,15 @@ async def upload_artifact(
 
     Args:
         data_product_id: UUID of the data product.
-        artifact_type: One of 'erd', 'yaml', 'brd', 'quality_report'.
+        artifact_type: One of 'erd', 'yaml', 'brd', 'quality_report', 'data_description'.
         filename: Name for the stored file.
         content: The file content as a string.
     """
+    # Guard: correct artifact_type if filename contradicts it
+    if "data-description" in filename.lower() and artifact_type != "data_description":
+        logger.warning("Correcting artifact_type from %s to data_description (filename=%s)", artifact_type, filename)
+        artifact_type = "data_description"
+
     client = _get_client()
     content_type = CONTENT_TYPES.get(artifact_type, "application/octet-stream")
     content_bytes = content.encode("utf-8")

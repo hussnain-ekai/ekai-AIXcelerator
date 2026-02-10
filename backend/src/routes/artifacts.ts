@@ -372,6 +372,53 @@ export async function artifactRoutes(app: FastifyInstance): Promise<void> {
   );
 
   /**
+   * GET /artifacts/:dataProductId/data-description
+   * Get the latest Data Description for a data product.
+   */
+  app.get(
+    '/:dataProductId/data-description',
+    async (
+      request: FastifyRequest<{ Params: { dataProductId: string } }>,
+      reply,
+    ) => {
+      const { dataProductId } = request.params;
+      const { snowflakeUser } = request.user;
+
+      const result = await postgresService.query(
+        `SELECT
+           id, data_product_id, version, description_json,
+           created_by, created_at
+         FROM data_descriptions
+         WHERE data_product_id = $1
+         ORDER BY version DESC
+         LIMIT 1`,
+        [dataProductId],
+        snowflakeUser,
+      );
+
+      interface DataDescriptionRow {
+        id: string;
+        data_product_id: string;
+        version: number;
+        description_json: Record<string, unknown>;
+        created_by: string;
+        created_at: string;
+      }
+
+      const dd = result.rows[0] as DataDescriptionRow | undefined;
+
+      if (!dd) {
+        return reply.status(404).send({
+          error: 'NOT_FOUND',
+          message: 'No data description found for this data product',
+        });
+      }
+
+      return reply.send(dd);
+    },
+  );
+
+  /**
    * GET /artifacts/:dataProductId/quality-report
    * Get the latest data quality report for a data product.
    * Transforms response to camelCase format expected by frontend.

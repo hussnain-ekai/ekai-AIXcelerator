@@ -112,13 +112,16 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
           }
         },
         onArtifact: (artifactId: string, artifactType: string) => {
+          const typedArtifact = artifactType as ArtifactType;
           addArtifact({
             id: artifactId,
-            type: artifactType as ArtifactType,
+            type: typedArtifact,
             title: artifactType.toUpperCase(),
             dataProductId,
             createdAt: new Date().toISOString(),
           });
+          // Attach this artifact to the last assistant message so it shows inline
+          useChatStore.getState().attachArtifactToLastAssistant(typedArtifact);
         },
         onApprovalRequest: (_action: string, description: string, _options: string[]) => {
           addMessage({
@@ -152,14 +155,14 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
               // Dedup: skip if last message already has this content
               const msgs = useChatStore.getState().messages;
               const lastMsg = msgs[msgs.length - 1];
-              const discoveryText = "I've reviewed your data tables, mapped the relationships between them, and checked the overall data quality.";
+              const discoveryText = "I've analyzed your data tables and checked the overall data quality.";
               if (!lastMsg || lastMsg.content !== discoveryText) {
                 addMessage({
                   id: crypto.randomUUID(),
                   role: 'assistant',
                   content: discoveryText,
                   timestamp: new Date().toISOString(),
-                  artifactRefs: ['erd', 'data_quality'],
+                  artifactRefs: ['data_quality'],
                 });
               }
             }, 1200);

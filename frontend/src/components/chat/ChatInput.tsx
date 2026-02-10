@@ -8,7 +8,10 @@ import CloseOutlined from '@mui/icons-material/CloseOutlined';
 import InsertDriveFileOutlined from '@mui/icons-material/InsertDriveFileOutlined';
 import StopRounded from '@mui/icons-material/StopRounded';
 
-const ACCEPTED_TYPES = '.pdf,.csv,.txt,.json,.xlsx,.png,.jpg,.jpeg';
+// Accept all files — users upload DBML, SQL, SVG, data catalogs, and other uncommon
+// formats that browsers don't recognize in restrictive accept lists.
+// Size validation (MAX_FILE_SIZE) still applies.
+const ACCEPTED_TYPES = '*/*';
 const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB
 const MAX_FILES = 5;
 
@@ -113,7 +116,6 @@ export function ChatInput({
       <input
         ref={fileInputRef}
         type="file"
-        accept={ACCEPTED_TYPES}
         multiple
         style={{ display: 'none' }}
         onChange={handleFileChange}

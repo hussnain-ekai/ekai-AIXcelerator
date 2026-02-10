@@ -2,7 +2,7 @@ import { create } from 'zustand';
 
 type MessageRole = 'user' | 'assistant' | 'system';
 type AgentPhase = 'discovery' | 'requirements' | 'generation' | 'validation' | 'publishing' | 'explorer' | 'idle';
-type ArtifactType = 'erd' | 'yaml' | 'brd' | 'data_quality' | 'data_preview';
+type ArtifactType = 'erd' | 'yaml' | 'brd' | 'data_quality' | 'data_preview' | 'data_description';
 
 interface ChatMessageAttachment {
   filename: string;
@@ -72,6 +72,7 @@ interface ChatState {
   setActivePanel: (panel: ArtifactType | null) => void;
   setPipelineProgress: (progress: PipelineProgress | null) => void;
   setPipelineRunning: (running: boolean) => void;
+  attachArtifactToLastAssistant: (artifactType: ArtifactType) => void;
   truncateAfter: (messageId: string) => void;
   editMessage: (messageId: string, newContent: string) => void;
   clearMessages: () => void;
@@ -123,7 +124,7 @@ export const useChatStore = create<ChatState>()((set) => ({
         // Dedup: if this message duplicates the previous finalized assistant message, remove it
         for (let i = lastIndex - 1; i >= 0; i--) {
           const prev = messages[i];
-          if (prev.role === 'assistant' && !prev.isStreaming) {
+          if (prev && prev.role === 'assistant' && !prev.isStreaming) {
             const prevText = prev.content.trim();
             const currText = lastMessage.content.trim();
             if (
@@ -191,6 +192,23 @@ export const useChatStore = create<ChatState>()((set) => ({
 
   setPipelineRunning: (running: boolean) =>
     set({ pipelineRunning: running }),
+
+  attachArtifactToLastAssistant: (artifactType: ArtifactType) =>
+    set((state) => {
+      const messages = [...state.messages];
+      // Find the last assistant message (streaming or finalized)
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i];
+        if (msg && msg.role === 'assistant') {
+          const existing = msg.artifactRefs ?? [];
+          if (!existing.includes(artifactType)) {
+            messages[i] = { ...msg, artifactRefs: [...existing, artifactType] };
+          }
+          return { messages };
+        }
+      }
+      return state;
+    }),
 
   truncateAfter: (messageId: string) =>
     set((state) => {

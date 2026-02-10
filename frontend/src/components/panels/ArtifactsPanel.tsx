@@ -7,11 +7,12 @@ import SchemaIcon from '@mui/icons-material/Schema';
 import CodeIcon from '@mui/icons-material/Code';
 import AssessmentIcon from '@mui/icons-material/Assessment';
 import TableChartIcon from '@mui/icons-material/TableChart';
+import LibraryBooksIcon from '@mui/icons-material/LibraryBooks';
 
 const GOLD = '#D4A843';
 const DRAWER_WIDTH = 380;
 
-type ArtifactType = 'erd' | 'yaml' | 'brd' | 'data_quality' | 'data_preview';
+type ArtifactType = 'erd' | 'yaml' | 'brd' | 'data_quality' | 'data_preview' | 'data_description';
 type ArtifactPhase = 'DISCOVERY' | 'REQUIREMENTS' | 'GENERATION' | 'VALIDATION';
 
 interface Artifact {
@@ -37,6 +38,7 @@ const ARTIFACT_ICONS: Record<ArtifactType, React.ReactNode> = {
   yaml: <CodeIcon fontSize="small" />,
   data_quality: <AssessmentIcon fontSize="small" />,
   data_preview: <TableChartIcon fontSize="small" />,
+  data_description: <LibraryBooksIcon fontSize="small" />,
 };
 
 const PHASE_ORDER: ArtifactPhase[] = [

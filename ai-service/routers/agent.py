@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -45,6 +46,27 @@ def _sanitize_error_for_user(exc: Exception) -> str:
 
     # Generic fallback — never expose raw exception text
     return "Something went wrong while processing your request. Please try again or contact support."
+
+
+def _extract_yaml_from_text(text: str) -> str | None:
+    """Extract YAML content from LLM text output (safety net helper)."""
+    # Try markdown yaml block
+    match = re.search(r'```ya?ml\s*\n(.*?)\n\s*```', text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    # Try generic code block with YAML content
+    match = re.search(r'```\s*\n(.*?)\n\s*```', text, re.DOTALL)
+    if match:
+        content = match.group(1).strip()
+        if "tables:" in content and "base_table:" in content:
+            return content
+    # Try raw YAML (look for name: + tables: pattern)
+    match = re.search(r'(name:\s+\S+.*?tables:.*)', text, re.DOTALL)
+    if match:
+        candidate = match.group(1).strip()
+        if "base_table:" in candidate:
+            return candidate
+    return None
 
 
 # Discovery trigger constant
@@ -241,7 +263,17 @@ def _build_discovery_summary(
                 parts.append("unique identifier")
             if distinct is not None and simple_type == "text" and distinct <= 100:
                 parts.append(f"{distinct} values")
-            if null_pct is not None and null_pct > 5:
+            # Only show completeness for identifier columns — non-ID sparseness
+            # is structurally expected (e.g., coal fields on solar plants)
+            col_lower = col_name.lower()
+            is_id_col = (
+                is_pk
+                or col_lower.endswith("_id")
+                or col_lower == "id"
+                or col_lower.endswith("_code")
+                or col_lower.endswith("_key")
+            )
+            if is_id_col and null_pct is not None and null_pct > 5:
                 parts.append(f"{100 - null_pct:.0f}% complete")
             if role and role not in ("identifier", "descriptive", ""):
                 parts.append(role)
@@ -250,17 +282,6 @@ def _build_discovery_summary(
 
         section = f"  {name} ({biz_type}{row_str})\n" + "\n".join(field_lines)
         table_sections.append(section)
-
-    # Build relationship summaries
-    rel_lines = []
-    name_map = {t["fqn"]: t["name"] for t in metadata}
-    for rel in relationships:
-        src = name_map.get(rel["from_table"], rel["from_table"].split(".")[-1])
-        tgt = name_map.get(rel["to_table"], rel["to_table"].split(".")[-1])
-        via = rel.get("from_column", "")
-        confidence = rel.get("confidence", 0)
-        conf_str = "strong" if confidence >= 0.9 else "likely"
-        rel_lines.append(f"  - {src} connects to {tgt} via {via} ({conf_str})")
 
     # Quality summary
     score = quality.get("overall_score", 0)
@@ -294,11 +315,6 @@ TABLE DETAILS & FIELD ANALYSIS
 {chr(10).join(table_sections)}
 
 ═══════════════════════════════════════════════════════
-CONNECTIONS
-═══════════════════════════════════════════════════════
-{chr(10).join(rel_lines) if rel_lines else '  (none detected)'}
-
-═══════════════════════════════════════════════════════
 DATA QUALITY
 ═══════════════════════════════════════════════════════
 Score: {score}/100 (average completeness: {completeness:.0f}%)
@@ -307,26 +323,33 @@ Score: {score}/100 (average completeness: {completeness:.0f}%)
 ═══════════════════════════════════════════════════════
 YOUR TASK
 ═══════════════════════════════════════════════════════
-All profiling, classification, relationship detection, data map construction,
-and quality checks are ALREADY DONE. Artifacts are ALREADY saved.
+All profiling, classification, and quality checks are ALREADY DONE.
+Quality report artifact is ALREADY saved.
+
+The data map (ERD) and connections have NOT been built yet. You will build
+them AFTER your conversation with the user.
 
 Your job is to:
-1. Interpret these results in natural business language
-2. Recognize the business domain from table/field naming patterns
-3. Mention the quality score naturally
-4. Using the FIELD ANALYSIS above, PROPOSE 2-3 specific analytical questions or metrics
-   this data could support. Use fields tagged "potential measure" for metrics and
+1. Identify the business domain from table/field naming patterns
+2. Recognize each table's likely business role (transaction vs reference)
+3. Weave the quality score in naturally
+4. Form relationship HYPOTHESES from _id columns and naming patterns
+5. Using the FIELD ANALYSIS above, PROPOSE 2-3 specific metrics this data
+   could support. Use fields tagged "potential measure" for metrics and
    fields tagged "potential dimension" for grouping options.
-5. If the user's description above states their goal, tailor your suggestions to it.
-   Do NOT re-ask what they want to do — they already told you. Confirm understanding instead.
+6. Ask 2-3 validation questions. For each: state your inference, then ask the
+   user to confirm. Example: "I suspect X connects to Y through Z — does that
+   match your understanding? If you're not sure, I'll proceed with my analysis."
 
 RULES:
-- Do NOT call any tools — everything is already computed and saved
+- Do NOT call any tools on this first message — everything is in the context above
 - Do NOT repeat the data above verbatim — interpret it in business language
 - Refer to the data product as "{dp_name}"
 - Use table short names (e.g. "your Customers table") not FQNs
 - Your suggested metrics MUST reference actual field names from the analysis above
   Use format: business name (FIELD_NAME) — e.g. "average reading value (VALUE)"
+- If the user's description states their goal, tailor your suggestions to it.
+  Do NOT re-ask what they want to do — they already told you. Confirm understanding.
 - DATA ISOLATION: ONLY discuss the tables listed above. You know NOTHING about
   any other databases, schemas, or tables in this Snowflake account. They do not
   exist to you. NEVER mention or speculate about any other datasets.
@@ -471,6 +494,11 @@ async def _run_agent(
     _run_token_buffer: list[str] = []
     _run_dedup_resolved: bool = True  # True once dedup check is done or not needed
     _run_suppressed: bool = False  # True if current run is a duplicate
+    # Safety net: track whether save_data_description was called during discovery conversation
+    _dd_tool_called: bool = False
+    _erd_build_called: bool = False
+    _discovery_conversation_ran: bool = False  # True after discovery-agent runs more than once
+    _discovery_invocation_count: int = 0
     # Safety net: track whether save_brd was called during this invocation
     _brd_tool_called: bool = False
     _brd_artifact_uploaded: bool = False
@@ -507,6 +535,26 @@ async def _run_agent(
                 "data": {"from": "idle", "to": "discovery"},
             })
 
+            # 0. Invalidate stale artifacts from prior phases when re-running discovery.
+            # A new discovery means old BRD, YAML, Data Description, and ERD are no longer valid.
+            if force_rerun:
+                try:
+                    from services.postgres import get_pool, execute as pg_execute
+                    _pool = await get_pool(_settings.database_url)
+                    # Delete artifacts (erd, yaml, brd, data_description) — keep data_quality (re-generated by pipeline)
+                    await pg_execute(
+                        _pool,
+                        "DELETE FROM artifacts WHERE data_product_id = $1::uuid AND artifact_type IN ('erd', 'yaml', 'brd', 'data_description')",
+                        data_product_id,
+                    )
+                    # Delete related table rows
+                    await pg_execute(_pool, "DELETE FROM business_requirements WHERE data_product_id = $1::uuid", data_product_id)
+                    await pg_execute(_pool, "DELETE FROM semantic_views WHERE data_product_id = $1::uuid", data_product_id)
+                    await pg_execute(_pool, "DELETE FROM data_descriptions WHERE data_product_id = $1::uuid", data_product_id)
+                    logger.info("Invalidated prior-phase artifacts for data product %s", data_product_id)
+                except Exception as e:
+                    logger.warning("Failed to invalidate prior artifacts: %s", e)
+
             # 1. Get data product details
             dp_info = await _get_data_product_info(data_product_id)
             if dp_info is None:
@@ -532,10 +580,11 @@ async def _run_agent(
                     cached_artifacts = pipeline_results.get("artifacts", {})
                     if isinstance(cached_artifacts, dict):
                         artifact_ids = cached_artifacts.get("artifact_ids", {})
-                        # Map storage types to frontend types
+                        # Map storage types to frontend types — only quality_report in Phase 1
+                        # ERD comes later from the discovery conversation (Phase 2)
                         _ART_TYPE_MAP = {"quality_report": "data_quality"}
                         for art_type, art_id in artifact_ids.items():
-                            if art_id and art_type in ("erd", "quality_report"):
+                            if art_id and art_type == "quality_report":
                                 await queue.put({
                                     "type": "artifact",
                                     "data": {
@@ -603,6 +652,10 @@ async def _run_agent(
             await agent.aupdate_state(config, {"messages": _patches})
             logger.info("Patched %d empty AI messages in checkpoint for session %s",
                         len(_patches), session_id)
+
+        # Wire the SSE queue contextvar so build_erd_from_description can emit artifact events
+        from tools.discovery_tools import _sse_queue
+        _sse_queue.set(queue)
 
         # With PostgreSQL checkpointer, LangGraph automatically restores
         # conversation history for this thread_id. We only send the new message.
@@ -711,6 +764,10 @@ async def _run_agent(
                 # (more reliable than parsing output — subagent tool output may not propagate cleanly)
                 if tool_name == "upload_artifact" and isinstance(tool_input, dict):
                     art_type = tool_input.get("artifact_type", "")
+                    art_filename = tool_input.get("filename", "")
+                    # Guard: correct type if filename contradicts it
+                    if "data-description" in art_filename.lower() and art_type != "data_description":
+                        art_type = "data_description"
                     if art_type == "brd":
                         _brd_artifact_uploaded = True
                     if art_type:
@@ -733,6 +790,10 @@ async def _run_agent(
                     _subagent_completed = False
                     subagent_type = tool_input.get("subagent_type", "")
                     phase_name = _SUBAGENT_PHASE_MAP.get(subagent_type)
+                    if phase_name == "discovery":
+                        _discovery_invocation_count += 1
+                        if _discovery_invocation_count > 1:
+                            _discovery_conversation_ran = True
                     if phase_name == "requirements":
                         _requirements_phase_ran = True
                     if phase_name == "generation":
@@ -765,6 +826,16 @@ async def _run_agent(
                 # Truncate long outputs
                 truncate_len = _settings.tool_output_truncate_length
                 output_str = str(output)[:truncate_len] if output else ""
+
+                # Track save_data_description for safety net
+                if tool_name == "save_data_description":
+                    _dd_tool_called = True
+                    logger.info("save_data_description completed for session %s", session_id)
+
+                # Track build_erd_from_description for safety net
+                if tool_name == "build_erd_from_description":
+                    _erd_build_called = True
+                    logger.info("build_erd_from_description completed for session %s", session_id)
 
                 # Track save_brd completion for safety net
                 if tool_name == "save_brd":
@@ -829,6 +900,79 @@ async def _run_agent(
         if current_assistant_content.strip():
             _assistant_texts.append(current_assistant_content)
 
+        # --- Safety net: save Data Description if discovery agent produced text but didn't call save_data_description ---
+        if _discovery_conversation_ran and not _dd_tool_called:
+            dd_content = ""
+            for text in _assistant_texts:
+                if len(text) > len(dd_content):
+                    dd_content = text
+            _DD_MARKERS = ("[1] System Architecture", "[2] Business Context",
+                           "---BEGIN DATA DESCRIPTION---", "[6] Data Map")
+            has_dd_markers = any(marker in dd_content for marker in _DD_MARKERS)
+            if len(dd_content) > 1000 and has_dd_markers:
+                logger.warning(
+                    "Safety net: discovery agent did not call save_data_description for session %s — saving programmatically",
+                    session_id,
+                )
+                try:
+                    from tools.postgres_tools import _get_pool
+                    from services import postgres as _pg_svc
+                    from uuid import uuid4 as _uuid4
+
+                    pool = await _get_pool()
+                    dd_id = str(_uuid4())
+                    clean_json = json.dumps({"document": dd_content})
+                    sql = """
+                    INSERT INTO data_descriptions (id, data_product_id, description_json, created_by)
+                    VALUES ($1::uuid, $2::uuid, $3::jsonb, $4)
+                    """
+                    await _pg_svc.execute(pool, sql, dd_id, data_product_id, clean_json, "ai-agent")
+                    logger.info("Safety net: Data Description saved (dd_id=%s)", dd_id)
+                    _dd_tool_called = True
+
+                    # Upload artifact
+                    from tools.minio_tools import upload_artifact_programmatic
+                    await upload_artifact_programmatic(
+                        data_product_id=data_product_id,
+                        artifact_type="data_description",
+                        filename="data-description.json",
+                        content=dd_content,
+                    )
+                    await queue.put({
+                        "type": "artifact",
+                        "data": {
+                            "artifact_id": dd_id,
+                            "artifact_type": "data_description",
+                        },
+                    })
+
+                    # Trigger ERD build if not already done
+                    if not _erd_build_called:
+                        try:
+                            from services.discovery_pipeline import run_erd_pipeline
+                            erd_result = await run_erd_pipeline(data_product_id, {"document": dd_content})
+                            erd_artifact_id = erd_result.get("erd_artifact_id")
+                            if erd_artifact_id:
+                                await queue.put({
+                                    "type": "artifact",
+                                    "data": {
+                                        "artifact_id": erd_artifact_id,
+                                        "artifact_type": "erd",
+                                    },
+                                })
+                            logger.info("Safety net: ERD built from Data Description")
+                        except Exception as erd_err:
+                            logger.error("Safety net: failed to build ERD: %s", erd_err)
+
+                except Exception as e:
+                    logger.error("Safety net: failed to save Data Description: %s", e)
+            else:
+                logger.info(
+                    "Safety net: skipped — no Data Description content detected (longest msg: %d chars, markers: %s)",
+                    len(dd_content),
+                    has_dd_markers,
+                )
+
         # --- Safety net: save BRD if requirements agent produced text but didn't call save_brd ---
         if _requirements_phase_ran and not _brd_tool_called:
             # Find the longest assistant message — likely the BRD
@@ -888,20 +1032,36 @@ async def _run_agent(
                     has_brd_markers,
                 )
 
-        # --- Safety net: save YAML if generation agent produced JSON but didn't call save_semantic_view ---
+        # --- Safety net: save YAML if generation agent produced content but didn't call save_semantic_view ---
         if _generation_phase_ran and not _yaml_tool_called:
-            # Look for JSON structure in assistant messages
+            # 1. Try extracting JSON structure first (preferred — goes through full assembler)
             yaml_content = ""
             for text in _assistant_texts:
                 if '"tables"' in text and ('"facts"' in text or '"dimensions"' in text):
                     try:
-                        from agents.generation import extract_json_from_text, assemble_semantic_view_yaml
+                        from agents.generation import extract_json_from_text, assemble_semantic_view_yaml, build_table_metadata
                         structure = extract_json_from_text(text)
                         if structure and "tables" in structure:
-                            yaml_content = assemble_semantic_view_yaml(structure)
+                            meta = await build_table_metadata(data_product_id, structure)
+                            yaml_content = assemble_semantic_view_yaml(structure, table_metadata=meta)
                             break
                     except Exception as e:
                         logger.warning("Generation safety net: failed to assemble YAML from JSON: %s", e)
+
+            # 2. Fallback: try extracting YAML from assistant output
+            if not yaml_content:
+                for text in _assistant_texts:
+                    if "tables:" in text and "base_table:" in text:
+                        yaml_text = _extract_yaml_from_text(text)
+                        if yaml_text and len(yaml_text) > 100:
+                            try:
+                                from agents.generation import quote_columns_in_yaml_str
+                                yaml_content = await quote_columns_in_yaml_str(yaml_text, data_product_id)
+                                logger.info("Generation safety net: extracted YAML from assistant output (%d chars)", len(yaml_content))
+                            except Exception as e:
+                                logger.warning("Generation safety net: YAML quoting failed, using raw: %s", e)
+                                yaml_content = yaml_text
+                            break
 
             if yaml_content and len(yaml_content) > 100:
                 logger.warning(
@@ -943,7 +1103,7 @@ async def _run_agent(
                     logger.error("Safety net: failed to save YAML: %s", e)
             else:
                 logger.info(
-                    "Generation safety net: skipped — no valid JSON structure found in assistant output",
+                    "Generation safety net: skipped — no valid JSON or YAML structure found in assistant output",
                 )
 
         # Update data product state with session_id so frontend knows which thread to recover.
@@ -1350,6 +1510,8 @@ async def _infer_phase(session_id: str, all_messages: list) -> str:
         "explorer": 4,
     }
     tool_to_phase = {
+        "save_data_description": "discovery",
+        "build_erd_from_description": "discovery",
         "save_brd": "requirements",
         "save_semantic_view": "generation",
         "update_validation_status": "publishing",

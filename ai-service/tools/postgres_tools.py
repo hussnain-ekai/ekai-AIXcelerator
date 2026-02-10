@@ -76,6 +76,58 @@ async def load_workspace_state(data_product_id: str) -> str:
 
 
 @tool
+async def save_data_description(
+    data_product_id: str,
+    description_json: str,
+    created_by: str,
+) -> str:
+    """Persist a data description document for a data product.
+
+    Creates a new data_descriptions row with the provided JSON content.
+
+    Args:
+        data_product_id: UUID of the data product.
+        description_json: JSON string containing the structured data description.
+        created_by: Username of the person who created the description.
+    """
+    pool = await _get_pool()
+    dd_id = str(uuid4())
+
+    # LLM may send raw text or malformed JSON — normalize to valid JSON string
+    try:
+        parsed = json.loads(description_json)
+    except (json.JSONDecodeError, TypeError):
+        parsed = {"document": description_json}
+    clean_json = json.dumps(parsed)
+
+    sql = """
+    INSERT INTO data_descriptions (id, data_product_id, description_json, created_by)
+    VALUES ($1::uuid, $2::uuid, $3::jsonb, $4)
+    """
+    await pg_service.execute(pool, sql, dd_id, data_product_id, clean_json, created_by)
+
+    return json.dumps({"status": "ok", "data_description_id": dd_id})
+
+
+@tool
+async def get_latest_data_description(data_product_id: str) -> str:
+    """Retrieve the most recent data description for a data product.
+
+    Args:
+        data_product_id: UUID of the data product.
+    """
+    pool = await _get_pool()
+    rows = await pg_service.query(
+        pool,
+        "SELECT description_json, version FROM data_descriptions WHERE data_product_id = $1::uuid ORDER BY version DESC LIMIT 1",
+        data_product_id,
+    )
+    if not rows:
+        return json.dumps({"status": "not_found", "message": "No data description found for this data product"})
+    return json.dumps({"status": "ok", "version": rows[0]["version"], "description_json": rows[0]["description_json"]})
+
+
+@tool
 async def save_brd(
     data_product_id: str,
     brd_json: str,
@@ -149,15 +201,24 @@ async def save_semantic_view(
     content = yaml_content.strip()
     if content.startswith("{"):
         try:
-            from agents.generation import extract_json_from_text, assemble_semantic_view_yaml
+            from agents.generation import extract_json_from_text, assemble_semantic_view_yaml, build_table_metadata
             structure = extract_json_from_text(content)
             if structure and "tables" in structure:
-                assembled = assemble_semantic_view_yaml(structure)
+                meta = await build_table_metadata(data_product_id, structure)
+                assembled = assemble_semantic_view_yaml(structure, table_metadata=meta)
                 if assembled and len(assembled) > 50:
-                    logger.info("save_semantic_view: auto-assembled JSON to YAML (%d chars)", len(assembled))
+                    logger.info("save_semantic_view: auto-assembled JSON to YAML (%d chars, meta=%d tables)", len(assembled), len(meta))
                     content = assembled
         except Exception as e:
             logger.warning("save_semantic_view: failed to auto-assemble JSON to YAML: %s", e)
+    else:
+        # Content is YAML — apply column quoting as a fallback
+        # (handles the case where the agent outputs pre-assembled YAML)
+        try:
+            from agents.generation import quote_columns_in_yaml_str
+            content = await quote_columns_in_yaml_str(content, data_product_id)
+        except Exception as e:
+            logger.warning("save_semantic_view: failed to apply YAML column quoting: %s", e)
 
     pool = await _get_pool()
     sv_id = str(uuid4())

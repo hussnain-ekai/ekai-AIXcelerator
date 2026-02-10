@@ -26,10 +26,8 @@ STEPS = [
     {"key": "metadata", "label": "Reading data structure"},
     {"key": "profiling", "label": "Analyzing data patterns"},
     {"key": "classification", "label": "Classifying data"},
-    {"key": "fk_inference", "label": "Detecting connections"},
-    {"key": "erd", "label": "Building data map"},
     {"key": "quality", "label": "Checking data quality"},
-    {"key": "artifacts", "label": "Saving results"},
+    {"key": "artifacts", "label": "Saving quality report"},
 ]
 
 TOTAL_STEPS = len(STEPS)
@@ -97,7 +95,7 @@ async def run_discovery_pipeline(
     queue: asyncio.Queue[dict | None],
     force: bool = False,
 ) -> dict[str, Any]:
-    """Execute the 7-step deterministic discovery pipeline.
+    """Execute the 5-step deterministic discovery pipeline (Phase 1).
 
     Args:
         data_product_id: UUID of the data product.
@@ -108,8 +106,9 @@ async def run_discovery_pipeline(
         force: If True, skip cache and re-run the pipeline.
 
     Returns:
-        A dict with all pipeline results (metadata, profiles, classifications,
-        relationships, erd_status, quality, artifacts).
+        A dict with Phase 1 results (metadata, profiles, classifications,
+        quality, artifacts). FK inference and ERD construction happen in
+        Phase 2 after the discovery conversation.
     """
     settings = get_settings()
 
@@ -167,25 +166,12 @@ async def run_discovery_pipeline(
         await _emit(queue, "classification", STEPS[2]["label"],
                      "completed", "Done", 1, 1, 2)
 
-        # Step 4: FK Inference ---------------------------------------------
-        results["relationships"] = _step_fk_inference(
-            results["metadata"],
-            results.get("profiles", []),
-        )
-        await _emit(queue, "fk_inference", STEPS[3]["label"],
+        # Step 4: Quality score --------------------------------------------
+        results["quality"] = _step_quality(results)
+        await _emit(queue, "quality", STEPS[3]["label"],
                      "completed", "Done", 1, 1, 3)
 
-        # Step 5: ERD construction -----------------------------------------
-        results["erd_status"] = await _step_erd(
-            queue, data_product_id, results,
-        )
-
-        # Step 6: Quality score --------------------------------------------
-        results["quality"] = _step_quality(results)
-        await _emit(queue, "quality", STEPS[5]["label"],
-                     "completed", "Done", 1, 1, 5)
-
-        # Step 7: Artifact persistence -------------------------------------
+        # Step 5: Artifact persistence (quality report only) ---------------
         results["artifacts"] = await _step_artifacts(
             queue, data_product_id, results,
         )
@@ -541,28 +527,10 @@ def _step_fk_inference(
     metadata: list[dict[str, Any]],
     profiles: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Step 4: Infer foreign key relationships (pure Python)."""
+    """Infer foreign key relationships (pure Python). Used by Phase 2."""
     from agents.discovery import infer_foreign_keys
 
-    # Build profile lookup so we can pass is_pk flags to FK inference
-    profile_map: dict[str, dict[str, bool]] = {}
-    for p in profiles:
-        pk_lookup: dict[str, bool] = {}
-        for pc in p.get("columns", []):
-            pk_lookup[pc["column"]] = pc.get("is_likely_pk", False)
-        profile_map[p["table"]] = pk_lookup
-
-    # Transform metadata into the format infer_foreign_keys expects
-    tables_for_fk: list[dict[str, Any]] = []
-    for table in metadata:
-        pk_lookup = profile_map.get(table["fqn"], {})
-        tables_for_fk.append({
-            "name": table["fqn"],
-            "columns": [
-                {"name": c["name"], "is_pk": pk_lookup.get(c["name"], False)}
-                for c in table.get("columns", [])
-            ],
-        })
+    tables_for_fk = _build_fk_input(metadata, profiles)
     return infer_foreign_keys(tables_for_fk)
 
 
@@ -571,10 +539,9 @@ async def _step_erd(
     data_product_id: str,
     results: dict[str, Any],
 ) -> dict[str, Any]:
-    """Step 5: Build ERD graph in Neo4j."""
-    step_idx = 4
-    await _emit(queue, "erd", STEPS[step_idx]["label"],
-                "running", "Writing to graph...", 0, 1, step_idx)
+    """Build ERD graph in Neo4j (Phase 2)."""
+    await _emit(queue, "erd", "Building data map",
+                "running", "Writing to graph...", 0, 1, 0)
 
     metadata = results.get("metadata", [])
     classifications = results.get("classifications", {})
@@ -592,8 +559,8 @@ async def _step_erd(
 
         if neo4j_service._driver is None:
             logger.warning("Neo4j driver not initialized, skipping ERD step")
-            await _emit(queue, "erd", STEPS[step_idx]["label"],
-                        "completed", "Skipped (Neo4j unavailable)", 1, 1, step_idx)
+            await _emit(queue, "erd", "Building data map",
+                        "completed", "Skipped (Neo4j unavailable)", 1, 1, 0)
             return {"status": "skipped", "reason": "neo4j_unavailable"}
 
         driver = neo4j_service._driver
@@ -664,9 +631,9 @@ async def _step_erd(
                 target_column=rel.get("to_column", ""),
             )
 
-        await _emit(queue, "erd", STEPS[step_idx]["label"],
+        await _emit(queue, "erd", "Building data map",
                     "completed", f"{len(metadata)} tables, {len(relationships)} connections",
-                    1, 1, step_idx)
+                    1, 1, 0)
         return {
             "status": "ok",
             "nodes_upserted": len(metadata),
@@ -675,13 +642,13 @@ async def _step_erd(
 
     except Exception as e:
         logger.error("ERD step failed: %s", e)
-        await _emit(queue, "erd", STEPS[step_idx]["label"],
-                    "completed", "Partial (graph write failed)", 1, 1, step_idx)
+        await _emit(queue, "erd", "Building data map",
+                    "completed", "Partial (graph write failed)", 1, 1, 0)
         return {"status": "error", "error": str(e)}
 
 
 def _step_quality(results: dict[str, Any]) -> dict[str, Any]:
-    """Step 6: Compute data quality health score (pure Python)."""
+    """Step 4: Compute data quality health score (pure Python)."""
     from agents.discovery import compute_health_score
 
     profiles = results.get("profiles", [])
@@ -704,18 +671,55 @@ def _step_quality(results: dict[str, Any]) -> dict[str, Any]:
             completeness_pcts.append(0.0)
             continue
 
-        null_pcts = [c.get("null_pct", 0) for c in columns if "null_pct" in c]
-        if null_pcts:
-            avg_non_null = 100.0 - (sum(null_pcts) / len(null_pcts))
+        # Completeness is measured ONLY on identifier columns (likely PKs/FKs).
+        # Rationale: sparse optional columns (e.g., coal-specific fields on solar
+        # plants) are structurally correct — their nulls are not quality issues.
+        # What matters is whether the core identifiers that link tables together
+        # are populated and consistent.
+        id_null_pcts: list[float] = []
+        for c in columns:
+            if "null_pct" not in c:
+                continue
+            col_name = c.get("column", "").lower()
+            is_id = (
+                c.get("is_likely_pk", False)
+                or col_name.endswith("_id")
+                or col_name == "id"
+                or col_name.endswith("_code")
+                or col_name.endswith("_key")
+            )
+            if is_id:
+                id_null_pcts.append(c["null_pct"])
+
+        if id_null_pcts:
+            avg_non_null = 100.0 - (sum(id_null_pcts) / len(id_null_pcts))
             completeness_pcts.append(max(0.0, avg_non_null))
         else:
-            completeness_pcts.append(0.0)
+            # No identifier columns found — fall back to all columns
+            all_null_pcts = [c.get("null_pct", 0) for c in columns if "null_pct" in c]
+            if all_null_pcts:
+                avg_non_null = 100.0 - (sum(all_null_pcts) / len(all_null_pcts))
+                completeness_pcts.append(max(0.0, avg_non_null))
+            else:
+                completeness_pcts.append(0.0)
 
-        # Check for columns with high null rates
+        # Only flag identifier columns with gaps — these are real quality issues.
+        # Non-identifier columns with high nulls are informational (shown in the
+        # report but don't affect the score).
         table_name = profile.get("table", "").split(".")[-1]
         for col in columns:
             null_pct = col.get("null_pct", 0)
-            if null_pct > 50:
+            if null_pct <= 5:
+                continue
+            col_name = col.get("column", "").lower()
+            is_id = (
+                col.get("is_likely_pk", False)
+                or col_name.endswith("_id")
+                or col_name == "id"
+                or col_name.endswith("_code")
+                or col_name.endswith("_key")
+            )
+            if is_id and null_pct > 5:
                 issues.append({
                     "severity": "warning",
                     "message": f"{table_name}.{col['column']} is {100 - null_pct:.0f}% complete",
@@ -748,10 +752,10 @@ async def _step_artifacts(
     data_product_id: str,
     results: dict[str, Any],
 ) -> dict[str, Any]:
-    """Step 7: Persist quality report and ERD to PostgreSQL + MinIO."""
-    step_idx = 6
+    """Step 5: Persist quality report to PostgreSQL + MinIO (Phase 1 only)."""
+    step_idx = 4
     await _emit(queue, "artifacts", STEPS[step_idx]["label"],
-                "running", "Saving quality report...", 0, 2, step_idx)
+                "running", "Saving quality report...", 0, 1, step_idx)
 
     quality = results.get("quality", {})
     artifact_ids: dict[str, str] = {}
@@ -781,10 +785,7 @@ async def _step_artifacts(
     except Exception as e:
         logger.warning("Failed to save quality report to PostgreSQL: %s", e)
 
-    await _emit(queue, "artifacts", STEPS[step_idx]["label"],
-                "running", "Uploading artifacts...", 1, 2, step_idx)
-
-    # 7b: Upload ERD + quality report to MinIO
+    # 5b: Upload quality report to MinIO
     try:
         from services import minio as minio_service
         from services import postgres as pg_service
@@ -793,24 +794,6 @@ async def _step_artifacts(
             client = minio_service._client
             bucket = settings.minio_artifacts_bucket
             minio_service.ensure_bucket(client, bucket)
-
-            # ERD artifact (JSON summary)
-            erd_data = _build_erd_artifact(results)
-            erd_path, erd_artifact_id = await _upload_artifact_with_pg(
-                data_product_id, "erd", "erd.json",
-                json.dumps(erd_data, default=str).encode("utf-8"),
-                "application/json",
-            )
-            if erd_artifact_id:
-                artifact_ids["erd"] = erd_artifact_id
-                # Emit artifact event for the frontend
-                await queue.put({
-                    "type": "artifact",
-                    "data": {
-                        "artifact_id": erd_artifact_id,
-                        "artifact_type": "erd",
-                    },
-                })
 
             # Quality report artifact (JSON)
             qr_data = {
@@ -840,8 +823,106 @@ async def _step_artifacts(
         logger.warning("Failed to upload artifacts to MinIO: %s", e)
 
     await _emit(queue, "artifacts", STEPS[step_idx]["label"],
-                "completed", "Done", 2, 2, step_idx)
+                "completed", "Done", 1, 1, step_idx)
     return {"status": "ok", "artifact_ids": artifact_ids}
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: ERD pipeline (after discovery conversation)
+# ---------------------------------------------------------------------------
+
+
+def _build_fk_input(
+    metadata: list[dict[str, Any]],
+    profiles: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build the table list expected by infer_foreign_keys from pipeline data."""
+    profile_map: dict[str, dict[str, bool]] = {}
+    for p in profiles:
+        pk_lookup: dict[str, bool] = {}
+        for pc in p.get("columns", []):
+            pk_lookup[pc["column"]] = pc.get("is_likely_pk", False)
+        profile_map[p["table"]] = pk_lookup
+
+    tables_for_fk: list[dict[str, Any]] = []
+    for table in metadata:
+        pk_lookup = profile_map.get(table["fqn"], {})
+        tables_for_fk.append({
+            "name": table["fqn"],
+            "columns": [
+                {"name": c["name"], "is_pk": pk_lookup.get(c["name"], False)}
+                for c in table.get("columns", [])
+            ],
+        })
+    return tables_for_fk
+
+
+async def _upload_erd_artifact(
+    data_product_id: str,
+    erd_data: dict[str, Any],
+) -> str | None:
+    """Upload ERD artifact to MinIO + PostgreSQL, return artifact_id."""
+    try:
+        erd_path, erd_artifact_id = await _upload_artifact_with_pg(
+            data_product_id, "erd", "erd.json",
+            json.dumps(erd_data, default=str).encode("utf-8"),
+            "application/json",
+        )
+        return erd_artifact_id
+    except Exception as e:
+        logger.warning("Failed to upload ERD artifact: %s", e)
+        return None
+
+
+async def run_erd_pipeline(
+    data_product_id: str,
+    data_description: dict[str, Any] | str,
+) -> dict[str, Any]:
+    """Phase 2: Build ERD using data description context.
+
+    Loads Phase 1 results from Redis cache, runs enhanced FK inference,
+    builds Neo4j graph, and saves ERD artifact.
+    """
+    from services import redis as redis_service
+
+    settings = get_settings()
+    client = await redis_service.get_client(settings.redis_url)
+    cache_key = f"{CACHE_KEY_PREFIX}:{data_product_id}"
+    cached = await redis_service.get_json(client, cache_key)
+    if not cached:
+        raise ValueError("Phase 1 results not found in cache — run discovery pipeline first")
+
+    results = cached
+    metadata = results.get("metadata", [])
+    profiles = results.get("profiles", [])
+
+    # Enhanced FK inference using data description context
+    from agents.discovery import infer_foreign_keys_enhanced
+
+    fk_input = _build_fk_input(metadata, profiles)
+    relationships = infer_foreign_keys_enhanced(fk_input, data_description)
+    results["relationships"] = relationships
+
+    # Build ERD in Neo4j (reuse existing _step_erd with a dummy queue)
+    dummy_queue: asyncio.Queue[dict | None] = asyncio.Queue()
+    erd_result = await _step_erd(dummy_queue, data_product_id, results)
+
+    # Save ERD artifact
+    erd_data = _build_erd_artifact(results)
+    erd_artifact_id = await _upload_erd_artifact(data_product_id, erd_data)
+
+    # Update cache with relationships for downstream use
+    results["_cached_at"] = time.time()
+    try:
+        await redis_service.set_json(client, cache_key, results, ttl=CACHE_TTL)
+    except Exception as e:
+        logger.warning("Failed to update cache with ERD results: %s", e)
+
+    return {
+        "relationships": relationships,
+        "erd_status": erd_result,
+        "erd_artifact_id": erd_artifact_id,
+    }
 
 
 # ---------------------------------------------------------------------------

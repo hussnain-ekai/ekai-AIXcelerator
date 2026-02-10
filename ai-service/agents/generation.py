@@ -158,6 +158,232 @@ _COLUMN_KEYS = {"column", "col", "col1", "col2"}
 _LITERAL_KEYS = {"op", "val", "default", "type", "granularity"}
 
 
+# ---------------------------------------------------------------------------
+# Column case sensitivity helpers — Snowflake auto-uppercases unquoted
+# identifiers, so columns stored in lowercase (via double-quoted CREATE)
+# must be referenced with double quotes in SQL expressions.
+# ---------------------------------------------------------------------------
+
+
+def needs_quoting(col_name: str) -> bool:
+    """True if a Snowflake identifier needs double-quoting (stored as non-uppercase)."""
+    return col_name != col_name.upper()
+
+
+def safe_col(col_name: str) -> str:
+    """Wrap a column name in SQL double quotes if it needs quoting for Snowflake."""
+    if needs_quoting(col_name):
+        return f'"{col_name}"'
+    return col_name
+
+
+def _resolve_column_case(col_name: str, table_alias: str,
+                          table_metadata: dict[str, set[str]]) -> str:
+    """Resolve a column name to its actual stored case via case-insensitive lookup."""
+    cols = table_metadata.get(table_alias, set())
+    for actual in cols:
+        if actual.upper() == col_name.upper():
+            return actual
+    return col_name  # Not found — return as-is
+
+
+def _quote_column_refs(columns: dict[str, str], table_alias: str,
+                        table_metadata: dict[str, set[str]]) -> dict[str, str]:
+    """Resolve actual column case and apply SQL quoting for all column-key values."""
+    result = dict(columns)
+    for key in _COLUMN_KEYS:
+        if key in result and result[key]:
+            resolved = _resolve_column_case(result[key], table_alias, table_metadata)
+            result[key] = safe_col(resolved)
+    return result
+
+
+def _quote_columns_in_filter_expr(expr: str, table_alias: str,
+                                    table_metadata: dict[str, set[str]]) -> str:
+    """Find and quote column names within a raw SQL filter expression.
+
+    Uses look-around assertions to skip columns already wrapped in double quotes.
+    """
+    cols = table_metadata.get(table_alias, set())
+    for col in cols:
+        if needs_quoting(col):
+            # (?<!") prevents matching inside already-quoted identifiers
+            pattern = re.compile(r'(?<!")' + r'\b' + re.escape(col) + r'\b' + r'(?!")', re.IGNORECASE)
+            expr = pattern.sub(f'"{col}"', expr)
+    return expr
+
+
+async def build_table_metadata(data_product_id: str,
+                                structure: dict[str, Any]) -> dict[str, set[str]]:
+    """Build alias -> set(actual_column_names) from discovery pipeline cache.
+
+    Maps the LLM's table aliases to actual column sets via FQN matching.
+    Falls back to an empty dict if cache is unavailable (graceful degradation).
+    """
+    fqn_columns = await _build_fqn_column_map(data_product_id)
+    if not fqn_columns:
+        return {}
+
+    # Map structure aliases to column sets via FQN
+    meta: dict[str, set[str]] = {}
+    for tbl in structure.get("tables", []):
+        alias = tbl.get("alias", tbl.get("name", ""))
+        fqn = f"{tbl.get('database', '')}.{tbl.get('schema', '')}.{tbl.get('table', '')}".upper()
+        cols = fqn_columns.get(fqn, set())
+        meta[alias] = cols
+
+    return meta
+
+
+async def _build_fqn_column_map(data_product_id: str) -> dict[str, set[str]]:
+    """Fetch Redis discovery cache and return FQN (uppercased) -> set(actual column names)."""
+    from config import get_settings
+    from services import redis as redis_service
+
+    try:
+        settings = get_settings()
+        client = await redis_service.get_client(settings.redis_url)
+        cache_key = f"discovery:pipeline:{data_product_id}"
+        cached = await redis_service.get_json(client, cache_key)
+    except Exception as exc:
+        logger.warning("_build_fqn_column_map: Redis unavailable: %s", exc)
+        return {}
+
+    if not cached:
+        return {}
+
+    fqn_columns: dict[str, set[str]] = {}
+    for table in cached.get("metadata", []):
+        fqn = table.get("fqn", "").upper()
+        columns = {col["name"] for col in table.get("columns", [])}
+        fqn_columns[fqn] = columns
+    return fqn_columns
+
+
+async def build_table_metadata_from_yaml(
+    data_product_id: str, yaml_doc: dict[str, Any]
+) -> dict[str, set[str]]:
+    """Build alias -> set(actual_column_names) from a parsed YAML doc.
+
+    Unlike build_table_metadata (which works with JSON structure from the LLM),
+    this works with the final YAML doc where tables have name + base_table fields.
+    """
+    fqn_columns = await _build_fqn_column_map(data_product_id)
+    if not fqn_columns:
+        return {}
+
+    meta: dict[str, set[str]] = {}
+    for tbl in yaml_doc.get("tables", []):
+        alias = tbl.get("name", "")
+        bt = tbl.get("base_table", {})
+        fqn = f"{bt.get('database', '')}.{bt.get('schema', '')}.{bt.get('table', '')}".upper()
+        meta[alias] = fqn_columns.get(fqn, set())
+    return meta
+
+
+def _quote_columns_in_expr(expr: str, table_alias: str,
+                            table_metadata: dict[str, set[str]]) -> str:
+    """Quote all column references in a SQL expression.
+
+    Handles simple column refs (CAPACITY_MW), aggregate funcs (SUM(CAPACITY_MW)),
+    CASE expressions, etc. by doing word-boundary replacement for each known column.
+    Skips columns that are already quoted (wrapped in double quotes).
+    """
+    if not expr or not table_metadata:
+        return expr
+    cols = table_metadata.get(table_alias, set())
+    if not cols:
+        return expr
+
+    for col in cols:
+        if needs_quoting(col):
+            # Match column name with word boundaries, not already inside double quotes
+            pattern = re.compile(r'(?<!")' + r'\b' + re.escape(col) + r'\b' + r'(?!")', re.IGNORECASE)
+            expr = pattern.sub(f'"{col}"', expr)
+
+    return expr
+
+
+async def quote_columns_in_yaml_str(yaml_str: str, data_product_id: str) -> str:
+    """Parse YAML, resolve column case, apply SQL quoting, re-serialize.
+
+    This is the YAML-level fallback for when the generation agent outputs
+    pre-assembled YAML instead of JSON (bypassing the template assembler).
+    """
+    try:
+        doc = yaml.safe_load(yaml_str)
+    except yaml.YAMLError:
+        return yaml_str  # Can't parse, return as-is
+
+    if not isinstance(doc, dict) or "tables" not in doc:
+        return yaml_str
+
+    # Build metadata from the YAML's own table definitions
+    meta = await build_table_metadata_from_yaml(data_product_id, doc)
+    if not meta:
+        logger.warning("quote_columns_in_yaml_str: no metadata available, returning YAML as-is")
+        return yaml_str
+
+    # Check if any quoting is needed at all
+    any_lowercase = False
+    for cols in meta.values():
+        if any(needs_quoting(c) for c in cols):
+            any_lowercase = True
+            break
+    if not any_lowercase:
+        return yaml_str  # All columns are uppercase, no quoting needed
+
+    changed = False
+
+    # Quote expr fields in facts/dimensions/time_dimensions/metrics/filters
+    for tbl in doc.get("tables", []):
+        alias = tbl.get("name", "")
+        for section in ("facts", "dimensions", "time_dimensions", "metrics", "filters"):
+            for item in tbl.get(section, []):
+                old_expr = item.get("expr", "")
+                if old_expr:
+                    new_expr = _quote_columns_in_expr(old_expr, alias, meta)
+                    if new_expr != old_expr:
+                        item["expr"] = new_expr
+                        changed = True
+
+        # Quote primary_key columns
+        pk = tbl.get("primary_key")
+        if pk and isinstance(pk, dict) and "columns" in pk:
+            new_cols = []
+            for c in pk["columns"]:
+                # Skip already-quoted columns
+                if c.startswith('"') and c.endswith('"'):
+                    new_cols.append(c)
+                    continue
+                resolved = _resolve_column_case(c, alias, meta)
+                quoted = safe_col(resolved)
+                if quoted != c:
+                    changed = True
+                new_cols.append(quoted)
+            pk["columns"] = new_cols
+
+    # Quote relationship columns
+    for rel in doc.get("relationships", []):
+        from_table = rel.get("left_table", "")
+        to_table = rel.get("right_table", "")
+        for rc in rel.get("relationship_columns", []):
+            for col_key, tbl_alias in [("left_column", from_table), ("right_column", to_table)]:
+                c = rc.get(col_key, "")
+                if c and not (c.startswith('"') and c.endswith('"')):
+                    resolved = _resolve_column_case(c, tbl_alias, meta)
+                    quoted = safe_col(resolved)
+                    if quoted != c:
+                        rc[col_key] = quoted
+                        changed = True
+
+    if not changed:
+        return yaml_str
+
+    logger.info("quote_columns_in_yaml_str: applied column quoting to YAML for %s", data_product_id)
+    return yaml.dump(doc, default_flow_style=False, sort_keys=False, allow_unicode=True)
+
+
 def _validate_all_column_refs(columns: dict[str, str], table_alias: str,
                                table_metadata: dict[str, set[str]]) -> list[str]:
     """Validate all column references in a columns dict. Returns list of invalid columns."""
@@ -333,6 +559,8 @@ def assemble_semantic_view_yaml(structure: dict[str, Any],
                 logger.warning("Skipping fact %s: columns %s not found in table %s",
                                fact["name"], invalid, tbl_alias)
                 continue
+            # Resolve case + quote for SQL expressions
+            columns = _quote_column_refs(columns, tbl_alias, table_metadata)
 
         expr = _fill_template(template_name, FACT_TEMPLATES, columns)
         if expr is None:
@@ -342,6 +570,10 @@ def assemble_semantic_view_yaml(structure: dict[str, Any],
             else:
                 logger.warning("Cannot resolve expression for fact %s, skipping", fact["name"])
                 continue
+
+        # Post-fill quoting: catch column refs in raw/expr templates (e.g. CASE expressions)
+        if table_metadata and tbl_alias:
+            expr = _quote_columns_in_expr(expr, tbl_alias, table_metadata)
 
         f: dict[str, Any] = {"name": fact["name"], "expr": expr}
         if fact.get("synonyms"):
@@ -366,6 +598,8 @@ def assemble_semantic_view_yaml(structure: dict[str, Any],
                 logger.warning("Skipping dimension %s: columns %s not found in table %s",
                                dim["name"], invalid, tbl_alias)
                 continue
+            # Resolve case + quote for SQL expressions
+            columns = _quote_column_refs(columns, tbl_alias, table_metadata)
 
         expr = _fill_template(template_name, FACT_TEMPLATES, columns)
         if expr is None:
@@ -375,6 +609,10 @@ def assemble_semantic_view_yaml(structure: dict[str, Any],
             else:
                 logger.warning("Cannot resolve expression for dimension %s, skipping", dim["name"])
                 continue
+
+        # Post-fill quoting: catch column refs in raw/expr templates
+        if table_metadata and tbl_alias:
+            expr = _quote_columns_in_expr(expr, tbl_alias, table_metadata)
 
         d: dict[str, Any] = {"name": dim["name"], "expr": expr}
         if dim.get("synonyms"):
@@ -399,6 +637,8 @@ def assemble_semantic_view_yaml(structure: dict[str, Any],
                 logger.warning("Skipping time_dimension %s: columns %s not found in table %s",
                                tdim["name"], invalid, tbl_alias)
                 continue
+            # Resolve case + quote for SQL expressions
+            columns = _quote_column_refs(columns, tbl_alias, table_metadata)
 
         expr = _fill_template(template_name, FACT_TEMPLATES, columns)
         if expr is None:
@@ -408,6 +648,10 @@ def assemble_semantic_view_yaml(structure: dict[str, Any],
             else:
                 logger.warning("Cannot resolve expression for time_dimension %s, skipping", tdim["name"])
                 continue
+
+        # Post-fill quoting: catch column refs in raw/expr templates
+        if table_metadata and tbl_alias:
+            expr = _quote_columns_in_expr(expr, tbl_alias, table_metadata)
 
         td: dict[str, Any] = {"name": tdim["name"], "expr": expr}
         if tdim.get("synonyms"):
@@ -424,6 +668,8 @@ def assemble_semantic_view_yaml(structure: dict[str, Any],
     for flt in structure.get("filters", []):
         tbl_alias = flt.get("table", "")
         f_entry: dict[str, Any] = {"name": flt["name"], "expr": flt.get("expr", "")}
+        if table_metadata and tbl_alias and f_entry["expr"]:
+            f_entry["expr"] = _quote_columns_in_filter_expr(f_entry["expr"], tbl_alias, table_metadata)
         if flt.get("synonyms"):
             f_entry["synonyms"] = flt["synonyms"]
         if flt.get("description"):
@@ -460,6 +706,10 @@ def assemble_semantic_view_yaml(structure: dict[str, Any],
             else:
                 logger.info("Auto-recovered expression for metric %s: %s", metric["name"], expr)
 
+        # Post-fill quoting: catch column refs in raw/expr metrics
+        if table_metadata and tbl_alias:
+            expr = _quote_columns_in_expr(expr, tbl_alias, table_metadata)
+
         m: dict[str, Any] = {"name": metric["name"], "expr": expr}
         if metric.get("synonyms"):
             m["synonyms"] = metric["synonyms"]
@@ -487,11 +737,17 @@ def assemble_semantic_view_yaml(structure: dict[str, Any],
         pk = tbl.get("primary_key")
         if pk:
             if isinstance(pk, list):
+                if table_metadata:
+                    pk = [safe_col(_resolve_column_case(c, alias, table_metadata)) for c in pk]
                 t["primary_key"] = {"columns": pk}
             elif isinstance(pk, dict) and "columns" in pk:
-                t["primary_key"] = pk
+                cols_list = pk["columns"]
+                if table_metadata:
+                    cols_list = [safe_col(_resolve_column_case(c, alias, table_metadata)) for c in cols_list]
+                t["primary_key"] = {"columns": cols_list}
             elif isinstance(pk, str):
-                t["primary_key"] = {"columns": [pk]}
+                resolved = safe_col(_resolve_column_case(pk, alias, table_metadata)) if table_metadata else pk
+                t["primary_key"] = {"columns": [resolved]}
         # Nest facts, dimensions, time_dimensions, metrics, filters inside the table
         if alias in facts_by_table:
             t["facts"] = facts_by_table[alias]
@@ -517,10 +773,11 @@ def assemble_semantic_view_yaml(structure: dict[str, Any],
         r: dict[str, Any] = {"name": rel["name"]}
         r["left_table"] = from_table
         r["right_table"] = to_table
-        r["relationship_columns"] = [
-            {"left_column": fc, "right_column": tc}
-            for fc, tc in zip(from_cols, to_cols)
-        ]
+        r["relationship_columns"] = []
+        for fc, tc in zip(from_cols, to_cols):
+            lc = safe_col(_resolve_column_case(fc, from_table, table_metadata)) if table_metadata else fc
+            rc = safe_col(_resolve_column_case(tc, to_table, table_metadata)) if table_metadata else tc
+            r["relationship_columns"].append({"left_column": lc, "right_column": rc})
         rels_out.append(r)
     if rels_out:
         doc["relationships"] = rels_out

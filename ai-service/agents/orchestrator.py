@@ -63,10 +63,12 @@ def _load_tools() -> None:
     )
     from tools.postgres_tools import (
         get_latest_brd,
+        get_latest_data_description,
         get_latest_semantic_view,
         load_workspace_state,
         log_agent_action,
         save_brd,
+        save_data_description,
         save_quality_report,
         save_semantic_view,
         save_workspace_state,
@@ -77,11 +79,16 @@ def _load_tools() -> None:
         retrieve_artifact,
         upload_artifact,
     )
+    from tools.discovery_tools import build_erd_from_description
 
-    # Discovery Agent tools — only follow-up tools (pipeline handles initial profiling)
+    # Discovery Agent tools — conversational discovery + Data Description + ERD building
     _discovery_tools = [
         execute_rcr_query,
         query_erd_graph,
+        save_data_description,
+        get_latest_data_description,
+        upload_artifact,
+        build_erd_from_description,
     ]
 
     # Requirements Agent tools — NO execute_rcr_query (discovery context has all
@@ -91,6 +98,7 @@ def _load_tools() -> None:
         save_brd,
         upload_artifact,
         get_latest_brd,
+        get_latest_data_description,
     ]
 
     from tools.web_tools import fetch_documentation
@@ -98,6 +106,7 @@ def _load_tools() -> None:
     # Generation Agent tools
     _generation_tools = [
         get_latest_brd,
+        get_latest_data_description,
         get_latest_semantic_view,
         query_erd_graph,
         save_semantic_view,
@@ -151,8 +160,10 @@ def _build_subagents(model: Any) -> list[dict[str, Any]]:
             "name": "discovery-agent",
             "description": (
                 "Interprets pre-computed discovery results and engages the user "
-                "in business conversation about their data. Can run follow-up queries. "
-                "Use when starting a new data product or when the user has questions about discovered data."
+                "in multi-turn conversation about their data. Generates a Data Description "
+                "document capturing business context, then builds the ERD. May take 1-3 rounds "
+                "of questions before generating. Use when starting a new data product or "
+                "when the user has questions about discovered data."
             ),
             "system_prompt": DISCOVERY_PROMPT,
             "tools": _discovery_tools,

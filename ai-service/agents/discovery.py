@@ -11,7 +11,9 @@ Responsibilities:
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from typing import Any
 
 from agents.prompts import DISCOVERY_PROMPT
@@ -83,7 +85,9 @@ def compute_health_score(check_results: dict[str, list[dict[str, Any]]]) -> int:
     score -= len(numeric_varchars) * _get_deduction_numeric_varchar()
 
     missing_descriptions = check_results.get("missing_descriptions", [])
-    score -= len(missing_descriptions) * _get_deduction_missing_description()
+    # Cap missing description deduction at 10 points total (avoid penalizing
+    # large schemas unfairly — most Snowflake tables lack comments)
+    score -= min(len(missing_descriptions) * _get_deduction_missing_description(), 10)
 
     return max(0, score)
 
@@ -222,6 +226,113 @@ def infer_foreign_keys(
                             "confidence": confidence,
                             "cardinality": "many_to_one",
                         })
+
+    return relationships
+
+
+def _parse_relationship_overrides(
+    doc_text: str,
+) -> tuple[dict[tuple[str, str], dict[str, Any]], set[tuple[str, str]]]:
+    """Parse data description text for confirmed/rejected relationships.
+
+    Looks for patterns in section [6] ERD Generation Recommendations:
+      - [6.1] Confirmed/Focus: "TABLE_A connects to TABLE_B via COL"
+      - [6.3] Rejected/Known Limitations: "TABLE_A to TABLE_B: rejected"
+
+    Returns (confirmed_dict, rejected_set). Best-effort parsing — returns
+    empty collections on failure (base heuristics are used unchanged).
+    """
+    confirmed: dict[tuple[str, str], dict[str, Any]] = {}
+    rejected: set[tuple[str, str]] = set()
+
+    # Pattern: "TABLE_A connects to TABLE_B via COLUMN" or
+    #          "TABLE_A to TABLE_B: relationship_type"
+    connect_pattern = re.compile(
+        r"(\S+)\s+(?:connects? to|→|->)\s+(\S+)\s+via\s+(\S+)",
+        re.IGNORECASE,
+    )
+    reject_pattern = re.compile(
+        r"(\S+)\s+(?:to|→|->)\s+(\S+).*(?:reject|remove|invalid|incorrect)",
+        re.IGNORECASE,
+    )
+
+    for match in connect_pattern.finditer(doc_text):
+        from_tbl = match.group(1).strip("'\"")
+        to_tbl = match.group(2).strip("'\"")
+        via_col = match.group(3).strip("'\"")
+        key = (from_tbl, to_tbl)
+        confirmed[key] = {
+            "from_table": from_tbl,
+            "from_column": via_col,
+            "to_table": to_tbl,
+            "to_column": "",  # Will be resolved by FK inference
+            "cardinality": "many_to_one",
+        }
+
+    for match in reject_pattern.finditer(doc_text):
+        from_tbl = match.group(1).strip("'\"")
+        to_tbl = match.group(2).strip("'\"")
+        rejected.add((from_tbl, to_tbl))
+
+    return confirmed, rejected
+
+
+def infer_foreign_keys_enhanced(
+    tables: list[dict[str, Any]],
+    data_description: dict[str, Any] | str,
+) -> list[dict[str, Any]]:
+    """FK inference enhanced with data description context.
+
+    1. Run base heuristic inference
+    2. Parse data description for relationship overrides
+    3. Boost confirmed relationships to confidence 1.0
+    4. Add user-stated relationships that heuristics missed
+    5. Remove rejected relationships
+    """
+    # 1. Base heuristic inference
+    relationships = infer_foreign_keys(tables)
+
+    # 2. Parse data description
+    if isinstance(data_description, dict):
+        doc_text = data_description.get("document", json.dumps(data_description))
+    elif isinstance(data_description, str):
+        try:
+            parsed = json.loads(data_description)
+            doc_text = parsed.get("document", data_description)
+        except (json.JSONDecodeError, TypeError):
+            doc_text = data_description
+    else:
+        doc_text = str(data_description)
+
+    confirmed, rejected = _parse_relationship_overrides(doc_text)
+    if not confirmed and not rejected:
+        logger.info("No relationship overrides found in data description — using base heuristics")
+        return relationships
+
+    # 3. Boost confirmed relationships
+    existing_keys: set[tuple[str, str]] = set()
+    for rel in relationships:
+        key = (rel["from_table"], rel["to_table"])
+        existing_keys.add(key)
+        if key in confirmed:
+            rel["confidence"] = 1.0
+            rel["source"] = "user_confirmed"
+            logger.info("Boosted relationship %s → %s to confidence 1.0", key[0], key[1])
+
+    # 4. Add user-stated relationships that heuristics missed
+    for key, rel_data in confirmed.items():
+        if key not in existing_keys:
+            relationships.append({**rel_data, "confidence": 1.0, "source": "user_stated"})
+            logger.info("Added user-stated relationship: %s → %s", key[0], key[1])
+
+    # 5. Remove rejected relationships
+    if rejected:
+        before_count = len(relationships)
+        relationships = [r for r in relationships
+                         if (r["from_table"], r["to_table"]) not in rejected]
+        removed = before_count - len(relationships)
+        if removed:
+            logger.info("Removed %d rejected relationships", removed)
 
     return relationships
 

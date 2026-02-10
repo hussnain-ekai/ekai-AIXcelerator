@@ -90,6 +90,7 @@ const PROVIDERS: ProviderDef[] = [
       // Gemini 2.0
       'gemini-2-0-flash', 'gemini-2-0-flash-lite',
       // Claude models on Vertex
+      'claude-opus-4-6@default',
       'claude-sonnet-4-5@20250929', 'claude-opus-4-5@20251101',
       'claude-3-7-sonnet@20250219', 'claude-3-5-haiku@20241022',
     ],
@@ -115,6 +116,7 @@ const PROVIDERS: ProviderDef[] = [
           // Gemini 2.0
           'gemini-2-0-flash', 'gemini-2-0-flash-lite',
           // Claude on Vertex
+          'claude-opus-4-6@default',
           'claude-sonnet-4-5@20250929', 'claude-opus-4-5@20251101',
           'claude-3-5-haiku@20241022',
         ],
@@ -153,8 +155,8 @@ const PROVIDERS: ProviderDef[] = [
     description: 'Direct API access to Claude models.',
     badges: [],
     models: [
-      'claude-sonnet-4-5-20250929', 'claude-opus-4-5-20251101',
-      'claude-haiku-4-5-20251001',
+      'claude-opus-4-6-20260210', 'claude-sonnet-4-5-20250929',
+      'claude-opus-4-5-20251101', 'claude-haiku-4-5-20251001',
     ],
     fields: [
       { key: 'anthropic_api_key', label: 'API Key', type: 'password' },
@@ -163,8 +165,8 @@ const PROVIDERS: ProviderDef[] = [
         label: 'Model',
         type: 'select',
         options: [
-          'claude-sonnet-4-5-20250929', 'claude-opus-4-5-20251101',
-          'claude-haiku-4-5-20251001',
+          'claude-opus-4-6-20260210', 'claude-sonnet-4-5-20250929',
+          'claude-opus-4-5-20251101', 'claude-haiku-4-5-20251001',
         ],
       },
     ],
