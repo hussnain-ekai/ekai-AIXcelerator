@@ -32,8 +32,11 @@ STEPS = [
 
 TOTAL_STEPS = len(STEPS)
 CACHE_KEY_PREFIX = "discovery:pipeline"
-CACHE_TTL = 3600  # 1 hour
+CACHE_TTL = 86400  # 24 hours
 FRESH_THRESHOLD = 300  # 5 minutes — skip pipeline if cache is this fresh
+
+# Column types for which sample_values are collected during profiling
+_STRING_TYPES = {"VARCHAR", "TEXT", "STRING", "CHAR", "NCHAR", "NVARCHAR", "NTEXT"}
 
 
 # ---------------------------------------------------------------------------
@@ -372,10 +375,14 @@ async def _step_profiling(
                 cn = col["column_name"]
                 if not cn:
                     continue
-                col_expressions.append(
+                expr = (
                     f'COUNT("{cn}") AS "nn_{cn}", '
                     f'APPROX_COUNT_DISTINCT("{cn}") AS "dc_{cn}"'
                 )
+                # For string-type columns, also collect up to 25 sample distinct values
+                if col["data_type"].upper() in _STRING_TYPES:
+                    expr += f', ARRAY_SLICE(ARRAY_AGG(DISTINCT "{cn}"), 0, 25) AS "sv_{cn}"'
+                col_expressions.append(expr)
 
             batch_row: dict[str, Any] = {}
             sample_n = 0
@@ -416,7 +423,7 @@ async def _step_profiling(
                     stats_say_pk = uniqueness_pct > 98 and null_pct == 0
                     is_likely_pk = stats_say_pk and not is_text_like and not is_excluded_name
 
-                    profile_cols.append({
+                    entry: dict[str, Any] = {
                         "column": col_name,
                         "data_type": col["data_type"],
                         "nullable": col["is_nullable"] == "YES",
@@ -426,7 +433,24 @@ async def _step_profiling(
                         "total_rows": total_rows,
                         "is_likely_pk": is_likely_pk,
                         "sampled": sampled,
-                    })
+                    }
+
+                    # Attach sample_values for string-type columns
+                    sv_key = f"sv_{col_name}"
+                    raw_sv = batch_row.get(sv_key)
+                    if raw_sv is not None:
+                        # Snowflake ARRAY comes back as JSON string from the connector
+                        if isinstance(raw_sv, str):
+                            try:
+                                raw_sv = json.loads(raw_sv)
+                            except (json.JSONDecodeError, TypeError):
+                                raw_sv = None
+                        if isinstance(raw_sv, list):
+                            sample_vals = [str(v) for v in raw_sv if v is not None][:25]
+                            if sample_vals:
+                                entry["sample_values"] = sample_vals
+
+                    profile_cols.append(entry)
                 except Exception as col_err:
                     logger.warning("Profiling column %s.%s failed: %s", table_fqn, col_name, col_err)
 

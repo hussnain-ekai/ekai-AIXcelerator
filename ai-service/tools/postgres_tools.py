@@ -180,6 +180,77 @@ async def get_latest_brd(data_product_id: str) -> str:
     return json.dumps({"status": "ok", "version": rows[0]["version"], "brd_json": rows[0]["brd_json"]})
 
 
+async def _strip_unnecessary_casts(yaml_str: str, data_product_id: str) -> str:
+    """Remove TRY_CAST/CAST on columns that are already the target numeric type.
+
+    Some LLMs (e.g. gpt-5-mini) add TRY_CAST(COL AS NUMERIC) even when the column
+    is already NUMBER/FLOAT/REAL. Snowflake errors: "TRY_CAST cannot be used with
+    arguments of types NUMBER(38,0) and FLOAT". This uses the Redis metadata cache
+    to detect and strip these unnecessary casts.
+    """
+    import re
+    import yaml as _yaml
+    from services.redis import get_client as get_redis
+
+    # Universal safety: TRY_CAST only works on VARCHAR input in Snowflake.
+    # Always convert to CAST first (works for any type conversion).
+    yaml_str = re.sub(r'\bTRY_CAST\(', 'CAST(', yaml_str)
+
+    redis = await get_redis()
+    if not redis:
+        return yaml_str
+
+    # Build column->data_type map from Redis metadata cache
+    col_types: dict[str, str] = {}  # "TABLE.COLUMN" -> data_type
+    cache_keys = await redis.keys(f"cache:metadata:{data_product_id}:*")
+    for key in cache_keys:
+        cached = await redis.get(key)
+        if not cached:
+            continue
+        try:
+            import json as _json
+            meta = _json.loads(cached) if isinstance(cached, str) else cached
+            for col_info in meta if isinstance(meta, list) else []:
+                col_name = (col_info.get("COLUMN_NAME") or col_info.get("column_name") or "").upper()
+                col_type = (col_info.get("DATA_TYPE") or col_info.get("data_type") or "").upper()
+                if col_name and col_type:
+                    col_types[col_name] = col_type
+        except Exception:
+            continue
+
+    if not col_types:
+        logger.info("_strip_unnecessary_casts: no column metadata found, skipping")
+        return yaml_str
+
+    _NUMERIC_TYPES = {"NUMBER", "FLOAT", "REAL", "DOUBLE", "INTEGER", "INT", "BIGINT",
+                      "SMALLINT", "TINYINT", "DECIMAL", "NUMERIC", "FIXED"}
+
+    def _is_numeric_col(col_name: str) -> bool:
+        ct = col_types.get(col_name.upper(), "")
+        # Handle types like "NUMBER(38,0)" -> "NUMBER"
+        base_type = ct.split("(")[0].strip()
+        return base_type in _NUMERIC_TYPES
+
+    # Pattern: TRY_CAST(COL_NAME AS NUMERIC/FLOAT/DOUBLE/NUMBER)
+    # Also: CAST(COL_NAME AS NUMERIC/FLOAT/DOUBLE/NUMBER)
+    pattern = re.compile(
+        r'(?:TRY_CAST|CAST)\(\s*([A-Z_][A-Z0-9_]*)\s+AS\s+(?:NUMERIC|FLOAT|DOUBLE|NUMBER|REAL|INTEGER)\s*\)',
+        re.IGNORECASE,
+    )
+
+    def _replace_cast(match: re.Match) -> str:
+        col = match.group(1)
+        if _is_numeric_col(col):
+            logger.info("_strip_unnecessary_casts: stripped cast on already-numeric column %s", col)
+            return col
+        return match.group(0)  # Keep the cast if column isn't numeric
+
+    result = pattern.sub(_replace_cast, yaml_str)
+    if result != yaml_str:
+        logger.info("_strip_unnecessary_casts: cleaned unnecessary casts in YAML")
+    return result
+
+
 @tool
 async def save_semantic_view(
     data_product_id: str,
@@ -192,35 +263,108 @@ async def save_semantic_view(
     If the content is JSON (structured output from the generation agent),
     it is automatically assembled into Snowflake-compatible YAML.
 
+    Production hardening:
+    - Dedup guard: skips save if an assembled version already exists within 2 minutes
+    - JSON input always routed through template assembler (deterministic YAML)
+    - Raw YAML input validated for required structure before saving
+    - All YAML validated with yaml.safe_load before persistence
+
     Args:
         data_product_id: UUID of the data product.
         yaml_content: The semantic view YAML string (or JSON structure).
         created_by: Username of the person who created the semantic view.
     """
-    # Auto-detect JSON and assemble into YAML
+    import yaml as _yaml
+
     content = yaml_content.strip()
-    if content.startswith("{"):
+    is_json = content.startswith("{")
+    logger.info("save_semantic_view: received %d chars, is_json=%s, first_100=%s",
+                len(content), is_json, repr(content[:100]))
+
+    pool = await _get_pool()
+
+    # ── Dedup guard: if a version was saved very recently (within 2 min),
+    # skip this save. Prevents LLM calling save twice in one generation cycle
+    # (once with JSON → assembler, once with raw YAML → buggy). ──
+    recent_rows = await pg_service.query(
+        pool,
+        "SELECT id, LENGTH(yaml_content) as len FROM semantic_views "
+        "WHERE data_product_id = $1::uuid AND created_at > NOW() - INTERVAL '2 minutes' "
+        "ORDER BY version DESC LIMIT 1",
+        data_product_id,
+    )
+    if recent_rows and not is_json:
+        # A version was already saved recently (likely from the assembler path).
+        # Raw YAML saves are lower quality — skip to keep the assembled version.
+        logger.info(
+            "save_semantic_view: DEDUP GUARD — skipping raw YAML save, "
+            "assembled version already exists (id=%s, %d chars, saved <2min ago)",
+            recent_rows[0]["id"], recent_rows[0]["len"],
+        )
+        return json.dumps({
+            "status": "ok",
+            "semantic_view_id": str(recent_rows[0]["id"]),
+            "note": "Using previously saved assembled version (dedup guard)",
+        })
+
+    if is_json:
         try:
-            from agents.generation import extract_json_from_text, assemble_semantic_view_yaml, build_table_metadata
+            from agents.generation import extract_json_from_text, assemble_semantic_view_yaml, build_table_metadata, _build_fqn_sample_values
+            logger.info("save_semantic_view: extracting JSON from text...")
             structure = extract_json_from_text(content)
             if structure and "tables" in structure:
+                logger.info("save_semantic_view: building table metadata...")
                 meta = await build_table_metadata(data_product_id, structure)
-                assembled = assemble_semantic_view_yaml(structure, table_metadata=meta)
+                logger.info("save_semantic_view: building sample values map...")
+                sv_map = await _build_fqn_sample_values(data_product_id)
+                logger.info("save_semantic_view: assembling YAML (meta=%d tables, sv_map=%d)...", len(meta), len(sv_map))
+                assembled = assemble_semantic_view_yaml(structure, table_metadata=meta, sample_values_map=sv_map)
                 if assembled and len(assembled) > 50:
                     logger.info("save_semantic_view: auto-assembled JSON to YAML (%d chars, meta=%d tables)", len(assembled), len(meta))
                     content = assembled
+                else:
+                    logger.warning("save_semantic_view: assembly returned empty/short result (%s chars)", len(assembled) if assembled else 0)
+            else:
+                logger.warning("save_semantic_view: extract_json_from_text returned no tables structure=%s", bool(structure))
         except Exception as e:
             logger.warning("save_semantic_view: failed to auto-assemble JSON to YAML: %s", e)
     else:
-        # Content is YAML — apply column quoting as a fallback
-        # (handles the case where the agent outputs pre-assembled YAML)
+        # Content is raw YAML — apply column quoting and expression cleanup
         try:
             from agents.generation import quote_columns_in_yaml_str
+            logger.info("save_semantic_view: applying YAML column quoting...")
             content = await quote_columns_in_yaml_str(content, data_product_id)
+            logger.info("save_semantic_view: YAML column quoting done (%d chars)", len(content))
         except Exception as e:
             logger.warning("save_semantic_view: failed to apply YAML column quoting: %s", e)
 
-    pool = await _get_pool()
+        # Strip unnecessary TRY_CAST on columns that are already numeric
+        try:
+            content = await _strip_unnecessary_casts(content, data_product_id)
+        except Exception as e:
+            logger.warning("save_semantic_view: failed to strip unnecessary casts: %s", e)
+
+    # ── YAML structure validation before saving ──
+    try:
+        parsed = _yaml.safe_load(content)
+        if not isinstance(parsed, dict):
+            return json.dumps({"status": "error", "error": "YAML content is not a valid mapping"})
+        if "name" not in parsed:
+            return json.dumps({"status": "error", "error": "YAML missing required 'name' field"})
+        if "tables" not in parsed or not parsed["tables"]:
+            return json.dumps({"status": "error", "error": "YAML missing required 'tables' list"})
+        for i, tbl in enumerate(parsed["tables"]):
+            if not tbl.get("base_table"):
+                return json.dumps({"status": "error", "error": f"Table #{i} missing 'base_table'"})
+            bt = tbl["base_table"]
+            for key in ("database", "schema", "table"):
+                if not bt.get(key):
+                    return json.dumps({"status": "error", "error": f"Table #{i} base_table missing '{key}'"})
+        logger.info("save_semantic_view: YAML structure validation passed (%d tables)", len(parsed["tables"]))
+    except _yaml.YAMLError as e:
+        logger.error("save_semantic_view: YAML parse error: %s", e)
+        return json.dumps({"status": "error", "error": f"Invalid YAML syntax: {e}"})
+
     sv_id = str(uuid4())
 
     sql = """

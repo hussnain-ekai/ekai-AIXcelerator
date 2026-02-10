@@ -19,6 +19,9 @@ import {
 import CheckCircleOutlineIcon from '@mui/icons-material/CheckCircleOutline';
 import ErrorOutlineIcon from '@mui/icons-material/ErrorOutline';
 import UploadFileIcon from '@mui/icons-material/UploadFile';
+import AddIcon from '@mui/icons-material/Add';
+import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline';
+import SwapHorizIcon from '@mui/icons-material/SwapHoriz';
 import {
   useLlmConfig,
   useLlmSave,
@@ -202,6 +205,7 @@ function ProviderCard({
   onSelect,
   onFieldChange,
   onFileUpload,
+  idPrefix = '',
 }: {
   provider: ProviderDef;
   selected: boolean;
@@ -211,7 +215,9 @@ function ProviderCard({
   onSelect: () => void;
   onFieldChange: (key: string, value: string) => void;
   onFileUpload?: (key: string, content: string, projectId?: string) => void;
+  idPrefix?: string;
 }): React.ReactNode {
+  const uploadId = `${idPrefix}vertex-credentials-upload`;
   return (
     <Card
       variant="outlined"
@@ -229,6 +235,7 @@ function ProviderCard({
       <CardContent sx={{ display: 'flex', gap: 2 }}>
         <Radio
           checked={selected}
+          value={provider.id}
           onChange={onSelect}
           sx={{
             color: 'text.secondary',
@@ -280,7 +287,7 @@ function ProviderCard({
               {provider.id === 'vertex-ai' && (
                 <Box sx={{ alignSelf: 'flex-start' }}>
                   <input
-                    id="vertex-credentials-upload"
+                    id={uploadId}
                     type="file"
                     accept=".json,application/json"
                     style={{ display: 'none' }}
@@ -314,7 +321,7 @@ function ProviderCard({
                       e.target.value = '';
                     }}
                   />
-                  <label htmlFor="vertex-credentials-upload">
+                  <label htmlFor={uploadId}>
                     <Button
                       variant="outlined"
                       size="small"
@@ -442,6 +449,12 @@ export default function LlmConfigurationPage(): React.ReactNode {
   const [testResult, setTestResult] = useState<LLMTestResponse | null>(null);
   const [initialized, setInitialized] = useState(false);
 
+  // Fallback provider state
+  const [showFallback, setShowFallback] = useState(false);
+  const [fallbackProvider, setFallbackProvider] = useState<LLMProvider | ''>('');
+  const [fallbackFieldValues, setFallbackFieldValues] = useState<Record<string, string>>({});
+  const [fallbackTestResult, setFallbackTestResult] = useState<LLMTestResponse | null>(null);
+
   // Pre-fill from saved config or defaults when data loads
   useEffect(() => {
     if (!configData || initialized) return;
@@ -466,7 +479,18 @@ export default function LlmConfigurationPage(): React.ReactNode {
     }
     if (saved) {
       for (const [k, v] of Object.entries(saved)) {
-        if (k !== 'provider' && v) merged[k] = String(v);
+        if (k !== 'provider' && k !== 'fallback' && v) merged[k] = String(v);
+      }
+      // Restore fallback config
+      const fb = (saved as unknown as Record<string, unknown>).fallback as Record<string, string> | undefined;
+      if (fb && fb.provider) {
+        setShowFallback(true);
+        setFallbackProvider(fb.provider as LLMProvider);
+        const fbFields: Record<string, string> = {};
+        for (const [k, v] of Object.entries(fb)) {
+          if (k !== 'provider' && v) fbFields[k] = String(v);
+        }
+        setFallbackFieldValues(fbFields);
       }
     }
     setFieldValues(merged);
@@ -480,6 +504,28 @@ export default function LlmConfigurationPage(): React.ReactNode {
     (key: string, value: string) => {
       setFieldValues((prev) => ({ ...prev, [key]: value }));
       setTestResult(null);
+    },
+    [],
+  );
+
+  const handleFallbackFieldChange = useCallback(
+    (key: string, value: string) => {
+      setFallbackFieldValues((prev) => ({ ...prev, [key]: value }));
+      setFallbackTestResult(null);
+    },
+    [],
+  );
+
+  const handleFallbackFileUpload = useCallback(
+    (key: string, content: string, projectId?: string) => {
+      setFallbackFieldValues((prev) => {
+        const next = { ...prev, [key]: content };
+        if (projectId && !prev['vertex_project']) {
+          next['vertex_project'] = projectId;
+        }
+        return next;
+      });
+      setFallbackTestResult(null);
     },
     [],
   );
@@ -527,8 +573,21 @@ export default function LlmConfigurationPage(): React.ReactNode {
       }
     }
 
+    // Include fallback config if configured
+    if (showFallback && fallbackProvider) {
+      const fb: Record<string, string> = { provider: fallbackProvider };
+      const fbDef = PROVIDERS.find((p) => p.id === fallbackProvider);
+      if (fbDef) {
+        for (const field of fbDef.fields) {
+          const val = fallbackFieldValues[field.key];
+          if (val) fb[field.key] = val;
+        }
+      }
+      body.fallback = fb as unknown as LLMConfigBody['fallback'];
+    }
+
     return body;
-  }, [selectedProvider, fieldValues]);
+  }, [selectedProvider, fieldValues, showFallback, fallbackProvider, fallbackFieldValues]);
 
   const handleTest = useCallback(() => {
     setTestResult(null);
@@ -536,6 +595,48 @@ export default function LlmConfigurationPage(): React.ReactNode {
       onSuccess: (result) => setTestResult(result),
     });
   }, [testMutation, buildBody]);
+
+  const handleFallbackTest = useCallback(() => {
+    if (!fallbackProvider) return;
+    setFallbackTestResult(null);
+    // Build a body with just the fallback provider's fields
+    const fbBody: LLMConfigBody = { provider: fallbackProvider as LLMProvider };
+    const fbDef = PROVIDERS.find((p) => p.id === fallbackProvider);
+    if (fbDef) {
+      for (const field of fbDef.fields) {
+        const val = fallbackFieldValues[field.key];
+        if (val) {
+          (fbBody as unknown as Record<string, string>)[field.key] = val;
+        }
+      }
+    }
+    testMutation.mutate(fbBody, {
+      onSuccess: (result) => setFallbackTestResult(result),
+    });
+  }, [testMutation, fallbackProvider, fallbackFieldValues]);
+
+  const handleFallbackProviderSelect = useCallback(
+    (providerId: LLMProvider) => {
+      setFallbackProvider(providerId);
+      setFallbackTestResult(null);
+      const providerDef = PROVIDERS.find((p) => p.id === providerId);
+      if (providerDef) {
+        setFallbackFieldValues((prev) => {
+          const next = { ...prev };
+          for (const field of providerDef.fields) {
+            if (field.type === 'select' && !next[field.key] && field.options?.length) {
+              next[field.key] = field.options[0] as string;
+            }
+          }
+          if (providerId === 'vertex-ai' && !next['vertex_location']) {
+            next['vertex_location'] = 'us-central1';
+          }
+          return next;
+        });
+      }
+    },
+    [],
+  );
 
   const handleSave = useCallback(() => {
     saveMutation.mutate(buildBody(), {
@@ -640,6 +741,141 @@ export default function LlmConfigurationPage(): React.ReactNode {
           ))}
         </Box>
       </RadioGroup>
+
+      {/* Fallback Provider Section */}
+      <Box sx={{ mt: 4, mb: 2 }}>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+          <SwapHorizIcon sx={{ color: 'text.secondary', fontSize: 20 }} />
+          <Typography variant="h6" fontWeight={600}>
+            Fallback Provider
+          </Typography>
+          <Typography variant="body2" color="text.secondary">
+            (Optional)
+          </Typography>
+        </Box>
+        <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+          If the primary provider fails (rate limits, outage), the system automatically switches to the fallback.
+        </Typography>
+
+        {!showFallback ? (
+          <Button
+            variant="outlined"
+            size="small"
+            startIcon={<AddIcon />}
+            onClick={() => setShowFallback(true)}
+            sx={{
+              borderColor: GOLD,
+              color: GOLD,
+              textTransform: 'none',
+              '&:hover': { borderColor: GOLD, bgcolor: 'rgba(212,168,67,0.08)' },
+            }}
+          >
+            Add Fallback Provider
+          </Button>
+        ) : (
+          <Box>
+            <Box sx={{ display: 'flex', justifyContent: 'flex-end', mb: 1 }}>
+              <Button
+                size="small"
+                color="error"
+                startIcon={<DeleteOutlineIcon />}
+                onClick={() => {
+                  setShowFallback(false);
+                  setFallbackProvider('');
+                  setFallbackFieldValues({});
+                  setFallbackTestResult(null);
+                }}
+                sx={{ textTransform: 'none' }}
+              >
+                Remove Fallback
+              </Button>
+            </Box>
+            <RadioGroup
+              value={fallbackProvider}
+              onChange={(_, val) => handleFallbackProviderSelect(val as LLMProvider)}
+            >
+              <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
+                {PROVIDERS.filter((p) => p.id !== selectedProvider).map((provider) => (
+                  <ProviderCard
+                    key={`fallback-${provider.id}`}
+                    provider={provider}
+                    selected={fallbackProvider === provider.id}
+                    isActive={false}
+                    fieldValues={fallbackFieldValues}
+                    defaults={configData?.defaults ?? null}
+                    onSelect={() => handleFallbackProviderSelect(provider.id)}
+                    onFieldChange={handleFallbackFieldChange}
+                    onFileUpload={handleFallbackFileUpload}
+                    idPrefix="fallback-"
+                  />
+                ))}
+              </Box>
+            </RadioGroup>
+
+            {/* Fallback test result */}
+            {fallbackTestResult && (
+              <Alert
+                severity={fallbackTestResult.status === 'ok' ? 'success' : 'error'}
+                icon={
+                  fallbackTestResult.status === 'ok' ? (
+                    <CheckCircleOutlineIcon />
+                  ) : (
+                    <ErrorOutlineIcon />
+                  )
+                }
+                sx={{ mt: 2 }}
+              >
+                {fallbackTestResult.status === 'ok' ? (
+                  <>
+                    Fallback connection successful ({fallbackTestResult.response_time_ms}ms)
+                    {fallbackTestResult.model_response && (
+                      <Typography variant="caption" display="block" sx={{ mt: 0.5, opacity: 0.8 }}>
+                        {fallbackTestResult.model_response}
+                      </Typography>
+                    )}
+                  </>
+                ) : (
+                  <>Fallback connection failed: {fallbackTestResult.error}</>
+                )}
+              </Alert>
+            )}
+
+            {/* Fallback test button */}
+            {fallbackProvider && (
+              <Box sx={{ mt: 1.5 }}>
+                <Button
+                  variant="outlined"
+                  size="small"
+                  onClick={handleFallbackTest}
+                  disabled={isBusy}
+                  sx={{
+                    borderColor: GOLD,
+                    color: GOLD,
+                    textTransform: 'none',
+                    '&:hover': { borderColor: GOLD, bgcolor: 'rgba(212,168,67,0.08)' },
+                  }}
+                >
+                  {testMutation.isPending ? (
+                    <CircularProgress size={16} sx={{ color: GOLD, mr: 1 }} />
+                  ) : null}
+                  Test Fallback Connection
+                </Button>
+              </Box>
+            )}
+          </Box>
+        )}
+      </Box>
+
+      {/* Active fallback banner */}
+      {configData?.active?.fallback && (
+        <Alert
+          severity="info"
+          icon={<SwapHorizIcon />}
+          sx={{ mb: 2 }}
+        >
+          <strong>Fallback:</strong> {configData.active.fallback.provider} &mdash; {configData.active.fallback.model}
+        </Alert>
+      )}
 
       {/* Test result */}
       {testResult && (

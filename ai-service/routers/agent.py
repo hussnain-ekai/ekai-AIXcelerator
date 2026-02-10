@@ -25,6 +25,25 @@ from models.schemas import (
 logger = logging.getLogger(__name__)
 _settings = get_settings()
 
+# LLM error patterns that should trigger fallback to backup model.
+# Includes transient errors (rate limits, outages) AND provider-level auth/permission
+# errors — if the user has a working fallback configured, trying it is better than
+# simply failing when the primary provider is misconfigured or experiencing IAM issues.
+_TRANSIENT_ERROR_PATTERNS = (
+    "rate_limit", "429", "resource_exhausted",
+    "service_unavailable", "503", "502",
+    "connection_error", "timeout", "deadline_exceeded",
+    "overloaded", "too many requests", "quota exceeded",
+    "permission_denied", "403", "401", "unauthorized",
+    "invalid_api_key", "authentication", "consumer_invalid",
+)
+
+
+def _is_transient_llm_error(exc: Exception) -> bool:
+    """Check if an exception is a transient LLM error worth retrying with fallback."""
+    err_str = str(exc).lower()
+    return any(pattern in err_str for pattern in _TRANSIENT_ERROR_PATTERNS)
+
 
 def _sanitize_error_for_user(exc: Exception) -> str:
     """Convert internal errors to user-friendly messages.
@@ -229,6 +248,19 @@ def _build_discovery_summary(
             col_map[col.get("column", "")] = col
         profile_lookup[table_fqn] = col_map
 
+    # For large datasets (>15 tables), only include the most interesting columns
+    # per table to keep the summary under ~15K chars. PKs, FKs, and role-tagged
+    # columns are always included; plain descriptive columns are trimmed.
+    # Scale inversely: more tables → fewer columns per table.
+    _LARGE_DATASET_THRESHOLD = 15
+    num_tables = len(metadata)
+    if num_tables > 30:
+        _MAX_COLS_PER_TABLE_LARGE = 6
+    elif num_tables > 20:
+        _MAX_COLS_PER_TABLE_LARGE = 8
+    else:
+        _MAX_COLS_PER_TABLE_LARGE = 12
+
     # Build table detail sections (tables + field analysis)
     table_sections = []
     for table in metadata:
@@ -242,8 +274,8 @@ def _build_discovery_summary(
         # Get profile data for this table
         col_profiles = profile_lookup.get(fqn, {})
 
-        # Build field analysis lines
-        field_lines = []
+        # Build field analysis lines with priority scoring for large datasets
+        all_field_entries: list[tuple[int, str]] = []  # (priority, line)
         for col in table.get("columns", []):
             col_name = col["name"]
             raw_type = col.get("data_type", "")
@@ -256,6 +288,17 @@ def _build_discovery_summary(
             null_pct = prof.get("null_pct")
 
             role = _suggest_field_role(col_name, simple_type, is_pk, distinct, null_pct)
+
+            # Priority: PKs=0, FKs=1, measures=2, time=3, dimensions=4, descriptive=5
+            priority = 5
+            if is_pk:
+                priority = 0
+            elif col_name.lower().endswith("_id") or col_name.lower() == "id":
+                priority = 1
+            elif role in ("potential measure", "potential time dimension"):
+                priority = 2 if "measure" in role else 3
+            elif role == "potential dimension":
+                priority = 4
 
             # Build description parts
             parts = [simple_type]
@@ -278,7 +321,18 @@ def _build_discovery_summary(
             if role and role not in ("identifier", "descriptive", ""):
                 parts.append(role)
 
-            field_lines.append(f"    - {col_name} ({', '.join(parts)})")
+            all_field_entries.append((priority, f"    - {col_name} ({', '.join(parts)})"))
+
+        # For large datasets, keep only the most important columns per table
+        if len(metadata) > _LARGE_DATASET_THRESHOLD:
+            all_field_entries.sort(key=lambda x: x[0])
+            kept = all_field_entries[:_MAX_COLS_PER_TABLE_LARGE]
+            trimmed = len(all_field_entries) - len(kept)
+            field_lines = [line for _, line in kept]
+            if trimmed > 0:
+                field_lines.append(f"    ... and {trimmed} more columns")
+        else:
+            field_lines = [line for _, line in all_field_entries]
 
         section = f"  {name} ({biz_type}{row_str})\n" + "\n".join(field_lines)
         table_sections.append(section)
@@ -354,6 +408,39 @@ RULES:
   any other databases, schemas, or tables in this Snowflake account. They do not
   exist to you. NEVER mention or speculate about any other datasets.
 ══════════════════════════════════════════════════════════════════"""
+
+    # Hard cap: if summary exceeds 15K chars, the LLM may hang or produce
+    # empty output. Truncate table sections to fit.
+    _MAX_SUMMARY_CHARS = 15000
+    if len(summary) > _MAX_SUMMARY_CHARS:
+        logger.warning(
+            "Discovery summary too large (%d chars, %d tables). Truncating to %d chars.",
+            len(summary), len(metadata), _MAX_SUMMARY_CHARS,
+        )
+        # Find where table sections end and truncate
+        marker = "═══════════════════════════════════════════════════════\nDATA QUALITY"
+        marker_pos = summary.find(marker)
+        if marker_pos > 0:
+            # Get prefix (before tables) and suffix (quality + task sections)
+            prefix_end = summary.find("═══════════════════════════════════════════════════════\nTABLE DETAILS")
+            suffix = summary[marker_pos:]
+            prefix = summary[:prefix_end] if prefix_end > 0 else ""
+            # Available space for table sections
+            available = _MAX_SUMMARY_CHARS - len(prefix) - len(suffix) - 200
+            table_text = chr(10).join(table_sections)
+            if len(table_text) > available:
+                # Truncate table text and add note
+                table_text = table_text[:available] + f"\n\n  ... ({len(metadata)} tables total — showing key columns only)"
+            summary = f"""{prefix}═══════════════════════════════════════════════════════
+TABLE DETAILS & FIELD ANALYSIS
+═══════════════════════════════════════════════════════
+{table_text}
+
+{suffix}"""
+        else:
+            # Fallback: hard truncate
+            summary = summary[:_MAX_SUMMARY_CHARS] + "\n... (truncated)"
+        logger.info("Discovery summary truncated to %d chars", len(summary))
 
     return summary
 
@@ -506,6 +593,15 @@ async def _run_agent(
     # Safety net: track whether save_semantic_view was called during generation
     _yaml_tool_called: bool = False
     _generation_phase_ran: bool = False
+    # Diagnostic counters for stream events
+    _stream_event_count: int = 0
+    _stream_token_count: int = 0
+    _stream_llm_calls: int = 0          # on_chat_model_start count
+    _stream_llm_completions: int = 0    # on_chat_model_end count
+    _stream_raw_chunks: int = 0         # on_chat_model_stream with content (before gating)
+    _stream_gated_out: int = 0          # tokens filtered by _inside_task / _subagent_completed
+    _stream_dedup_suppressed: int = 0   # tokens suppressed by dedup
+    _stream_task_calls: int = 0         # task tool invocations
     # Phase tracking: detect subagent transitions
     _SUBAGENT_PHASE_MAP: dict[str, str] = {
         "discovery-agent": "discovery",
@@ -525,6 +621,7 @@ async def _run_agent(
         actual_message = message
         is_discovery = message.strip() in (DISCOVERY_TRIGGER, RERUN_DISCOVERY_TRIGGER)
         force_rerun = message.strip() == RERUN_DISCOVERY_TRIGGER
+        dp_info: dict | None = None  # Set inside discovery block, used for timeout check
         if is_discovery:
             _inside_task = True  # Discovery: orchestrator interprets summary directly
             logger.info("Discovery trigger detected for session %s (force=%s), running pipeline...", session_id, force_rerun)
@@ -649,9 +746,19 @@ async def _run_agent(
                     else:
                         _patches.append(_RM(id=_m.id))
         if _patches:
-            await agent.aupdate_state(config, {"messages": _patches})
-            logger.info("Patched %d empty AI messages in checkpoint for session %s",
-                        len(_patches), session_id)
+            try:
+                await agent.aupdate_state(config, {"messages": _patches})
+                logger.info("Patched %d empty AI messages in checkpoint for session %s",
+                            len(_patches), session_id)
+            except (UnboundLocalError, Exception) as patch_err:
+                # LangGraph may fail internally when patching certain checkpoint states
+                # (e.g. last_ai_index UnboundLocalError). Log and continue — the agent
+                # can still function; empty messages may cause Gemini to complain but
+                # the fallback/safety nets will handle it.
+                logger.warning(
+                    "Failed to patch empty AI messages for session %s: %s. Continuing without patch.",
+                    session_id, patch_err,
+                )
 
         # Wire the SSE queue contextvar so build_erd_from_description can emit artifact events
         from tools.discovery_tools import _sse_queue
@@ -662,10 +769,61 @@ async def _run_agent(
         content = _build_multimodal_content(actual_message, file_contents)
         input_messages = {"messages": [HumanMessage(content=content)]}
 
-        # Stream events from the agent
-        async for event in agent.astream_events(input_messages, config=config, version="v2"):
+        # Stream events from the agent.
+        # For discovery of large datasets, apply a timeout to prevent indefinite hangs
+        # when the LLM fails to respond to very large summaries.
+        # Timeout for large discovery: use table count (available from dp_info), not
+        # summary length (already truncated by this point).
+        _dp_table_count = len(dp_info.get("tables", [])) if is_discovery and dp_info else 0
+        _agent_timeout = 180 if is_discovery and _dp_table_count > 15 else None  # 3 min for large datasets
+        _agent_stream = agent.astream_events(input_messages, config=config, version="v2")
+        _stream_timed_out = False
+        if _agent_timeout:
+            logger.info("Applying %ds timeout for large discovery summary (%d chars)", _agent_timeout, len(actual_message))
+
+        # Use wait_for on each iteration to enforce timeout on blocked LLM calls.
+        # A simple `async for` blocks if the LLM never responds.
+        _iter = _agent_stream.__aiter__()
+        while True:
+            try:
+                if _agent_timeout:
+                    event = await asyncio.wait_for(_iter.__anext__(), timeout=_agent_timeout)
+                else:
+                    event = await _iter.__anext__()
+            except StopAsyncIteration:
+                break
+            except (asyncio.TimeoutError, TimeoutError):
+                _stream_timed_out = True
+                logger.warning(
+                    "Agent stream timed out after %ds for session %s (events=%d, tokens=%d)",
+                    _agent_timeout, session_id, _stream_event_count, _stream_token_count,
+                )
+                break
+
+            _stream_event_count += 1
             kind = event.get("event", "")
             data = event.get("data", {})
+
+            # Track LLM call lifecycle for diagnostics
+            if kind == "on_chat_model_start":
+                _stream_llm_calls += 1
+                _llm_model = event.get("name", "unknown")
+                logger.info("LLM call #%d started (model=%s, session=%s, inside_task=%s, subagent_completed=%s)",
+                            _stream_llm_calls, _llm_model, session_id, _inside_task, _subagent_completed)
+            elif kind == "on_chat_model_end":
+                _stream_llm_completions += 1
+                # Log output summary
+                _end_output = data.get("output")
+                _end_content_len = 0
+                _end_tool_calls = 0
+                if _end_output:
+                    if hasattr(_end_output, "content"):
+                        _c = _end_output.content
+                        _end_content_len = len(_c) if isinstance(_c, str) else len(str(_c))
+                    if hasattr(_end_output, "tool_calls"):
+                        _end_tool_calls = len(_end_output.tool_calls or [])
+                logger.info("LLM call #%d completed (content_len=%d, tool_calls=%d, session=%s)",
+                            _stream_llm_completions, _end_content_len, _end_tool_calls, session_id)
 
             if kind == "on_chat_model_stream":
                 # Token streaming — only emit tokens from subagent runs.
@@ -673,6 +831,7 @@ async def _run_agent(
                 run_id = event.get("run_id", "")
                 chunk = data.get("chunk")
                 if chunk and hasattr(chunk, "content") and chunk.content:
+                    _stream_raw_chunks += 1
                     # If a new LLM run starts, emit message_done to close previous bubble
                     if run_id and run_id != _current_run_id:
                         # Flush any dedup buffer from the ending run
@@ -707,6 +866,7 @@ async def _run_agent(
 
                     # Gate: only emit tokens from subagent runs (inside task tool)
                     if not _inside_task:
+                        _stream_gated_out += 1
                         continue
 
                     # Extract text from structured content blocks if needed
@@ -722,6 +882,7 @@ async def _run_agent(
 
                     # If current run is already marked as duplicate, suppress
                     if _run_suppressed:
+                        _stream_dedup_suppressed += 1
                         continue
 
                     # Dedup check: buffer initial tokens and compare with previous run
@@ -751,6 +912,7 @@ async def _run_agent(
                     if "[INTERNAL" in current_assistant_content:
                         continue
 
+                    _stream_token_count += 1
                     await queue.put({
                         "type": "token",
                         "data": {"content": content},
@@ -786,6 +948,7 @@ async def _run_agent(
                 # Detect subagent delegation via the `task` tool and emit phase_change
                 # Deep Agents uses a `task` tool with `subagent_type` parameter
                 if tool_name == "task" and isinstance(tool_input, dict):
+                    _stream_task_calls += 1
                     _inside_task = True  # Enable token emission for subagent
                     _subagent_completed = False
                     subagent_type = tool_input.get("subagent_type", "")
@@ -871,12 +1034,24 @@ async def _run_agent(
                 # All user-facing content comes from subagent runs (inside task tool).
                 pass
 
+    except (asyncio.TimeoutError, TimeoutError) as e:
+        logger.warning(
+            "Agent timed out for session %s after streaming %d events, %d tokens. "
+            "Large discovery summary may have caused the LLM to hang.",
+            session_id, _stream_event_count, _stream_token_count,
+        )
+        # The fallback in the finally block will handle sending a message to the user.
+
     except ValueError as e:
         # LangChain raises ValueError("No generations found in stream") when an LLM
         # produces an empty response (e.g. orchestrator after subagent did all the work).
         # This is benign — the subagent already delivered content.
         if "no generations" in str(e).lower():
-            logger.info("Agent %s produced empty response (expected after subagent delegation)", session_id)
+            if is_discovery and _stream_token_count == 0:
+                logger.warning("Agent %s: no generations during discovery (summary_len=%d) — fallback will fire in finally",
+                               session_id, len(actual_message))
+            else:
+                logger.info("Agent %s produced empty response (expected after subagent delegation)", session_id)
         else:
             logger.exception("Agent execution failed for session %s: %s", session_id, e)
             await queue.put({
@@ -884,17 +1059,244 @@ async def _run_agent(
                 "data": {"message": _sanitize_error_for_user(e)},
             })
     except Exception as e:
-        logger.exception("Agent execution failed for session %s: %s", session_id, e)
-        await queue.put({
-            "type": "error",
-            "data": {"message": _sanitize_error_for_user(e)},
-        })
+        # Check if this is a transient LLM error that should trigger fallback
+        if _is_transient_llm_error(e):
+            logger.warning(
+                "Primary LLM failed with transient error for session %s: %s. Attempting fallback...",
+                session_id, e,
+            )
+            try:
+                from services.llm import get_fallback_chat_model
+                from agents.orchestrator import build_fallback_orchestrator
+
+                fallback_model = get_fallback_chat_model()
+                if fallback_model is None:
+                    logger.warning("No fallback LLM configured — surfacing original error")
+                    raise  # Re-raise original error
+
+                # Notify user via SSE
+                await queue.put({
+                    "type": "status",
+                    "data": {"message": "Switching to backup model..."},
+                })
+
+                # Rebuild orchestrator with fallback model (one-shot, doesn't affect cache)
+                fallback_graph = await build_fallback_orchestrator(fallback_model)
+                fallback_config = {
+                    "configurable": {"thread_id": session_id},
+                    "recursion_limit": _settings.agent_recursion_limit,
+                }
+
+                # Retry with fallback model — same checkpoint state
+                content = _build_multimodal_content(actual_message, file_contents)
+                fallback_input = {"messages": [HumanMessage(content=content)]}
+
+                # Reset gating flags for fallback retry.
+                # Mirror primary path: discovery pre-sets _inside_task = True (line 626)
+                # so orchestrator direct output flows through as a safety net.
+                # Non-discovery: orchestrator tokens are gated; only subagent tokens pass.
+                _inside_task = is_discovery
+                _subagent_completed = False
+
+                logger.info("Fallback: starting astream_events (session=%s, input_msg_len=%d)", session_id, len(str(fallback_input)))
+                _fallback_event_idx = 0
+                _iter = fallback_graph.astream_events(fallback_input, config=fallback_config, version="v2").__aiter__()
+                while True:
+                    try:
+                        event = await _iter.__anext__()
+                    except StopAsyncIteration:
+                        logger.info("Fallback: astream_events finished after %d events (session=%s)", _fallback_event_idx, session_id)
+                        break
+
+                    _fallback_event_idx += 1
+                    if _fallback_event_idx <= 3 or _fallback_event_idx % 100 == 0:
+                        logger.info("Fallback event #%d: %s (session=%s)", _fallback_event_idx, event.get("event", "?"), session_id)
+
+                    _stream_event_count += 1
+                    kind = event.get("event", "")
+                    data = event.get("data", {})
+
+                    if kind == "on_chat_model_stream":
+                        run_id = event.get("run_id", "")
+                        chunk = data.get("chunk")
+                        if chunk and hasattr(chunk, "content") and chunk.content:
+                            if run_id and run_id != _current_run_id:
+                                if _current_run_id is not None and current_assistant_content.strip():
+                                    _assistant_texts.append(current_assistant_content)
+                                    current_assistant_content = ""
+                                    await queue.put({"type": "message_done", "data": {"content": ""}})
+                                _current_run_id = run_id
+
+                            # Gate: only emit tokens from subagent runs (same as primary path)
+                            if not _inside_task:
+                                _stream_gated_out += 1
+                                continue
+
+                            content_text = chunk.content
+                            if isinstance(content_text, list):
+                                text_parts = [
+                                    block.get("text", "") if isinstance(block, dict) else str(block)
+                                    for block in content_text
+                                ]
+                                content_text = "".join(text_parts)
+
+                            current_assistant_content += content_text
+
+                            # Suppress [INTERNAL] sections that LLMs sometimes leak
+                            if "[INTERNAL" in current_assistant_content:
+                                continue
+
+                            _stream_token_count += 1
+                            await queue.put({"type": "token", "data": {"content": content_text}})
+
+                    elif kind == "on_tool_start":
+                        tool_name = event.get("name", "unknown")
+                        tool_input = data.get("input", {})
+                        if tool_name == "task" and isinstance(tool_input, dict):
+                            _stream_task_calls += 1
+                            _inside_task = True
+                            _subagent_completed = False
+                            subagent_type = tool_input.get("subagent_type", "")
+                            logger.info(
+                                "Fallback task() call #%d: subagent=%s (session=%s)",
+                                _stream_task_calls, subagent_type, session_id,
+                            )
+                            # Track phase-specific flags (same as primary path)
+                            phase_name = _SUBAGENT_PHASE_MAP.get(subagent_type)
+                            if phase_name == "discovery":
+                                _discovery_invocation_count += 1
+                                if _discovery_invocation_count > 1:
+                                    _discovery_conversation_ran = True
+                            if phase_name == "requirements":
+                                _requirements_phase_ran = True
+                            if phase_name == "generation":
+                                _generation_phase_ran = True
+                            if phase_name and phase_name != _current_phase:
+                                old_phase = _current_phase
+                                _current_phase = phase_name
+                                await queue.put({
+                                    "type": "phase_change",
+                                    "data": {"from": old_phase, "to": phase_name},
+                                })
+                                logger.info("Fallback phase change: %s → %s (session %s)", old_phase, phase_name, session_id)
+                        else:
+                            logger.info(
+                                "Fallback tool_start: %s (session=%s, inside_task=%s)",
+                                tool_name, session_id, _inside_task,
+                            )
+                        # Emit tool_call SSE event for non-task tools (shows "Working" badges)
+                        if tool_name != "task":
+                            await queue.put({
+                                "type": "tool_call",
+                                "data": {
+                                    "tool": tool_name,
+                                    "input": tool_input if isinstance(tool_input, dict) else str(tool_input),
+                                },
+                            })
+                        if tool_name == "upload_artifact" and isinstance(tool_input, dict):
+                            art_type = tool_input.get("artifact_type", "")
+                            art_filename = tool_input.get("filename", "")
+                            if "data-description" in art_filename.lower() and art_type != "data_description":
+                                art_type = "data_description"
+                            if art_type == "brd":
+                                _brd_artifact_uploaded = True
+                            if art_type:
+                                _ARTIFACT_TYPE_MAP = {"quality_report": "data_quality"}
+                                mapped_type = _ARTIFACT_TYPE_MAP.get(art_type, art_type)
+                                await queue.put({
+                                    "type": "artifact",
+                                    "data": {"artifact_id": str(uuid4()), "artifact_type": mapped_type},
+                                })
+                                logger.info("Fallback emitted artifact event: type=%s", mapped_type)
+                    elif kind == "on_tool_end":
+                        tool_name = event.get("name", "unknown")
+                        if tool_name == "save_brd":
+                            _brd_tool_called = True
+                            logger.info("Fallback save_brd completed for session %s", session_id)
+                        if tool_name == "save_semantic_view":
+                            _yaml_tool_called = True
+                            logger.info("Fallback save_semantic_view completed for session %s", session_id)
+                        if tool_name == "save_data_description":
+                            _dd_tool_called = True
+                            logger.info("Fallback save_data_description completed for session %s", session_id)
+                        if tool_name == "build_erd_from_description":
+                            _erd_build_called = True
+                            logger.info("Fallback build_erd_from_description completed for session %s", session_id)
+                        if tool_name == "task":
+                            _inside_task = False
+                            _subagent_completed = True
+                            logger.info("Fallback subagent completed for session %s", session_id)
+
+                logger.info(
+                    "Fallback LLM completed for session %s (tokens=%d, task_calls=%d, gated_out=%d)",
+                    session_id, _stream_token_count, _stream_task_calls, _stream_gated_out,
+                )
+
+            except Exception as fallback_err:
+                if fallback_err is e:
+                    # Re-raised original error (no fallback configured)
+                    logger.exception("Agent execution failed for session %s: %s", session_id, e)
+                    await queue.put({
+                        "type": "error",
+                        "data": {"message": _sanitize_error_for_user(e)},
+                    })
+                else:
+                    logger.exception(
+                        "Fallback LLM also failed for session %s: %s (original: %s)",
+                        session_id, fallback_err, e,
+                    )
+                    await queue.put({
+                        "type": "error",
+                        "data": {"message": _sanitize_error_for_user(fallback_err)},
+                    })
+        else:
+            logger.exception("Agent execution failed for session %s: %s", session_id, e)
+            await queue.put({
+                "type": "error",
+                "data": {"message": _sanitize_error_for_user(e)},
+            })
 
     finally:
         # Flush any remaining dedup buffer from the last run
         if _run_token_buffer and not _run_suppressed:
             current_assistant_content = "".join(_run_token_buffer)
             _run_token_buffer = []
+
+        # Diagnostic: log stream statistics — full pipeline for root-cause analysis
+        logger.info(
+            "Agent stream completed for session %s: events=%d, llm_calls=%d, llm_completions=%d, "
+            "raw_chunks=%d, gated_out=%d, dedup_suppressed=%d, tokens_emitted=%d, "
+            "task_calls=%d, assistant_texts=%d",
+            session_id, _stream_event_count, _stream_llm_calls, _stream_llm_completions,
+            _stream_raw_chunks, _stream_gated_out, _stream_dedup_suppressed, _stream_token_count,
+            _stream_task_calls, len(_assistant_texts) + (1 if current_assistant_content.strip() else 0),
+        )
+
+        # --- Zero-output fallback for discovery ---
+        # If the LLM produced zero visible tokens during discovery, the user sees nothing.
+        # Send a fallback message so the user can still interact.
+        if is_discovery and _stream_token_count == 0 and not current_assistant_content.strip():
+            logger.warning(
+                "ZERO-OUTPUT FALLBACK: Discovery agent produced no tokens for session %s "
+                "(events=%d, summary_len=%d). Sending fallback message.",
+                session_id, _stream_event_count, len(actual_message),
+            )
+            fallback_msg = (
+                "I've analyzed your data and completed the initial profiling. "
+                "I found some interesting patterns across the tables. "
+                "Could you tell me more about what you're looking to accomplish with this data? "
+                "That will help me tailor my analysis to your specific needs."
+            )
+            current_assistant_content = fallback_msg
+            for token_chunk in [fallback_msg]:
+                await queue.put({
+                    "type": "token",
+                    "data": {"content": token_chunk},
+                })
+            await queue.put({
+                "type": "message_done",
+                "data": {"content": ""},
+            })
 
         # Add final assistant content to local buffer for safety net
         if current_assistant_content.strip():
@@ -1039,11 +1441,12 @@ async def _run_agent(
             for text in _assistant_texts:
                 if '"tables"' in text and ('"facts"' in text or '"dimensions"' in text):
                     try:
-                        from agents.generation import extract_json_from_text, assemble_semantic_view_yaml, build_table_metadata
+                        from agents.generation import extract_json_from_text, assemble_semantic_view_yaml, build_table_metadata, _build_fqn_sample_values
                         structure = extract_json_from_text(text)
                         if structure and "tables" in structure:
                             meta = await build_table_metadata(data_product_id, structure)
-                            yaml_content = assemble_semantic_view_yaml(structure, table_metadata=meta)
+                            sv_map = await _build_fqn_sample_values(data_product_id)
+                            yaml_content = assemble_semantic_view_yaml(structure, table_metadata=meta, sample_values_map=sv_map)
                             break
                     except Exception as e:
                         logger.warning("Generation safety net: failed to assemble YAML from JSON: %s", e)

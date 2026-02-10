@@ -2,7 +2,7 @@
 
 import { useEffect, useRef } from 'react';
 import { api } from '@/lib/api';
-import { useChatStore } from '@/stores/chatStore';
+import { useChatStore, useChatStoreApi } from '@/stores/chatStoreProvider';
 import type { ChatMessage, AgentPhase } from '@/stores/chatStore';
 import type { DataProduct } from '@/hooks/useDataProducts';
 
@@ -34,6 +34,8 @@ interface UseSessionRecoveryReturn {
  */
 function useSessionRecovery(dataProduct: DataProduct | undefined): UseSessionRecoveryReturn {
   const recoveryAttemptedRef = useRef<string | null>(null);
+  const prevDataProductIdRef = useRef<string | null>(null);
+  const storeApi = useChatStoreApi();
   const isHydrated = useChatStore((state) => state.isHydrated);
   const messages = useChatStore((state) => state.messages);
   const hydrateFromHistory = useChatStore((state) => state.hydrateFromHistory);
@@ -43,13 +45,20 @@ function useSessionRecovery(dataProduct: DataProduct | undefined): UseSessionRec
   const dataProductId = dataProduct?.id;
   const storedSessionId = dataProduct?.state?.session_id;
 
-  // Reset hydration state when data product changes (navigation)
+  // Reset chat state when navigating between data products.
+  // Only fires when switching FROM one product TO another (not on initial mount).
+  // With scoped stores (ChatStoreProvider key={id}), this fires less often,
+  // but is kept as a safety net for same-component re-renders with different IDs.
   useEffect(() => {
-    if (dataProductId && recoveryAttemptedRef.current !== dataProductId) {
-      // New data product - reset state for fresh recovery
-      setHydrated(false);
+    if (dataProductId) {
+      if (prevDataProductIdRef.current && prevDataProductIdRef.current !== dataProductId) {
+        // Switching products — clear old messages, artifacts, session, and reset hydration.
+        storeApi.getState().clearMessages();
+        recoveryAttemptedRef.current = null; // Allow recovery for the new product
+      }
+      prevDataProductIdRef.current = dataProductId;
     }
-  }, [dataProductId, setHydrated]);
+  }, [dataProductId, storeApi]);
 
   useEffect(() => {
     // Only attempt recovery once per data product
@@ -65,9 +74,10 @@ function useSessionRecovery(dataProduct: DataProduct | undefined): UseSessionRec
       return;
     }
 
-    // No session ID stored - mark as hydrated with empty state
+    // No session ID stored — fresh product, clear any stale messages and allow auto-discovery
     if (!storedSessionId) {
       recoveryAttemptedRef.current = dataProductId;
+      storeApi.getState().clearMessages();
       setHydrated(true);
       return;
     }
@@ -110,7 +120,8 @@ function useSessionRecovery(dataProduct: DataProduct | undefined): UseSessionRec
 
           hydrateFromHistory(chatMessages, storedSessionId, phase);
         } else {
-          // No messages found, but still mark as hydrated
+          // No messages in history — clear any stale messages from previous product
+          storeApi.getState().clearMessages();
           setHydrated(true);
         }
       } catch (error) {
@@ -122,7 +133,7 @@ function useSessionRecovery(dataProduct: DataProduct | undefined): UseSessionRec
     };
 
     void fetchHistory();
-  }, [dataProductId, storedSessionId, sessionId, messages.length, hydrateFromHistory, setHydrated, dataProduct?.state?.current_phase]);
+  }, [dataProductId, storedSessionId, sessionId, messages.length, hydrateFromHistory, setHydrated, storeApi, dataProduct?.state?.current_phase]);
 
   return { isHydrated };
 }

@@ -2316,12 +2316,16 @@ try {
 - [ ] Memory leaks checked
 
 **Reliability:**
-- [ ] Error handling comprehensive
-- [ ] Retry logic implemented
+- [x] Error handling comprehensive
+- [x] Retry logic implemented
 - [ ] Circuit breakers implemented
 - [ ] Graceful shutdown handling
 - [ ] Health checks working
 - [ ] Logging comprehensive
+- [x] SSE resilience — JSON parse guard (malformed events skip instead of crash), exponential backoff with 0-30% jitter, error categorization (retry on 5xx/408/429, fatal on 4xx), Page Visibility API reconnection on tab return
+- [x] React error boundaries — Route-level (`error.tsx` for `/data-products/[id]`) catches unhandled page errors with retry button. Component-level (`ComponentErrorBoundary`) wraps `MessageThread` and all 6 artifact panels — a crash in one panel doesn't kill the page
+- [x] LLM fallback chain — Primary model wrapped with `with_retry(3 attempts, exponential jitter)`. Optional `llm_fallback_provider` config enables `with_fallbacks()` to a secondary provider (each with 2 retry attempts). Provider factory extracted to `_build_model_for_provider()` supporting all 5 backends
+- [x] Scoped Zustand stores — Global `create()` singleton replaced with `createStore()` (vanilla) + React Context. Each data product page mounts its own `ChatStoreProvider` (keyed by product ID), creating isolated state. Navigating between products unmounts the old provider, preventing cross-product contamination. All consumers (`useAgent`, `useSessionRecovery`, `MessageThread`, `page.tsx`) migrated to context-based `useChatStore(selector)` + `useChatStoreApi()` for imperative access
 
 **Observability:**
 - [ ] Structured logging (JSON)

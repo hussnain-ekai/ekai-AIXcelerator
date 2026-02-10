@@ -50,6 +50,7 @@ StreamEventType = Literal[
     "artifact",
     "approval_request",
     "approval_response",
+    "status",
     "error",
     "done",
     "pipeline_progress",
@@ -185,6 +186,9 @@ class LLMConfigRequest(BaseModel):
     azure_openai_deployment: str | None = None
     azure_openai_api_version: str | None = None
 
+    # Optional fallback provider config
+    fallback: dict[str, Any] | None = None
+
 
 class LLMConfigResponse(BaseModel):
     """Response after applying an LLM config change."""
@@ -230,9 +234,17 @@ class LLMTestResponse(BaseModel):
     error: str | None = None
 
 
+class LLMFallbackStatus(BaseModel):
+    """Fallback provider info."""
+
+    provider: str
+    model: str
+
+
 class LLMStatusResponse(BaseModel):
     """Current active LLM status."""
 
     provider: str
     model: str
     is_override: bool = False
+    fallback: LLMFallbackStatus | None = None

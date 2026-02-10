@@ -3,10 +3,16 @@ import { api } from '@/lib/api';
 
 type LLMProvider = 'snowflake-cortex' | 'vertex-ai' | 'azure-openai' | 'anthropic' | 'openai';
 
+interface LLMFallbackStatus {
+  provider: string;
+  model: string;
+}
+
 interface LLMActiveStatus {
   provider: string;
   model: string;
   is_override: boolean;
+  fallback?: LLMFallbackStatus | null;
 }
 
 interface LLMDefaults {
@@ -20,6 +26,23 @@ interface LLMConfigData {
   saved: LLMConfigBody | null;
   active: LLMActiveStatus | null;
   defaults: LLMDefaults;
+}
+
+interface LLMFallbackConfig {
+  provider: string;
+  cortex_model?: string;
+  vertex_credentials_json?: string;
+  vertex_project?: string;
+  vertex_location?: string;
+  vertex_model?: string;
+  anthropic_api_key?: string;
+  anthropic_model?: string;
+  openai_api_key?: string;
+  openai_model?: string;
+  azure_openai_api_key?: string;
+  azure_openai_endpoint?: string;
+  azure_openai_deployment?: string;
+  azure_openai_api_version?: string;
 }
 
 interface LLMConfigBody {
@@ -42,6 +65,8 @@ interface LLMConfigBody {
   azure_openai_endpoint?: string;
   azure_openai_deployment?: string;
   azure_openai_api_version?: string;
+  // Fallback provider
+  fallback?: LLMFallbackConfig;
 }
 
 interface LLMSaveResponse {
@@ -90,6 +115,8 @@ export type {
   LLMConfigBody,
   LLMConfigData,
   LLMActiveStatus,
+  LLMFallbackConfig,
+  LLMFallbackStatus,
   LLMDefaults,
   LLMSaveResponse,
   LLMTestResponse,

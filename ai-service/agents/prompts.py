@@ -787,3 +787,54 @@ AVAILABLE TOOLS:
 - get_latest_semantic_view: Load the current semantic model. Args: data_product_id. Use to answer questions about what is in the model.
 - get_latest_brd: Load the current business requirements. Args: data_product_id. Use to answer questions about the BRD or explain why items were included in the model.
 """
+
+import re
+
+
+def sanitize_prompt_for_azure(prompt: str) -> str:
+    """Soften directive language for Azure OpenAI's content filter.
+
+    Azure's jailbreak detector flags prompts with dense directive patterns
+    (MUST, NEVER, CRITICAL, delimiter markers, priority overrides).
+    This function tones down language while preserving meaning.
+    Only call this when the active provider is azure-openai.
+
+    All other providers (Gemini, Anthropic, OpenAI direct) get the original
+    prompts unchanged — they handle strong directives correctly.
+    """
+    s = prompt
+
+    # Soften directive keywords (case-sensitive replacements)
+    s = s.replace("CRITICAL:", "Important:")
+    s = s.replace("CRITICAL —", "Important —")
+    s = s.replace("CRITICAL FAILURE", "incorrect behavior")
+    s = s.replace("ABSOLUTE RULE", "GUIDELINE")
+    s = s.replace("You MUST ", "You should ")
+    s = s.replace("you MUST ", "you should ")
+    s = s.replace("MUST ", "Should ")
+    s = s.replace("NEVER ", "Do not ")
+    s = s.replace("Do NOT ", "Do not ")
+    s = s.replace("DO NOT ", "Do not ")
+    s = s.replace("must NEVER", "should not")
+
+    # Remove delimiter markers that trigger injection detection
+    s = s.replace("---BEGIN BRD---", "Format reference:")
+    s = s.replace("---END BRD---", "(end of format reference)")
+
+    # Soften hidden-section markers
+    s = s.replace("[INTERNAL — NEVER REFERENCE IN CHAT]", "")
+    s = s.replace("NEVER REFERENCE IN CHAT", "do not reference in chat")
+
+    # Soften violation language
+    s = re.sub(
+        r"Violation is a (critical |CRITICAL )?failure\.?",
+        "This is an important rule.",
+        s,
+        flags=re.IGNORECASE,
+    )
+
+    # Soften "Extract silently" pattern
+    s = s.replace("Extract silently", "Extract")
+    s = s.replace("extract silently", "extract")
+
+    return s

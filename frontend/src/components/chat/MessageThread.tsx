@@ -18,7 +18,7 @@ import EditOutlined from '@mui/icons-material/EditOutlined';
 import InsertDriveFileOutlined from '@mui/icons-material/InsertDriveFileOutlined';
 import RefreshOutlined from '@mui/icons-material/RefreshOutlined';
 import type { ChatMessage, ArtifactType } from '@/stores/chatStore';
-import { useChatStore } from '@/stores/chatStore';
+import { useChatStore } from '@/stores/chatStoreProvider';
 import { ArtifactCard } from './ArtifactCard';
 import { DiscoveryProgress } from './DiscoveryProgress';
 

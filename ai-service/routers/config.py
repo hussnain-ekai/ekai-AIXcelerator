@@ -16,9 +16,11 @@ from config import (
     get_effective_settings,
     get_settings,
 )
+from services.llm import _is_reasoning_model
 from models.schemas import (
     LLMConfigRequest,
     LLMConfigResponse,
+    LLMFallbackStatus,
     LLMStatusResponse,
     LLMTestRequest,
     LLMTestResponse,
@@ -155,27 +157,43 @@ def _build_test_model(overrides: dict[str, Any]) -> BaseChatModel:
             )
 
     if provider == "azure-openai":
-        from langchain_openai import AzureChatOpenAI
-
         api_key = overrides.get(
             "azure_openai_api_key",
             base.azure_openai_api_key.get_secret_value(),
         )
         endpoint = overrides.get("azure_openai_endpoint", base.azure_openai_endpoint)
+        deployment = overrides.get(
+            "azure_openai_deployment", base.azure_openai_deployment
+        )
         if not api_key or not endpoint:
             raise ValueError("Azure endpoint and API key are required")
-        return AzureChatOpenAI(
-            azure_deployment=overrides.get(
-                "azure_openai_deployment", base.azure_openai_deployment
-            ),
-            azure_endpoint=endpoint,
-            api_key=api_key if isinstance(api_key, str) else api_key.get_secret_value(),
-            api_version=overrides.get(
-                "azure_openai_api_version", base.azure_openai_api_version
-            ),
-            temperature=get_settings().llm_temperature,
-            max_tokens=get_settings().llm_test_max_tokens,
-        )
+        resolved_key = api_key if isinstance(api_key, str) else api_key.get_secret_value()
+
+        if _is_reasoning_model(deployment):
+            # GPT-5 family + o-series: use ChatOpenAI with Azure v1 base_url
+            from langchain_openai import ChatOpenAI as AzureV1ChatOpenAI
+
+            base_url = f"{endpoint.rstrip('/')}/openai/v1/"
+            return AzureV1ChatOpenAI(
+                model=deployment,
+                base_url=base_url,
+                api_key=resolved_key,
+                max_completion_tokens=get_settings().llm_test_max_tokens,
+            )
+        else:
+            # Legacy models: use AzureChatOpenAI
+            from langchain_openai import AzureChatOpenAI
+
+            return AzureChatOpenAI(
+                azure_deployment=deployment,
+                azure_endpoint=endpoint,
+                api_key=resolved_key,
+                api_version=overrides.get(
+                    "azure_openai_api_version", base.azure_openai_api_version
+                ),
+                temperature=get_settings().llm_temperature,
+                max_tokens=get_settings().llm_test_max_tokens,
+            )
 
     if provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
@@ -202,12 +220,15 @@ def _build_test_model(overrides: dict[str, Any]) -> BaseChatModel:
         )
         if not api_key:
             raise ValueError("OpenAI API key is required")
-        return ChatOpenAI(
-            model=overrides.get("openai_model", base.openai_model),
+        model_name = overrides.get("openai_model", base.openai_model)
+        oi_kwargs: dict[str, Any] = dict(
+            model=model_name,
             api_key=api_key,
-            temperature=get_settings().llm_temperature,
             max_tokens=get_settings().llm_test_max_tokens,
         )
+        if not _is_reasoning_model(model_name):
+            oi_kwargs["temperature"] = get_settings().llm_temperature
+        return ChatOpenAI(**oi_kwargs)
 
     raise ValueError(f"Unknown provider: {provider}")
 
@@ -217,16 +238,43 @@ def _build_test_model(overrides: dict[str, Any]) -> BaseChatModel:
 # ---------------------------------------------------------------------------
 
 
+def _get_fallback_model_name(fb_config: dict) -> str:
+    """Extract the model name from a fallback config dict."""
+    provider = fb_config.get("provider", "")
+    if provider == "snowflake-cortex":
+        return fb_config.get("cortex_model", "")
+    if provider == "vertex-ai":
+        return fb_config.get("vertex_model", "")
+    if provider == "azure-openai":
+        return fb_config.get("azure_openai_deployment", "")
+    if provider == "anthropic":
+        return fb_config.get("anthropic_model", "")
+    if provider == "openai":
+        return fb_config.get("openai_model", "")
+    return ""
+
+
 @router.get("/llm", response_model=LLMStatusResponse)
 async def get_llm_status() -> LLMStatusResponse:
     """Return the currently active LLM provider and model."""
     effective = get_effective_settings()
     base = get_settings()
     provider = effective.llm_provider
+
+    # Build fallback info
+    fb_config = getattr(effective, "llm_fallback_config", None)
+    fallback = None
+    if fb_config and isinstance(fb_config, dict) and fb_config.get("provider"):
+        fallback = LLMFallbackStatus(
+            provider=fb_config["provider"],
+            model=_get_fallback_model_name(fb_config),
+        )
+
     return LLMStatusResponse(
         provider=provider,
         model=_get_active_model_name(provider, effective),
         is_override=effective.llm_provider != base.llm_provider,
+        fallback=fallback,
     )
 
 
@@ -238,7 +286,15 @@ async def set_llm_config(req: LLMConfigRequest) -> LLMConfigResponse:
     reverts the overrides and returns an error.
     """
     overrides = _request_to_overrides(req)
-    logger.info("Applying LLM config overrides: provider=%s", req.provider)
+
+    # Include fallback config if provided
+    if req.fallback and isinstance(req.fallback, dict) and req.fallback.get("provider"):
+        overrides["llm_fallback_config"] = req.fallback
+    else:
+        overrides["llm_fallback_config"] = {}
+
+    logger.info("Applying LLM config overrides: provider=%s, fallback=%s",
+                req.provider, req.fallback.get("provider") if req.fallback else "none")
 
     # Save current overrides for rollback
     from config import _settings_overrides

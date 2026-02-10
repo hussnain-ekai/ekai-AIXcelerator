@@ -5,6 +5,23 @@ import { postgresService } from '../services/postgresService.js';
 
 const AI_SERVICE_URL = config.AI_SERVICE_URL;
 
+interface LlmFallbackConfig {
+  provider: string;
+  cortex_model?: string;
+  vertex_credentials_json?: string;
+  vertex_project?: string;
+  vertex_location?: string;
+  vertex_model?: string;
+  anthropic_api_key?: string;
+  anthropic_model?: string;
+  openai_api_key?: string;
+  openai_model?: string;
+  azure_openai_api_key?: string;
+  azure_openai_endpoint?: string;
+  azure_openai_deployment?: string;
+  azure_openai_api_version?: string;
+}
+
 interface LlmConfigBody {
   provider: string;
   model?: string;
@@ -25,6 +42,8 @@ interface LlmConfigBody {
   azure_openai_endpoint?: string;
   azure_openai_deployment?: string;
   azure_openai_api_version?: string;
+  // Fallback provider
+  fallback?: LlmFallbackConfig;
 }
 
 interface LlmTestBody extends LlmConfigBody {}

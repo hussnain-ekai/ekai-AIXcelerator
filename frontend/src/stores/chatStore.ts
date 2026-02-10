@@ -1,4 +1,4 @@
-import { create } from 'zustand';
+import { createStore } from 'zustand/vanilla';
 
 type MessageRole = 'user' | 'assistant' | 'system';
 type AgentPhase = 'discovery' | 'requirements' | 'generation' | 'validation' | 'publishing' | 'explorer' | 'idle';
@@ -93,161 +93,165 @@ const INITIAL_STATE = {
   pipelineRunning: false,
 };
 
-export const useChatStore = create<ChatState>()((set) => ({
-  ...INITIAL_STATE,
+export type ChatStore = ReturnType<typeof createChatStore>;
 
-  addMessage: (message: ChatMessage) =>
-    set((state) => ({
-      messages: [...state.messages, message],
-    })),
+export function createChatStore() {
+  return createStore<ChatState>()((set) => ({
+    ...INITIAL_STATE,
 
-  updateLastAssistantMessage: (content: string) =>
-    set((state) => {
-      const messages = [...state.messages];
-      const lastIndex = messages.length - 1;
-      const lastMessage = messages[lastIndex];
+    addMessage: (message: ChatMessage) =>
+      set((state) => ({
+        messages: [...state.messages, message],
+      })),
 
-      if (lastMessage && lastMessage.role === 'assistant') {
-        messages[lastIndex] = { ...lastMessage, content };
-      }
+    updateLastAssistantMessage: (content: string) =>
+      set((state) => {
+        const messages = [...state.messages];
+        const lastIndex = messages.length - 1;
+        const lastMessage = messages[lastIndex];
 
-      return { messages };
-    }),
+        if (lastMessage && lastMessage.role === 'assistant') {
+          messages[lastIndex] = { ...lastMessage, content };
+        }
 
-  finalizeLastMessage: () =>
-    set((state) => {
-      const messages = [...state.messages];
-      const lastIndex = messages.length - 1;
-      const lastMessage = messages[lastIndex];
+        return { messages };
+      }),
 
-      if (lastMessage && lastMessage.role === 'assistant' && lastMessage.isStreaming) {
-        // Dedup: if this message duplicates the previous finalized assistant message, remove it
-        for (let i = lastIndex - 1; i >= 0; i--) {
-          const prev = messages[i];
-          if (prev && prev.role === 'assistant' && !prev.isStreaming) {
-            const prevText = prev.content.trim();
-            const currText = lastMessage.content.trim();
-            if (
-              prevText.length > 50 &&
-              currText.length > 50 &&
-              prevText.slice(0, 200) === currText.slice(0, 200)
-            ) {
-              messages.splice(lastIndex, 1);
-              return { messages };
+    finalizeLastMessage: () =>
+      set((state) => {
+        const messages = [...state.messages];
+        const lastIndex = messages.length - 1;
+        const lastMessage = messages[lastIndex];
+
+        if (lastMessage && lastMessage.role === 'assistant' && lastMessage.isStreaming) {
+          // Dedup: if this message duplicates the previous finalized assistant message, remove it
+          for (let i = lastIndex - 1; i >= 0; i--) {
+            const prev = messages[i];
+            if (prev && prev.role === 'assistant' && !prev.isStreaming) {
+              const prevText = prev.content.trim();
+              const currText = lastMessage.content.trim();
+              if (
+                prevText.length > 50 &&
+                currText.length > 50 &&
+                prevText.slice(0, 200) === currText.slice(0, 200)
+              ) {
+                messages.splice(lastIndex, 1);
+                return { messages };
+              }
+              break;
             }
-            break;
+          }
+          messages[lastIndex] = { ...lastMessage, isStreaming: false };
+        }
+
+        return { messages };
+      }),
+
+    addToolCallToLastMessage: (toolCall: ToolCall) =>
+      set((state) => {
+        const messages = [...state.messages];
+        const lastIndex = messages.length - 1;
+        const lastMessage = messages[lastIndex];
+
+        if (lastMessage && lastMessage.role === 'assistant') {
+          const existingCalls = lastMessage.toolCalls ?? [];
+          messages[lastIndex] = {
+            ...lastMessage,
+            toolCalls: [...existingCalls, toolCall],
+          };
+        }
+
+        return { messages };
+      }),
+
+    setStreaming: (streaming: boolean) =>
+      set({ isStreaming: streaming }),
+
+    setPhase: (phase: AgentPhase) =>
+      set({ currentPhase: phase }),
+
+    setSessionId: (sessionId: string) =>
+      set({ sessionId }),
+
+    addArtifact: (artifact: ChatArtifact) =>
+      set((state) => {
+        // If same id exists, skip entirely
+        if (state.artifacts.some((a) => a.id === artifact.id)) return state;
+        // If same type exists, replace it with the newer version
+        const existingIdx = state.artifacts.findIndex((a) => a.type === artifact.type);
+        if (existingIdx !== -1) {
+          const updated = [...state.artifacts];
+          updated[existingIdx] = artifact;
+          return { artifacts: updated };
+        }
+        return { artifacts: [...state.artifacts, artifact] };
+      }),
+
+    setActivePanel: (panel: ArtifactType | null) =>
+      set({ activePanel: panel }),
+
+    setPipelineProgress: (progress: PipelineProgress | null) =>
+      set({ pipelineProgress: progress }),
+
+    setPipelineRunning: (running: boolean) =>
+      set({ pipelineRunning: running }),
+
+    attachArtifactToLastAssistant: (artifactType: ArtifactType) =>
+      set((state) => {
+        const messages = [...state.messages];
+        // Find the last assistant message (streaming or finalized)
+        for (let i = messages.length - 1; i >= 0; i--) {
+          const msg = messages[i];
+          if (msg && msg.role === 'assistant') {
+            const existing = msg.artifactRefs ?? [];
+            if (!existing.includes(artifactType)) {
+              messages[i] = { ...msg, artifactRefs: [...existing, artifactType] };
+            }
+            return { messages };
           }
         }
-        messages[lastIndex] = { ...lastMessage, isStreaming: false };
-      }
+        return state;
+      }),
 
-      return { messages };
-    }),
+    truncateAfter: (messageId: string) =>
+      set((state) => {
+        const idx = state.messages.findIndex((m) => m.id === messageId);
+        if (idx === -1) return state;
+        return { messages: state.messages.slice(0, idx + 1) };
+      }),
 
-  addToolCallToLastMessage: (toolCall: ToolCall) =>
-    set((state) => {
-      const messages = [...state.messages];
-      const lastIndex = messages.length - 1;
-      const lastMessage = messages[lastIndex];
+    editMessage: (messageId: string, newContent: string) =>
+      set((state) => {
+        const messages = state.messages.map((m) =>
+          m.id === messageId ? { ...m, content: newContent } : m,
+        );
+        return { messages };
+      }),
 
-      if (lastMessage && lastMessage.role === 'assistant') {
-        const existingCalls = lastMessage.toolCalls ?? [];
-        messages[lastIndex] = {
-          ...lastMessage,
-          toolCalls: [...existingCalls, toolCall],
-        };
-      }
+    clearMessages: () =>
+      set({
+        messages: [],
+        artifacts: [],
+        currentPhase: 'idle',
+        sessionId: null,
+        isHydrated: false,
+        pipelineProgress: null,
+      }),
 
-      return { messages };
-    }),
+    reset: () => set(INITIAL_STATE),
 
-  setStreaming: (streaming: boolean) =>
-    set({ isStreaming: streaming }),
+    hydrateFromHistory: (messages: ChatMessage[], sessionId: string, phase: AgentPhase) =>
+      set({
+        messages,
+        sessionId,
+        currentPhase: phase,
+        isHydrated: true,
+      }),
 
-  setPhase: (phase: AgentPhase) =>
-    set({ currentPhase: phase }),
-
-  setSessionId: (sessionId: string) =>
-    set({ sessionId }),
-
-  addArtifact: (artifact: ChatArtifact) =>
-    set((state) => {
-      // If same id exists, skip entirely
-      if (state.artifacts.some((a) => a.id === artifact.id)) return state;
-      // If same type exists, replace it with the newer version
-      const existingIdx = state.artifacts.findIndex((a) => a.type === artifact.type);
-      if (existingIdx !== -1) {
-        const updated = [...state.artifacts];
-        updated[existingIdx] = artifact;
-        return { artifacts: updated };
-      }
-      return { artifacts: [...state.artifacts, artifact] };
-    }),
-
-  setActivePanel: (panel: ArtifactType | null) =>
-    set({ activePanel: panel }),
-
-  setPipelineProgress: (progress: PipelineProgress | null) =>
-    set({ pipelineProgress: progress }),
-
-  setPipelineRunning: (running: boolean) =>
-    set({ pipelineRunning: running }),
-
-  attachArtifactToLastAssistant: (artifactType: ArtifactType) =>
-    set((state) => {
-      const messages = [...state.messages];
-      // Find the last assistant message (streaming or finalized)
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const msg = messages[i];
-        if (msg && msg.role === 'assistant') {
-          const existing = msg.artifactRefs ?? [];
-          if (!existing.includes(artifactType)) {
-            messages[i] = { ...msg, artifactRefs: [...existing, artifactType] };
-          }
-          return { messages };
-        }
-      }
-      return state;
-    }),
-
-  truncateAfter: (messageId: string) =>
-    set((state) => {
-      const idx = state.messages.findIndex((m) => m.id === messageId);
-      if (idx === -1) return state;
-      return { messages: state.messages.slice(0, idx + 1) };
-    }),
-
-  editMessage: (messageId: string, newContent: string) =>
-    set((state) => {
-      const messages = state.messages.map((m) =>
-        m.id === messageId ? { ...m, content: newContent } : m,
-      );
-      return { messages };
-    }),
-
-  clearMessages: () =>
-    set({
-      messages: [],
-      artifacts: [],
-      currentPhase: 'idle',
-      sessionId: null,
-      isHydrated: false,
-      pipelineProgress: null,
-    }),
-
-  reset: () => set(INITIAL_STATE),
-
-  hydrateFromHistory: (messages: ChatMessage[], sessionId: string, phase: AgentPhase) =>
-    set({
-      messages,
-      sessionId,
-      currentPhase: phase,
-      isHydrated: true,
-    }),
-
-  setHydrated: (hydrated: boolean) =>
-    set({ isHydrated: hydrated }),
-}));
+    setHydrated: (hydrated: boolean) =>
+      set({ isHydrated: hydrated }),
+  }));
+}
 
 export type {
   ChatMessage,

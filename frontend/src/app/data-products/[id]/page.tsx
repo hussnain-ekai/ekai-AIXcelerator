@@ -14,6 +14,7 @@ import FolderOpenIcon from '@mui/icons-material/FolderOpen';
 import TableChartOutlinedIcon from '@mui/icons-material/TableChartOutlined';
 import RestartAltIcon from '@mui/icons-material/RestartAlt';
 import NextLink from 'next/link';
+import { ComponentErrorBoundary } from '@/components/ErrorBoundary';
 import { PhaseStepper } from '@/components/chat/PhaseStepper';
 import { MessageThread } from '@/components/chat/MessageThread';
 import { ChatInput } from '@/components/chat/ChatInput';
@@ -31,7 +32,7 @@ import { useAgent } from '@/hooks/useAgent';
 import { useSessionRecovery } from '@/hooks/useSessionRecovery';
 import { useArtifacts, useERDData, useQualityReport, useYAMLContent, useBRD, useDataDescription } from '@/hooks/useArtifacts';
 import { useQueryClient } from '@tanstack/react-query';
-import { useChatStore } from '@/stores/chatStore';
+import { ChatStoreProvider, useChatStore, useChatStoreApi } from '@/stores/chatStoreProvider';
 import type { ArtifactType } from '@/stores/chatStore';
 
 interface ChatWorkspacePageProps {
@@ -53,13 +54,29 @@ function phaseForArtifactType(type: ArtifactType): 'DISCOVERY' | 'REQUIREMENTS' 
   }
 }
 
+/**
+ * Outer wrapper: mounts a fresh ChatStoreProvider per data product.
+ * When React unmounts this (navigating away), the store is destroyed.
+ */
 export default function ChatWorkspacePage({
   params,
 }: ChatWorkspacePageProps): React.ReactNode {
   const { id } = use(params);
+  return (
+    <ChatStoreProvider key={id}>
+      <ChatWorkspaceContent id={id} />
+    </ChatStoreProvider>
+  );
+}
+
+/**
+ * Inner component: all hooks consume the scoped store via context.
+ */
+function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
   const { data: dataProduct } = useDataProduct(id);
   const { isHydrated } = useSessionRecovery(dataProduct);
   const { sendMessage, retryMessage, interrupt, isConnected } = useAgent({ dataProductId: id });
+  const storeApi = useChatStoreApi();
   const truncateAfter = useChatStore((state) => state.truncateAfter);
   const editMessage = useChatStore((state) => state.editMessage);
   const messages = useChatStore((state) => state.messages);
@@ -89,7 +106,7 @@ export default function ChatWorkspacePage({
     //   1. messages.length === 0: blocks before auto-trigger fires (same render cycle race)
     //   2. discoveryTriggeredRef: blocks after pipeline adds completion message
     // On page reload with recovered messages, both guards are false → hydration proceeds.
-    const currentMessages = useChatStore.getState().messages;
+    const currentMessages = storeApi.getState().messages;
     if (
       artifactsHydratedRef.current ||
       !persistedArtifacts?.data ||
@@ -123,7 +140,7 @@ export default function ChatWorkspacePage({
       if (mappedType === 'erd' || mappedType === 'data_quality' || mappedType === 'data_description') {
         hasDiscoveryArtifacts = true;
       }
-      const alreadyExists = useChatStore.getState().artifacts.some(
+      const alreadyExists = storeApi.getState().artifacts.some(
         (existing) => existing.id === a.id,
       );
       if (!alreadyExists) {
@@ -141,7 +158,7 @@ export default function ChatWorkspacePage({
     // On page reload, if discovery artifacts exist but no discovery-complete
     // message is in the thread, prepend one so artifact cards always appear first
     if (hasDiscoveryArtifacts) {
-      const msgs = useChatStore.getState().messages;
+      const msgs = storeApi.getState().messages;
       const discoveryText = "I've analyzed your data tables and checked the overall data quality.";
       const hasDiscoveryMsg = msgs.some((m) => m.content === discoveryText || (m.artifactRefs && m.artifactRefs.length > 0));
       if (!hasDiscoveryMsg) {
@@ -152,12 +169,12 @@ export default function ChatWorkspacePage({
           timestamp: new Date(Date.now() - 1000).toISOString(),
           artifactRefs: ['data_quality' as const],
         };
-        useChatStore.setState((state) => ({
+        storeApi.setState((state) => ({
           messages: [discoveryMsg, ...state.messages],
         }));
       }
     }
-  }, [persistedArtifacts, addArtifact, addMessage, isHydrated, pipelineRunning]);
+  }, [persistedArtifacts, addArtifact, addMessage, isHydrated, pipelineRunning, storeApi]);
 
   // Fetch detail data on-demand when panels open
   const { data: erdData } = useERDData(id, activePanel === 'erd');
@@ -183,18 +200,18 @@ export default function ChatWorkspacePage({
   const handleEditMessage = useCallback(
     (messageId: string, newContent: string) => {
       // Capture original content BEFORE editing the store
-      const msg = useChatStore.getState().messages.find((m) => m.id === messageId);
+      const msg = storeApi.getState().messages.find((m) => m.id === messageId);
       const originalContent = msg?.content ?? '';
       editMessage(messageId, newContent);
       truncateAfter(messageId);
       void retryMessage({ messageId, editedContent: newContent, originalContent });
     },
-    [editMessage, truncateAfter, retryMessage],
+    [editMessage, truncateAfter, retryMessage, storeApi],
   );
 
   const handleRetryMessage = useCallback(
     (messageId: string) => {
-      const msgs = useChatStore.getState().messages;
+      const msgs = storeApi.getState().messages;
       const msgIndex = msgs.findIndex((m) => m.id === messageId);
       const msg = msgs[msgIndex];
       if (!msg) return;
@@ -213,7 +230,7 @@ export default function ChatWorkspacePage({
         }
       }
     },
-    [truncateAfter, retryMessage],
+    [truncateAfter, retryMessage, storeApi],
   );
 
   const handleStartDiscovery = useCallback(() => {
@@ -375,13 +392,15 @@ export default function ChatWorkspacePage({
       <Divider />
 
       {/* Message thread */}
-      <MessageThread
-        messages={messages}
-        isStreaming={isStreaming}
-        onOpenArtifact={handleOpenPanel}
-        onEditMessage={handleEditMessage}
-        onRetryMessage={handleRetryMessage}
-      />
+      <ComponentErrorBoundary fallbackMessage="Chat messages failed to render.">
+        <MessageThread
+          messages={messages}
+          isStreaming={isStreaming}
+          onOpenArtifact={handleOpenPanel}
+          onEditMessage={handleEditMessage}
+          onRetryMessage={handleRetryMessage}
+        />
+      </ComponentErrorBoundary>
 
       {/* Chat input */}
       <ChatInput
@@ -409,48 +428,60 @@ export default function ChatWorkspacePage({
       />
 
       {/* ERD detail panel */}
-      <ERDDiagramPanel
-        open={activePanel === 'erd'}
-        onClose={handleClosePanel}
-        erdData={erdData ?? null}
-      />
+      <ComponentErrorBoundary fallbackMessage="ERD diagram failed to render.">
+        <ERDDiagramPanel
+          open={activePanel === 'erd'}
+          onClose={handleClosePanel}
+          erdData={erdData ?? null}
+        />
+      </ComponentErrorBoundary>
 
       {/* Data Quality Report detail panel */}
-      <DataQualityReport
-        open={activePanel === 'data_quality'}
-        onClose={handleClosePanel}
-        report={qualityReport ?? null}
-      />
+      <ComponentErrorBoundary fallbackMessage="Data quality report failed to render.">
+        <DataQualityReport
+          open={activePanel === 'data_quality'}
+          onClose={handleClosePanel}
+          report={qualityReport ?? null}
+        />
+      </ComponentErrorBoundary>
 
       {/* BRD viewer detail panel */}
-      <BRDViewer
-        open={activePanel === 'brd'}
-        onClose={handleClosePanel}
-        brd={brdData ?? null}
-        isLoading={brdLoading}
-      />
+      <ComponentErrorBoundary fallbackMessage="Business requirements failed to render.">
+        <BRDViewer
+          open={activePanel === 'brd'}
+          onClose={handleClosePanel}
+          brd={brdData ?? null}
+          isLoading={brdLoading}
+        />
+      </ComponentErrorBoundary>
 
       {/* YAML viewer detail panel */}
-      <YAMLViewer
-        open={activePanel === 'yaml'}
-        onClose={handleClosePanel}
-        yaml={yamlData?.yaml_content ?? ''}
-      />
+      <ComponentErrorBoundary fallbackMessage="YAML viewer failed to render.">
+        <YAMLViewer
+          open={activePanel === 'yaml'}
+          onClose={handleClosePanel}
+          yaml={yamlData?.yaml_content ?? ''}
+        />
+      </ComponentErrorBoundary>
 
       {/* Data preview detail panel */}
-      <DataPreview
-        open={activePanel === 'data_preview'}
-        onClose={handleClosePanel}
-        data={null}
-      />
+      <ComponentErrorBoundary fallbackMessage="Data preview failed to render.">
+        <DataPreview
+          open={activePanel === 'data_preview'}
+          onClose={handleClosePanel}
+          data={null}
+        />
+      </ComponentErrorBoundary>
 
       {/* Data Description viewer panel */}
-      <DataDescriptionViewer
-        open={activePanel === 'data_description'}
-        onClose={handleClosePanel}
-        dataDescription={dataDescriptionData ?? null}
-        isLoading={dataDescriptionLoading}
-      />
+      <ComponentErrorBoundary fallbackMessage="Data description failed to render.">
+        <DataDescriptionViewer
+          open={activePanel === 'data_description'}
+          onClose={handleClosePanel}
+          dataDescription={dataDescriptionData ?? null}
+          isLoading={dataDescriptionLoading}
+        />
+      </ComponentErrorBoundary>
     </Box>
   );
 }

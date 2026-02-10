@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     # Configured via UI only (/llm-configuration). No .env defaults.
     # Options: "vertex-ai", "azure-openai", "anthropic", "openai", "snowflake-cortex"
     llm_provider: str = ""  # Must be set via UI
+    llm_fallback_config: dict[str, Any] = {}  # Full fallback provider config (provider, model, credentials)
 
     # --- Snowflake Cortex LLM ---
     cortex_model: str = ""
@@ -161,6 +162,7 @@ def get_settings() -> Settings:
 
 ALLOWED_LLM_OVERRIDES: set[str] = {
     "llm_provider",
+    "llm_fallback_config",
     "cortex_model",
     # Vertex AI — user-provided
     "vertex_credentials_json",
@@ -330,6 +332,10 @@ async def restore_llm_overrides(pool: object) -> None:
             "azure_openai_deployment": "azure_openai_deployment",
             "azure_openai_api_version": "azure_openai_api_version",
         }
+        # Restore fallback config if present
+        fallback = data.get("fallback")
+        if fallback and isinstance(fallback, dict) and fallback.get("provider"):
+            _settings_overrides["llm_fallback_config"] = fallback
         for src_key, dst_key in field_map.items():
             value = data.get(src_key)
             if value and dst_key in ALLOWED_LLM_OVERRIDES:

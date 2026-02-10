@@ -62,6 +62,30 @@
 
 ---
 
+## 5. Data Maturity Classification & Transformation Agent
+
+**Problem:** ekaiX assumes gold-layer data. When users connect bronze/silver data (untyped columns, duplicates, nested JSON, no PKs), the generated semantic model produces wrong answers.
+
+**Solution:** Auto-classify source data maturity (bronze/silver/gold) during discovery, then deploy a new Transformation Agent that creates Snowflake Dynamic Tables to clean the data before semantic modeling.
+
+**Full specification:** [`2026-02-11-data-maturity-transformation-agent.md`](./2026-02-11-data-maturity-transformation-agent.md)
+
+---
+
+## 6. Multi-Platform Support (Databricks, Microsoft Fabric)
+
+**Problem:** ekaiX is currently a Snowflake Native App. Customers on Databricks or Microsoft Fabric can't use it.
+
+**Solution:** The AI agents, frontend, and backend are platform-agnostic (~60-70% of code). The Snowflake-specific parts (discovery SQL, YAML semantic view spec, Cortex Agent DDL, SPCS packaging) need platform-specific backends. Architecture: `TransformationBackend` protocol abstraction with implementations for each platform.
+
+**Platform mapping:**
+- **Databricks:** Unity Catalog for discovery, Delta Live Tables for transforms, custom semantic layer
+- **Microsoft Fabric:** OneLake for discovery, Dataflow Gen2 for transforms, Power BI semantic model
+
+**See also:** Section 11 of [`2026-02-11-data-maturity-transformation-agent.md`](./2026-02-11-data-maturity-transformation-agent.md)
+
+---
+
 ## Priority Order
 
 | # | Feature | Effort | Impact |
@@ -69,4 +93,6 @@
 | 1 | sample_values + synonyms | Low | High — fixes a real accuracy problem |
 | 3 | Quality validation with user Q&A | Medium | High — trust and correctness |
 | 2 | MCP integration for testing | Medium | High — keeps users in ekaiX |
+| 5 | Data maturity + transformation agent | High | Very High — unlocks bronze/silver data |
 | 4 | ML Functions as tools | High | Medium — wow factor for demos |
+| 6 | Multi-platform (Databricks, Fabric) | Very High | Very High — market expansion |

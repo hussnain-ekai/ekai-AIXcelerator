@@ -260,6 +260,85 @@ async def _build_fqn_column_map(data_product_id: str) -> dict[str, set[str]]:
     return fqn_columns
 
 
+def _extract_sample_values_from_profiles(profiles: list[dict[str, Any]]) -> dict[str, dict[str, dict[str, Any]]]:
+    """Extract sample_values map from a list of profile dicts.
+
+    Returns: {FQN_UPPER: {COLUMN_NAME: {"sample_values": [...], "distinct_count": int}}}
+    """
+    result: dict[str, dict[str, dict[str, Any]]] = {}
+    for profile in profiles:
+        fqn = profile.get("table", "").upper()
+        if not fqn:
+            continue
+        col_map: dict[str, dict[str, Any]] = {}
+        for col in profile.get("columns", []):
+            sv = col.get("sample_values")
+            if sv:
+                col_map[col["column"]] = {
+                    "sample_values": sv,
+                    "distinct_count": col.get("distinct_count", 0),
+                }
+        if col_map:
+            result[fqn] = col_map
+    return result
+
+
+async def _build_fqn_sample_values(data_product_id: str) -> dict[str, dict[str, dict[str, Any]]]:
+    """Fetch sample_values + distinct_count per column from discovery data.
+
+    Returns: {FQN_UPPER: {COLUMN_NAME: {"sample_values": [...], "distinct_count": int}}}
+
+    Tries Redis cache first (fast). If cache expired, falls back to the
+    quality_report artifact in MinIO (permanent storage).
+    """
+    from config import get_settings
+    from services import redis as redis_service
+
+    # 1. Try Redis cache (fast path)
+    try:
+        settings = get_settings()
+        client = await redis_service.get_client(settings.redis_url)
+        cache_key = f"discovery:pipeline:{data_product_id}"
+        cached = await redis_service.get_json(client, cache_key)
+        if cached and cached.get("profiles"):
+            return _extract_sample_values_from_profiles(cached["profiles"])
+    except Exception as exc:
+        logger.warning("_build_fqn_sample_values: Redis unavailable: %s", exc)
+
+    # 2. Fallback: read quality_report artifact from MinIO (survives cache expiry)
+    try:
+        from services import minio as minio_service
+        from services import postgres as pg_service
+
+        if pg_service._pool is None or minio_service._client is None:
+            return {}
+
+        settings = get_settings()
+        rows = await pg_service.query(
+            pg_service._pool,
+            "SELECT minio_path FROM artifacts "
+            "WHERE data_product_id = $1::uuid AND artifact_type = 'quality_report' "
+            "ORDER BY created_at DESC LIMIT 1",
+            data_product_id,
+        )
+        if not rows:
+            return {}
+
+        minio_path = rows[0]["minio_path"]
+        raw = minio_service.download_file(
+            minio_service._client, settings.minio_artifacts_bucket, minio_path,
+        )
+        qr_data = json.loads(raw)
+        profiles = qr_data.get("profiles", [])
+        if profiles:
+            logger.info("_build_fqn_sample_values: loaded profiles from MinIO artifact (Redis cache expired)")
+            return _extract_sample_values_from_profiles(profiles)
+    except Exception as exc:
+        logger.warning("_build_fqn_sample_values: MinIO fallback failed: %s", exc)
+
+    return {}
+
+
 async def build_table_metadata_from_yaml(
     data_product_id: str, yaml_doc: dict[str, Any]
 ) -> dict[str, set[str]]:
@@ -381,7 +460,7 @@ async def quote_columns_in_yaml_str(yaml_str: str, data_product_id: str) -> str:
         return yaml_str
 
     logger.info("quote_columns_in_yaml_str: applied column quoting to YAML for %s", data_product_id)
-    return yaml.dump(doc, default_flow_style=False, sort_keys=False, allow_unicode=True)
+    return yaml.dump(doc, default_flow_style=False, sort_keys=False, allow_unicode=False)
 
 
 def _validate_all_column_refs(columns: dict[str, str], table_alias: str,
@@ -398,7 +477,8 @@ def _validate_all_column_refs(columns: dict[str, str], table_alias: str,
 
 
 def _lint_and_fix_structure(structure: dict[str, Any],
-                            table_metadata: dict[str, set[str]] | None = None) -> dict[str, Any]:
+                            table_metadata: dict[str, set[str]] | None = None,
+                            sample_values_map: dict[str, dict[str, dict[str, Any]]] | None = None) -> dict[str, Any]:
     """Auto-fix common structural issues in the LLM's JSON output.
 
     Runs before YAML assembly. Fixes:
@@ -408,6 +488,7 @@ def _lint_and_fix_structure(structure: dict[str, Any],
     - Duplicate names within a section
     - Empty/invalid entries
     - Root-level "comment" → "description"
+    - Injects sample_values + is_enum on dimensions from profiling data
     """
     import copy
     s = copy.deepcopy(structure)
@@ -506,11 +587,77 @@ def _lint_and_fix_structure(structure: dict[str, Any],
                 tbl["primary_key"] = [pk_candidates[0]]
                 logger.info("Lint: auto-assigned primary_key '%s' to table '%s'", pk_candidates[0], alias)
 
+    # 10. Inject sample_values + is_enum on dimensions from discovery profiling
+    if sample_values_map:
+        # Build alias -> FQN mapping from tables
+        alias_to_fqn: dict[str, str] = {}
+        for tbl in s.get("tables", []):
+            alias = tbl.get("alias", tbl.get("name", ""))
+            fqn = f"{tbl.get('database', '')}.{tbl.get('schema', '')}.{tbl.get('table', '')}".upper()
+            alias_to_fqn[alias] = fqn
+
+        for dim in s.get("dimensions", []):
+            tbl_alias = dim.get("table", "")
+            fqn = alias_to_fqn.get(tbl_alias, "")
+            col_name = dim.get("columns", {}).get("column", "")
+            if not fqn or not col_name:
+                continue
+            col_info = sample_values_map.get(fqn, {})
+            # Case-insensitive column lookup
+            matched_info = None
+            for stored_col, info in col_info.items():
+                if stored_col.upper() == col_name.upper():
+                    matched_info = info
+                    break
+            if matched_info:
+                dim["sample_values"] = matched_info["sample_values"]
+                dim["is_enum"] = matched_info["distinct_count"] <= 25
+                logger.info("Lint: injected sample_values (%d values, is_enum=%s) for dimension '%s'",
+                            len(matched_info["sample_values"]), dim["is_enum"], dim["name"])
+
     return s
 
 
+def _sanitize_yaml_strings(obj: Any) -> None:
+    """Replace non-ASCII characters in all string values in-place.
+
+    Snowflake's YAML parser rejects smart quotes, em-dashes, and other
+    Unicode characters. This recursively walks the dict/list and cleans
+    every string value. Safe for Gemini (already ASCII) — no-op on clean text.
+    """
+    _REPLACEMENTS = {
+        "\u2018": "'", "\u2019": "'",   # smart single quotes
+        "\u201c": '"', "\u201d": '"',   # smart double quotes
+        "\u2013": "-", "\u2014": "-",   # en-dash, em-dash
+        "\u2026": "...",                 # ellipsis
+        "\u00a0": " ",                   # non-breaking space
+        "\u200b": "",                    # zero-width space
+        "\u2022": "-",                   # bullet
+    }
+
+    def _clean(s: str) -> str:
+        for old, new in _REPLACEMENTS.items():
+            s = s.replace(old, new)
+        # Strip any remaining non-ASCII
+        return s.encode("ascii", errors="ignore").decode("ascii")
+
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, str):
+                obj[k] = _clean(v)
+            elif isinstance(v, (dict, list)):
+                _sanitize_yaml_strings(v)
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            if isinstance(v, str):
+                obj[i] = _clean(v)
+            elif isinstance(v, (dict, list)):
+                _sanitize_yaml_strings(v)
+
+
 def assemble_semantic_view_yaml(structure: dict[str, Any],
-                                 table_metadata: dict[str, set[str]] | None = None) -> str:
+                                 table_metadata: dict[str, set[str]] | None = None,
+                                 sample_values_map: dict[str, dict[str, dict[str, Any]]] | None = None) -> str:
     """Assemble a Snowflake Semantic View YAML from the LLM's structured JSON.
 
     Produces table-scoped YAML: facts, dimensions, and metrics are nested
@@ -523,12 +670,15 @@ def assemble_semantic_view_yaml(structure: dict[str, Any],
         structure: The JSON structure produced by the generation agent.
         table_metadata: Optional mapping of table_alias -> set of column names
                         for validation. If None, skips validation.
+        sample_values_map: Optional mapping of FQN -> {column -> {sample_values, distinct_count}}
+                           from discovery profiling. If provided, injects sample_values and is_enum
+                           on dimensions during the lint pass.
 
     Returns:
         YAML string conforming to Snowflake's semantic view YAML specification.
     """
     # Auto-fix common structural issues before assembly
-    structure = _lint_and_fix_structure(structure, table_metadata)
+    structure = _lint_and_fix_structure(structure, table_metadata, sample_values_map)
 
     doc: dict[str, Any] = {}
 
@@ -621,6 +771,10 @@ def assemble_semantic_view_yaml(structure: dict[str, Any],
             d["description"] = dim["description"]
         if dim.get("data_type"):
             d["data_type"] = dim["data_type"]
+        if dim.get("sample_values"):
+            d["sample_values"] = dim["sample_values"]
+            if dim.get("is_enum"):
+                d["is_enum"] = True
 
         dims_by_table.setdefault(tbl_alias, []).append(d)
 
@@ -795,8 +949,14 @@ def assemble_semantic_view_yaml(structure: dict[str, Any],
     # Custom instructions are set via the Cortex Agent creation SQL, not in the YAML.
     # Any ai_sql_generation content from the LLM is intentionally excluded here.
 
+    # Sanitize all string values to ASCII-safe characters before YAML dump.
+    # Some LLMs (e.g. gpt-5-mini) insert smart quotes, em-dashes, etc.
+    # that Snowflake's YAML parser rejects as "special characters".
+    # This is a no-op for models that already output clean ASCII (like Gemini).
+    _sanitize_yaml_strings(doc)
+
     # Serialize to YAML
-    return yaml.dump(doc, default_flow_style=False, sort_keys=False, allow_unicode=True)
+    return yaml.dump(doc, default_flow_style=False, sort_keys=False, allow_unicode=False)
 
 
 def extract_json_from_text(text: str) -> dict[str, Any] | None:

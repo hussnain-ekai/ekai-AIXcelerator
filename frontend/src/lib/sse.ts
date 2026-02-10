@@ -26,6 +26,7 @@ interface SSEHandlers {
   onArtifact: (artifactId: string, artifactType: string) => void;
   onApprovalRequest: (action: string, description: string, options: string[]) => void;
   onPipelineProgress: (data: PipelineProgressData) => void;
+  onStatus?: (message: string) => void;
   onError: (error: string, message: string) => void;
   onDone: () => void;
 }
@@ -45,8 +46,13 @@ function parseSSELine(line: string): SSEEvent | null {
     return { type: 'done', data: {} };
   }
 
-  const parsed = JSON.parse(jsonStr) as SSEEvent;
-  return parsed;
+  try {
+    const parsed = JSON.parse(jsonStr) as SSEEvent;
+    return parsed;
+  } catch {
+    // Malformed JSON — skip this line so the stream continues
+    return null;
+  }
 }
 
 function dispatchEvent(event: SSEEvent, handlers: SSEHandlers): void {
@@ -91,6 +97,9 @@ function dispatchEvent(event: SSEEvent, handlers: SSEHandlers): void {
     case 'pipeline_progress':
       handlers.onPipelineProgress(event.data as unknown as PipelineProgressData);
       break;
+    case 'status':
+      handlers.onStatus?.((event.data.message as string) ?? '');
+      break;
     case 'error':
       handlers.onError(
         (event.data.error as string) ?? 'UNKNOWN',
@@ -103,6 +112,33 @@ function dispatchEvent(event: SSEEvent, handlers: SSEHandlers): void {
     default:
       break;
   }
+}
+
+/** Determine whether a failed connection should be retried. */
+function shouldRetry(error: unknown): boolean {
+  if (error instanceof TypeError) {
+    // Network error (fetch failed, DNS, CORS, offline) — transient
+    return true;
+  }
+  if (error instanceof Error) {
+    const match = error.message.match(/SSE connection failed: (\d+)/);
+    if (match) {
+      const status = Number(match[1]);
+      // Retry on server errors, timeout, and rate-limit
+      if (status >= 500 || status === 408 || status === 429) return true;
+      // Do NOT retry on client errors (401, 403, 404, etc.)
+      return false;
+    }
+  }
+  // Unknown error type — retry to be safe
+  return true;
+}
+
+/** Exponential backoff with 0-30% random jitter to prevent thundering herd. */
+function retryDelay(attempt: number): number {
+  const base = BASE_DELAY_MS * Math.pow(2, attempt - 1);
+  const jitter = base * Math.random() * 0.3;
+  return base + jitter;
 }
 
 function connectSSE(
@@ -175,7 +211,7 @@ function connectSSE(
     }
   }
 
-  function attemptReconnect(): void {
+  function attemptReconnect(error: unknown): void {
     if (isCleanedUp || retries >= MAX_RETRIES) {
       if (retries >= MAX_RETRIES) {
         handlers.onError('MAX_RETRIES', 'Connection lost after maximum retry attempts');
@@ -183,18 +219,33 @@ function connectSSE(
       return;
     }
 
+    if (!shouldRetry(error)) {
+      handlers.onError('FATAL', error instanceof Error ? error.message : 'Connection failed');
+      return;
+    }
+
     retries += 1;
-    const delay = BASE_DELAY_MS * Math.pow(2, retries - 1);
+    const delay = retryDelay(retries);
     setTimeout(() => {
-      connect().catch(() => attemptReconnect());
+      connect().catch((err: unknown) => attemptReconnect(err));
     }, delay);
   }
 
-  connect().catch(() => attemptReconnect());
+  // Page Visibility API — reconnect when tab returns to foreground
+  function handleVisibilityChange(): void {
+    if (document.visibilityState === 'visible' && !isCleanedUp) {
+      // If the stream was broken while backgrounded, attempt reconnect
+      connect().catch((err: unknown) => attemptReconnect(err));
+    }
+  }
+  document.addEventListener('visibilitychange', handleVisibilityChange);
+
+  connect().catch((err: unknown) => attemptReconnect(err));
 
   return function cleanup(): void {
     isCleanedUp = true;
     abortController.abort();
+    document.removeEventListener('visibilitychange', handleVisibilityChange);
   };
 }
 

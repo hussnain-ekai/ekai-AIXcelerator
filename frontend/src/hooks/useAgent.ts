@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { connectSSE } from '@/lib/sse';
 import type { SSEHandlers } from '@/lib/sse';
 import { api } from '@/lib/api';
-import { useChatStore } from '@/stores/chatStore';
+import { useChatStore, useChatStoreApi } from '@/stores/chatStoreProvider';
 import type { AgentPhase, ArtifactType, ChatMessageAttachment } from '@/stores/chatStore';
 
 interface AgentResponse {
@@ -42,19 +42,19 @@ async function fileToBase64(file: File): Promise<string> {
 function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
   const [isConnected, setIsConnected] = useState(false);
   const cleanupRef = useRef<(() => void) | null>(null);
-  const {
-    sessionId,
-    setSessionId,
-    addMessage,
-    updateLastAssistantMessage,
-    finalizeLastMessage,
-    addToolCallToLastMessage,
-    setStreaming,
-    setPhase,
-    addArtifact,
-    setPipelineProgress,
-    setPipelineRunning,
-  } = useChatStore();
+  const storeApi = useChatStoreApi();
+
+  const setSessionId = useChatStore((s) => s.setSessionId);
+  const addMessage = useChatStore((s) => s.addMessage);
+  const updateLastAssistantMessage = useChatStore((s) => s.updateLastAssistantMessage);
+  const finalizeLastMessage = useChatStore((s) => s.finalizeLastMessage);
+  const addToolCallToLastMessage = useChatStore((s) => s.addToolCallToLastMessage);
+  const setStreaming = useChatStore((s) => s.setStreaming);
+  const setPhase = useChatStore((s) => s.setPhase);
+  const addArtifact = useChatStore((s) => s.addArtifact);
+  const setPipelineProgress = useChatStore((s) => s.setPipelineProgress);
+  const setPipelineRunning = useChatStore((s) => s.setPipelineRunning);
+  const sessionId = useChatStore((s) => s.sessionId);
 
   const connectToStream = useCallback(
     (sid: string) => {
@@ -64,7 +64,7 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
 
       const handlers: SSEHandlers = {
         onToken: (text: string) => {
-          const lastMessage = useChatStore.getState().messages.at(-1);
+          const lastMessage = storeApi.getState().messages.at(-1);
           if (lastMessage?.role === 'assistant' && lastMessage.isStreaming) {
             updateLastAssistantMessage(lastMessage.content + text);
           } else {
@@ -89,7 +89,7 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
         onPhaseChange: (_from: string, to: string) => {
           // Only inject a transition message when the phase ACTUALLY changes.
           // Skip if we're re-entering the same phase (e.g. requirements Q&A → BRD).
-          const prevPhase = useChatStore.getState().currentPhase;
+          const prevPhase = storeApi.getState().currentPhase;
           setPhase(to as AgentPhase);
 
           if (to === prevPhase) return;
@@ -121,7 +121,7 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
             createdAt: new Date().toISOString(),
           });
           // Attach this artifact to the last assistant message so it shows inline
-          useChatStore.getState().attachArtifactToLastAssistant(typedArtifact);
+          storeApi.getState().attachArtifactToLastAssistant(typedArtifact);
         },
         onApprovalRequest: (_action: string, description: string, _options: string[]) => {
           addMessage({
@@ -130,6 +130,16 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
             content: description,
             timestamp: new Date().toISOString(),
           });
+        },
+        onStatus: (message: string) => {
+          if (message) {
+            addMessage({
+              id: crypto.randomUUID(),
+              role: 'assistant',
+              content: message,
+              timestamp: new Date().toISOString(),
+            });
+          }
         },
         onPipelineProgress: (data) => {
           const isComplete = data.step === 'artifacts' && data.status === 'completed';
@@ -153,7 +163,7 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
               setPipelineProgress(null);
               setPipelineRunning(false);
               // Dedup: skip if last message already has this content
-              const msgs = useChatStore.getState().messages;
+              const msgs = storeApi.getState().messages;
               const lastMsg = msgs[msgs.length - 1];
               const discoveryText = "I've analyzed your data tables and checked the overall data quality.";
               if (!lastMsg || lastMsg.content !== discoveryText) {
@@ -168,7 +178,7 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
             }, 1200);
           } else {
             // Mark pipeline as running on first progress event
-            if (!useChatStore.getState().pipelineRunning) {
+            if (!storeApi.getState().pipelineRunning) {
               setPipelineRunning(true);
             }
             setPipelineProgress({
@@ -208,6 +218,7 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
     },
     [
       dataProductId,
+      storeApi,
       addMessage,
       updateLastAssistantMessage,
       finalizeLastMessage,
@@ -256,7 +267,7 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
       // or generate a new one for fresh sessions.
       // Always read from getState() — the closure's `sessionId` can be stale
       // after clearMessages() resets it in the same render cycle.
-      const existingSessionId = useChatStore.getState().sessionId;
+      const existingSessionId = storeApi.getState().sessionId;
       const sid = existingSessionId ?? crypto.randomUUID();
       if (!existingSessionId) {
         setSessionId(sid);
@@ -287,12 +298,12 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
 
       connectToStream(response.session_id);
     },
-    [dataProductId, addMessage, setStreaming, setSessionId, connectToStream],
+    [dataProductId, storeApi, addMessage, setStreaming, setSessionId, connectToStream],
   );
 
   const retryMessage = useCallback(
     async (opts: { messageId?: string; editedContent?: string; originalContent?: string }) => {
-      const sid = useChatStore.getState().sessionId;
+      const sid = storeApi.getState().sessionId;
       if (!sid) return;
 
       setStreaming(true);
@@ -310,7 +321,7 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
 
       connectToStream(response.session_id);
     },
-    [dataProductId, setStreaming, connectToStream],
+    [dataProductId, storeApi, setStreaming, connectToStream],
   );
 
   const interrupt = useCallback(async () => {

@@ -525,7 +525,7 @@ def create_semantic_view(yaml_content: str, target_schema: str, verify_only: boo
                     del tbl["primary_key"]
                     changed = True
             if changed:
-                yaml_content = _yaml.dump(parsed, default_flow_style=False, sort_keys=False, allow_unicode=True)
+                yaml_content = _yaml.dump(parsed, default_flow_style=False, sort_keys=False, allow_unicode=False)
     except Exception:
         pass
 
@@ -567,7 +567,7 @@ def create_semantic_view(yaml_content: str, target_schema: str, verify_only: boo
                 parsed = _yaml.safe_load(yaml_content)
                 if isinstance(parsed, dict) and "relationships" in parsed:
                     del parsed["relationships"]
-                    yaml_no_rels = _yaml.dump(parsed, default_flow_style=False, sort_keys=False, allow_unicode=True)
+                    yaml_no_rels = _yaml.dump(parsed, default_flow_style=False, sort_keys=False, allow_unicode=False)
                     sql2 = f"CALL SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML('{schema_name}', $${yaml_no_rels}$$, {verify_flag})"
                     execute_query_sync(sql2)
                     view_name = _extract_view_name(yaml_no_rels)
@@ -860,8 +860,32 @@ def validate_semantic_view_yaml(yaml_content: str, target_schema: str) -> str:
     if not yaml_content or not yaml_content.strip():
         return _tool_error("validate_semantic_view_yaml", "yaml_content cannot be empty")
 
-    # Clean up YAML before validation
+    # Guard: if LLM passed truncated/summarized YAML (missing tables section),
+    # auto-fetch the latest version from the database instead.
     import yaml as _yaml
+    if "tables:" not in yaml_content:
+        logger.warning("validate_semantic_view_yaml: yaml_content has no 'tables:' section (%d chars) — LLM likely passed truncated content. Auto-fetching from DB.", len(yaml_content))
+        try:
+            import psycopg2
+            from config import get_settings as _get_settings
+            _s = _get_settings()
+            _db_url = _s.database_url
+            if _db_url.startswith("postgres://"):
+                _db_url = "postgresql://" + _db_url[len("postgres://"):]
+            with psycopg2.connect(_db_url) as _conn:
+                with _conn.cursor() as _cur:
+                    _cur.execute(
+                        "SELECT yaml_content FROM semantic_views WHERE yaml_content LIKE %s ORDER BY created_at DESC LIMIT 1",
+                        (f"%{schema_parts[0]}.{schema_parts[1]}%",),
+                    )
+                    _row = _cur.fetchone()
+                    if _row and _row[0]:
+                        yaml_content = _row[0]
+                        logger.info("validate_semantic_view_yaml: auto-fetched %d chars from DB (matched schema %s)", len(yaml_content), target_schema)
+        except Exception as fetch_err:
+            logger.warning("validate_semantic_view_yaml: auto-fetch failed: %s", fetch_err)
+
+    # Clean up YAML before validation
     try:
         parsed = _yaml.safe_load(yaml_content)
         if isinstance(parsed, dict) and "tables" in parsed:
@@ -871,9 +895,15 @@ def validate_semantic_view_yaml(yaml_content: str, target_schema: str) -> str:
                     del tbl["primary_key"]
                     changed = True
             if changed:
-                yaml_content = _yaml.dump(parsed, default_flow_style=False, sort_keys=False, allow_unicode=True)
+                yaml_content = _yaml.dump(parsed, default_flow_style=False, sort_keys=False, allow_unicode=False)
     except Exception:
         pass
+
+    # Runtime guard: TRY_CAST only works on VARCHAR input in Snowflake.
+    # If columns are already numeric, TRY_CAST(NUMBER AS FLOAT) errors.
+    # Replace with CAST which handles numeric-to-numeric conversions.
+    import re as _re
+    yaml_content = _re.sub(r'\bTRY_CAST\(', 'CAST(', yaml_content)
 
     schema_name = f"{schema_parts[0]}.{schema_parts[1]}"
 
@@ -894,7 +924,7 @@ def validate_semantic_view_yaml(yaml_content: str, target_schema: str) -> str:
                 parsed = _yaml.safe_load(yaml_content)
                 if isinstance(parsed, dict) and "relationships" in parsed:
                     del parsed["relationships"]
-                    yaml_no_rels = _yaml.dump(parsed, default_flow_style=False, sort_keys=False, allow_unicode=True)
+                    yaml_no_rels = _yaml.dump(parsed, default_flow_style=False, sort_keys=False, allow_unicode=False)
                     sql2 = f"CALL SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML('{schema_name}', $${yaml_no_rels}$$, TRUE)"
                     execute_query_sync(sql2)
                     return json.dumps({
@@ -942,7 +972,7 @@ def validate_semantic_view_yaml(yaml_content: str, target_schema: str) -> str:
 
             if fixed:
                 try:
-                    fixed_yaml = _yaml_fix.dump(parsed_yaml, default_flow_style=False, sort_keys=False, allow_unicode=True)
+                    fixed_yaml = _yaml_fix.dump(parsed_yaml, default_flow_style=False, sort_keys=False, allow_unicode=False)
                     sql_retry = f"CALL SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML('{schema_name}', $${fixed_yaml}$$, TRUE)"
                     execute_query_sync(sql_retry)
                     return json.dumps({

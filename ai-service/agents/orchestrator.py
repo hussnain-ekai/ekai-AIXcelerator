@@ -25,6 +25,7 @@ from agents.prompts import (
     PUBLISHING_PROMPT,
     REQUIREMENTS_PROMPT,
     VALIDATION_PROMPT,
+    sanitize_prompt_for_azure,
 )
 
 logger = logging.getLogger(__name__)
@@ -147,13 +148,16 @@ def _load_tools() -> None:
     ]
 
 
-def _build_subagents(model: Any) -> list[dict[str, Any]]:
+def _build_subagents(model: Any, sanitize: bool = False) -> list[dict[str, Any]]:
     """Build the 6 subagent configurations for create_deep_agent.
 
     Args:
         model: The LangChain chat model to use for all subagents (same as orchestrator).
+        sanitize: If True, apply Azure content-filter sanitization to all prompts.
     """
     _load_tools()
+
+    _s = sanitize_prompt_for_azure if sanitize else lambda p: p
 
     return [
         {
@@ -165,7 +169,7 @@ def _build_subagents(model: Any) -> list[dict[str, Any]]:
                 "of questions before generating. Use when starting a new data product or "
                 "when the user has questions about discovered data."
             ),
-            "system_prompt": DISCOVERY_PROMPT,
+            "system_prompt": _s(DISCOVERY_PROMPT),
             "tools": _discovery_tools,
             "model": model,
         },
@@ -179,7 +183,7 @@ def _build_subagents(model: Any) -> list[dict[str, Any]]:
                 "Use immediately after the user responds to the discovery analysis — "
                 "do NOT wait for the user to explicitly ask for requirements."
             ),
-            "system_prompt": REQUIREMENTS_PROMPT,
+            "system_prompt": _s(REQUIREMENTS_PROMPT),
             "tools": _requirements_tools,
             "model": model,
         },
@@ -190,7 +194,7 @@ def _build_subagents(model: Any) -> list[dict[str, Any]]:
                 "Uses fully qualified table names, verifies column existence. "
                 "Use after requirements capture is complete."
             ),
-            "system_prompt": GENERATION_PROMPT,
+            "system_prompt": _s(GENERATION_PROMPT),
             "tools": _generation_tools,
             "model": model,
         },
@@ -201,7 +205,7 @@ def _build_subagents(model: Any) -> list[dict[str, Any]]:
                 "Runs EXPLAIN, checks cardinality, nulls, ranges. "
                 "Use after YAML generation to verify correctness."
             ),
-            "system_prompt": VALIDATION_PROMPT,
+            "system_prompt": _s(VALIDATION_PROMPT),
             "tools": _validation_tools,
             "model": model,
         },
@@ -212,7 +216,7 @@ def _build_subagents(model: Any) -> list[dict[str, Any]]:
                 "Requires explicit user approval before publishing. "
                 "Use after validation passes to make the model available."
             ),
-            "system_prompt": PUBLISHING_PROMPT,
+            "system_prompt": _s(PUBLISHING_PROMPT),
             "tools": _publishing_tools,
             "model": model,
         },
@@ -223,7 +227,7 @@ def _build_subagents(model: Any) -> list[dict[str, Any]]:
                 "Snowflake and the ERD graph. Available in any phase. "
                 "Use when the user asks data exploration questions."
             ),
-            "system_prompt": EXPLORER_PROMPT,
+            "system_prompt": _s(EXPLORER_PROMPT),
             "tools": _explorer_tools,
             "model": model,
         },
@@ -308,25 +312,26 @@ async def get_orchestrator() -> CompiledStateGraph:
     model = get_chat_model()
     checkpointer = await get_checkpointer()
 
-    # Pass the same model to all subagents to avoid creating separate model instances
-    subagents = _build_subagents(model)
+    # Sanitize prompts if the primary provider is Azure OpenAI
+    needs_sanitize = _is_azure_model(model)
+    if needs_sanitize:
+        logger.info("Azure primary detected — sanitizing prompts for content filter")
 
-    # Note: Langfuse callbacks are added per-session in routers/agent.py, not here
-    # This ensures proper trace isolation for each conversation session
+    subagents = _build_subagents(model, sanitize=needs_sanitize)
 
-    # Orchestrator should ONLY delegate to subagents, not call tools directly
-    # This prevents recursion loops and ambiguity
     logger.info(
-        "Building orchestrator: model=%s, subagents=%d, tools=%d",
+        "Building orchestrator: model=%s, subagents=%d, tools=%d, sanitized=%s",
         type(model).__name__,
         len(subagents),
-        0,  # No tools - orchestrator only delegates
+        0,
+        needs_sanitize,
     )
 
+    orch_prompt = sanitize_prompt_for_azure(ORCHESTRATOR_PROMPT) if needs_sanitize else ORCHESTRATOR_PROMPT
     agent = create_deep_agent(
         model=model,
-        system_prompt=ORCHESTRATOR_PROMPT,
-        tools=[],  # No tools - orchestrator delegates to subagents
+        system_prompt=orch_prompt,
+        tools=[],
         subagents=subagents,
         name="ekaix-orchestrator",
         checkpointer=checkpointer,
@@ -346,3 +351,46 @@ async def reset_orchestrator() -> CompiledStateGraph:
     _orchestrator = None
     logger.info("Orchestrator cache cleared — rebuilding with current settings")
     return await get_orchestrator()
+
+
+def _is_azure_model(model: Any) -> bool:
+    """Check if a model is backed by Azure OpenAI (needs prompt sanitization)."""
+    model_cls = type(model).__name__
+    # AzureChatOpenAI is obvious; ChatOpenAI with Azure base_url is used for
+    # reasoning models (gpt-5 family) routed through Azure's v1 endpoint.
+    if model_cls == "AzureChatOpenAI":
+        return True
+    if model_cls == "ChatOpenAI":
+        base_url = str(getattr(model, "openai_api_base", "") or getattr(model, "base_url", "") or "")
+        return ".openai.azure.com" in base_url
+    return False
+
+
+async def build_fallback_orchestrator(fallback_model: Any) -> CompiledStateGraph:
+    """Build a one-shot orchestrator using a specific fallback model.
+
+    Does NOT modify the cached ``_orchestrator`` — this graph is used only
+    for the current request. The next request will use the primary model again.
+
+    If the fallback model is Azure OpenAI, prompts are automatically sanitized
+    to avoid Azure's content filter (jailbreak detection).
+    """
+    from deepagents import create_deep_agent
+
+    checkpointer = await get_checkpointer()
+    needs_sanitize = _is_azure_model(fallback_model)
+    if needs_sanitize:
+        logger.info("Azure fallback detected — sanitizing prompts for content filter")
+    subagents = _build_subagents(fallback_model, sanitize=needs_sanitize)
+
+    orch_prompt = sanitize_prompt_for_azure(ORCHESTRATOR_PROMPT) if needs_sanitize else ORCHESTRATOR_PROMPT
+    graph = create_deep_agent(
+        model=fallback_model,
+        system_prompt=orch_prompt,
+        tools=[],
+        subagents=subagents,
+        name="ekaix-orchestrator",
+        checkpointer=checkpointer,
+    )
+    logger.info("Built fallback orchestrator with model: %s (sanitized=%s)", type(fallback_model).__name__, needs_sanitize)
+    return graph
