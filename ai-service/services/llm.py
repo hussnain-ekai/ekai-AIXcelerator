@@ -7,15 +7,18 @@ Supports:
 - Anthropic (Public API)
 - OpenAI (Public API)
 
+LiteLLM Router Integration:
+- When litellm_enable=True, returns a production-grade LiteLLM Router with automatic failover
+- The router handles retries, cooldowns, and provider switching transparently
+- When litellm_enable=False, falls back to legacy single-provider mode
+
 Langfuse Integration:
 - Callbacks are added at the MODEL level so all LLM calls are automatically traced
 - This works even with LangGraph's astream_events() which doesn't propagate callbacks
 
 Note on retry/fallback:
-- We intentionally do NOT wrap models with with_retry()/with_fallbacks() because
-  deepagents' create_deep_agent() accesses model.profile which RunnableRetry doesn't proxy.
-- LangChain provider SDKs (Vertex AI, OpenAI, Anthropic) have built-in retry for transient errors.
-- llm_fallback_provider config is available for future use at the agent execution level.
+- LiteLLM Router provides production-grade retry and fallback at the router level
+- LangChain provider SDKs (Vertex AI, OpenAI, Anthropic) have built-in retry for transient errors
 """
 
 import json
@@ -255,90 +258,67 @@ def _build_model_for_provider(
     )
 
 
-def _fallback_config_to_settings_patch(fb_config: dict[str, Any]) -> dict[str, Any]:
-    """Map frontend fallback config fields to Settings-compatible overrides.
+def get_chat_model() -> BaseChatModel | Any:
+    """Create a LangChain ChatModel or LiteLLM Router based on configuration.
 
-    Returns a dict that can be used to patch a Settings copy for building a fallback model.
-    """
-    provider = fb_config.get("provider", "")
-    m: dict[str, Any] = {"llm_provider": provider}
+    When litellm_enable=True (recommended for production):
+        Returns a LiteLLM Router with automatic failover between primary and
+        fallback providers. The router has the same interface as a LangChain
+        ChatModel and handles retries, cooldowns, and provider switching.
 
-    if provider == "vertex-ai":
-        m["vertex_model"] = fb_config.get("vertex_model", "")
-        m["vertex_project"] = fb_config.get("vertex_project", "")
-        m["vertex_location"] = fb_config.get("vertex_location", "global")
-        if fb_config.get("vertex_credentials_json"):
-            m["vertex_credentials_json"] = fb_config["vertex_credentials_json"]
-    elif provider == "anthropic":
-        m["anthropic_model"] = fb_config.get("anthropic_model", "")
-        m["anthropic_api_key"] = fb_config.get("anthropic_api_key", "")
-    elif provider == "openai":
-        m["openai_model"] = fb_config.get("openai_model", "")
-        m["openai_api_key"] = fb_config.get("openai_api_key", "")
-    elif provider == "azure-openai":
-        m["azure_openai_endpoint"] = fb_config.get("azure_openai_endpoint", "")
-        m["azure_openai_deployment"] = fb_config.get("azure_openai_deployment", "")
-        m["azure_openai_api_key"] = fb_config.get("azure_openai_api_key", "")
-        m["azure_openai_api_version"] = fb_config.get("azure_openai_api_version", "")
-    elif provider == "snowflake-cortex":
-        m["cortex_model"] = fb_config.get("cortex_model", "")
+    When litellm_enable=False (legacy mode):
+        Returns a single-provider LangChain ChatModel with no automatic failover.
 
-    return m
-
-
-def get_fallback_chat_model() -> BaseChatModel | None:
-    """Build a chat model from the fallback config, or None if not configured."""
-    settings = get_effective_settings()
-    fb_config = getattr(settings, "llm_fallback_config", None)
-    if not fb_config or not isinstance(fb_config, dict) or not fb_config.get("provider"):
-        return None
-
-    patch = _fallback_config_to_settings_patch(fb_config)
-    provider = patch["llm_provider"]
-
-    # Build a patched copy of settings with fallback credentials
-    import copy
-    from pydantic import SecretStr
-
-    patched = copy.copy(settings)
-    for key, value in patch.items():
-        field_info = type(settings).model_fields.get(key)
-        if field_info and field_info.annotation is SecretStr and isinstance(value, str):
-            value = SecretStr(value)
-        object.__setattr__(patched, key, value)
-
-    langfuse_callback = _get_langfuse_callback()
-    callbacks = [langfuse_callback] if langfuse_callback else None
-
-    try:
-        model = _build_model_for_provider(provider, patched, callbacks)
-        logger.info("Fallback model built: provider=%s, model_type=%s", provider, type(model).__name__)
-        return model
-    except Exception as e:
-        logger.warning("Failed to build fallback model (provider=%s): %s", provider, e)
-        return None
-
-
-def get_chat_model() -> BaseChatModel:
-    """Create a LangChain ChatModel based on the configured LLM provider.
-
-    Returns a raw BaseChatModel (not wrapped with retry/fallback) because
-    deepagents accesses model-specific attributes like .profile that wrappers
-    don't proxy. LangChain provider SDKs handle transient retries internally.
-
-    Langfuse callbacks are automatically added to the model if configured,
+    Langfuse callbacks are automatically added to models if configured,
     ensuring all LLM calls are traced regardless of how the model is invoked.
 
     Returns:
-        A BaseChatModel instance.
+        A LiteLLM Router (if enabled) or BaseChatModel instance.
 
     Raises:
         ValueError: If the provider is unknown or misconfigured.
     """
     settings = get_effective_settings()
+
+    # Use LiteLLM Router if enabled (recommended for production)
+    if settings.litellm_enable:
+        try:
+            from services.litellm_router import (
+                FALLBACK_MODEL_GROUP,
+                build_litellm_router,
+            )
+            from services.litellm_wrapper import create_langchain_compatible_router
+
+            langfuse_callback = _get_langfuse_callback()
+            callbacks = [langfuse_callback] if langfuse_callback else None
+
+            router = build_litellm_router()
+
+            # Determine if fallback is configured
+            fallback = settings.llm_fallback_config
+            has_fallback = bool(
+                fallback and isinstance(fallback, dict) and fallback.get("provider")
+            )
+
+            model = create_langchain_compatible_router(
+                router=router,
+                primary_provider=settings.llm_provider,
+                temperature=settings.llm_temperature,
+                max_tokens=settings.llm_max_tokens,
+                callbacks=callbacks,
+                fallback_model_group=FALLBACK_MODEL_GROUP if has_fallback else None,
+            )
+            logger.info("Using LiteLLM Router for LLM calls (automatic failover enabled)")
+            return model
+        except Exception as e:
+            logger.error("Failed to build LiteLLM Router: %s. Falling back to single provider.", e)
+            # Fall through to legacy mode if router build fails
+
+    # Fallback to legacy single-provider mode
     provider = settings.llm_provider.lower()
 
     langfuse_callback = _get_langfuse_callback()
     callbacks = [langfuse_callback] if langfuse_callback else None
 
+    logger.info("Using legacy single-provider mode (no automatic failover)")
     return _build_model_for_provider(provider, settings, callbacks)

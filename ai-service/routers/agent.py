@@ -25,26 +25,6 @@ from models.schemas import (
 logger = logging.getLogger(__name__)
 _settings = get_settings()
 
-# LLM error patterns that should trigger fallback to backup model.
-# Includes transient errors (rate limits, outages) AND provider-level auth/permission
-# errors — if the user has a working fallback configured, trying it is better than
-# simply failing when the primary provider is misconfigured or experiencing IAM issues.
-_TRANSIENT_ERROR_PATTERNS = (
-    "rate_limit", "429", "resource_exhausted",
-    "service_unavailable", "503", "502",
-    "connection_error", "timeout", "deadline_exceeded",
-    "overloaded", "too many requests", "quota exceeded",
-    "permission_denied", "403", "401", "unauthorized",
-    "invalid_api_key", "authentication", "consumer_invalid",
-)
-
-
-def _is_transient_llm_error(exc: Exception) -> bool:
-    """Check if an exception is a transient LLM error worth retrying with fallback."""
-    err_str = str(exc).lower()
-    return any(pattern in err_str for pattern in _TRANSIENT_ERROR_PATTERNS)
-
-
 def _sanitize_error_for_user(exc: Exception) -> str:
     """Convert internal errors to user-friendly messages.
 
@@ -222,6 +202,62 @@ def _suggest_field_role(col_name: str, simplified_type: str,
     return ""
 
 
+def _build_maturity_section(
+    maturity: dict[str, dict],
+    metadata: list[dict],
+) -> str:
+    """Build a human-readable maturity classification section for the LLM context."""
+    if not maturity:
+        return "Not available (pipeline may be cached from before maturity classification was added)."
+
+    lines: list[str] = []
+    # Map FQN to short name
+    name_map = {t["fqn"]: t["name"] for t in metadata}
+
+    for fqn, info in maturity.items():
+        name = name_map.get(fqn, fqn.split(".")[-1])
+        level = info.get("maturity", "unknown")
+        score = info.get("score", 0)
+        signals = info.get("signals", {})
+
+        # Build issue summary for non-gold tables
+        issue_hints: list[str] = []
+        if signals.get("varchar_ratio", 0) > 0.6:
+            issue_hints.append(f"{int(signals['varchar_ratio'] * 100)}% text-typed columns")
+        if signals.get("avg_null_pct", 0) > 20:
+            issue_hints.append(f"{signals['avg_null_pct']:.0f}% average null rate")
+        if signals.get("duplicate_rate", 0) > 0.05:
+            issue_hints.append(f"{signals['duplicate_rate'] * 100:.1f}% duplicate rows")
+        if signals.get("pk_confidence", 1) == 0:
+            issue_hints.append("no clear unique identifier")
+        if signals.get("nested_col_count", 0) > 0:
+            issue_hints.append(f"{signals['nested_col_count']} nested/semi-structured columns")
+
+        hint_str = f" — issues: {', '.join(issue_hints)}" if issue_hints else ""
+        lines.append(f"  {name}: {level.upper()} (score {score}){hint_str}")
+
+    return "\n".join(lines) if lines else "No tables classified."
+
+
+async def _persist_phase(data_product_id: str, phase: str) -> None:
+    """Persist current_phase to data_products.state JSONB."""
+    try:
+        from services.postgres import get_pool as _gp, execute as _ex
+        from config import get_effective_settings
+        _settings = get_effective_settings()
+        _pool = await _gp(_settings.database_url)
+        await _ex(
+            _pool,
+            """UPDATE data_products
+               SET state = jsonb_set(COALESCE(state, '{}'::jsonb), '{current_phase}', $1::jsonb)
+               WHERE id = $2::uuid""",
+            f'"{phase}"',
+            data_product_id,
+        )
+    except Exception as e:
+        logger.warning("Failed to persist current_phase=%s: %s", phase, e)
+
+
 def _build_discovery_summary(
     pipeline_results: dict,
     dp_name: str,
@@ -238,6 +274,7 @@ def _build_discovery_summary(
     classifications = pipeline_results.get("classifications", {})
     relationships = pipeline_results.get("relationships", [])
     quality = pipeline_results.get("quality", {})
+    maturity = pipeline_results.get("maturity_classifications", {})
 
     # Build profile lookup: fqn -> {column -> profile_data}
     profile_lookup: dict[str, dict[str, dict]] = {}
@@ -373,6 +410,11 @@ DATA QUALITY
 ═══════════════════════════════════════════════════════
 Score: {score}/100 (average completeness: {completeness:.0f}%)
 {issue_summary}
+
+═══════════════════════════════════════════════════════
+DATA READINESS (maturity_classifications)
+═══════════════════════════════════════════════════════
+{_build_maturity_section(maturity, metadata)}
 
 ═══════════════════════════════════════════════════════
 YOUR TASK
@@ -589,7 +631,10 @@ async def _run_agent(
     # Safety net: track whether save_brd was called during this invocation
     _brd_tool_called: bool = False
     _brd_artifact_uploaded: bool = False
+    _transformation_phase_ran: bool = False
     _requirements_phase_ran: bool = False
+    _modeling_phase_ran: bool = False
+    _gold_layer_registered: bool = False
     # Safety net: track whether save_semantic_view was called during generation
     _yaml_tool_called: bool = False
     _generation_phase_ran: bool = False
@@ -605,7 +650,9 @@ async def _run_agent(
     # Phase tracking: detect subagent transitions
     _SUBAGENT_PHASE_MAP: dict[str, str] = {
         "discovery-agent": "discovery",
+        "transformation-agent": "prepare",
         "requirements-agent": "requirements",
+        "modeling-agent": "modeling",
         "generation-agent": "generation",
         "validation-agent": "validation",
         "publishing-agent": "publishing",
@@ -690,12 +737,63 @@ async def _run_agent(
                                     },
                                 })
 
+                    # Emit cached maturity tier for frontend phase stepper
+                    _cached_maturity = pipeline_results.get("maturity_classifications", {})
+                    if _cached_maturity:
+                        _cached_tiers = [info.get("maturity", "gold") for info in _cached_maturity.values()]
+                        if "bronze" in _cached_tiers:
+                            _cached_tier = "bronze"
+                        elif "silver" in _cached_tiers:
+                            _cached_tier = "silver"
+                        else:
+                            _cached_tier = "gold"
+                    else:
+                        _cached_tier = "gold"
+                    await queue.put({
+                        "type": "data_maturity",
+                        "data": {"tier": _cached_tier},
+                    })
+
                 # 3. Build human-readable summary for the LLM
                 actual_message = _build_discovery_summary(
                     pipeline_results, dp_info["name"], data_product_id,
                     dp_description=dp_info["description"],
                 )
                 logger.info("Pipeline complete, summary length: %d chars", len(actual_message))
+
+                # 4. Emit data maturity tier so frontend can adapt the phase stepper.
+                # Aggregate = minimum tier across all tables (conservative).
+                _maturity = pipeline_results.get("maturity_classifications", {})
+                if _maturity:
+                    _tiers = [info.get("maturity", "gold") for info in _maturity.values()]
+                    if "bronze" in _tiers:
+                        _aggregate_tier = "bronze"
+                    elif "silver" in _tiers:
+                        _aggregate_tier = "silver"
+                    else:
+                        _aggregate_tier = "gold"
+                else:
+                    _aggregate_tier = "gold"
+
+                await queue.put({
+                    "type": "data_maturity",
+                    "data": {"tier": _aggregate_tier},
+                })
+
+                # Persist to data_products.state JSONB for session recovery
+                try:
+                    from services.postgres import get_pool as _gp, execute as _ex
+                    _dp_pool = await _gp(_settings.database_url)
+                    await _ex(
+                        _dp_pool,
+                        """UPDATE data_products
+                           SET state = jsonb_set(COALESCE(state, '{}'::jsonb), '{data_tier}', $1::jsonb)
+                           WHERE id = $2::uuid""",
+                        f'"{_aggregate_tier}"',
+                        data_product_id,
+                    )
+                except Exception as _e:
+                    logger.warning("Failed to persist data_tier: %s", _e)
 
         # Langfuse tracing is now handled at the model level in services/llm.py
         # Each LLM call will be automatically traced with input/output
@@ -709,6 +807,11 @@ async def _run_agent(
 
         # --- Data isolation: scope tools to this data product's database ---
         from tools.snowflake_tools import set_data_isolation_context
+        from tools.postgres_tools import set_data_product_context
+
+        # Set data_product_id contextvar — ensures tools always use the correct UUID
+        # even if the LLM truncates or mangles the ID in tool call arguments.
+        set_data_product_context(data_product_id)
 
         dp_info_for_isolation = await _get_data_product_info(data_product_id)
         if dp_info_for_isolation:
@@ -957,8 +1060,12 @@ async def _run_agent(
                         _discovery_invocation_count += 1
                         if _discovery_invocation_count > 1:
                             _discovery_conversation_ran = True
+                    if phase_name == "transformation":
+                        _transformation_phase_ran = True
                     if phase_name == "requirements":
                         _requirements_phase_ran = True
+                    if phase_name == "modeling":
+                        _modeling_phase_ran = True
                     if phase_name == "generation":
                         _generation_phase_ran = True
                     if phase_name and phase_name != _current_phase:
@@ -969,6 +1076,8 @@ async def _run_agent(
                             "data": {"from": old_phase, "to": phase_name},
                         })
                         logger.info("Phase change: %s → %s (session %s)", old_phase, phase_name, session_id)
+                        # Persist current_phase to data_products.state
+                        await _persist_phase(data_product_id, phase_name)
 
                 # Skip tool_call event for internal `task` tool — phase_change events handle this
                 if tool_name != "task":
@@ -1004,6 +1113,11 @@ async def _run_agent(
                 if tool_name == "save_brd":
                     _brd_tool_called = True
                     logger.info("save_brd completed for session %s", session_id)
+
+                # Track register_gold_layer for modeling phase
+                if tool_name == "register_gold_layer":
+                    _gold_layer_registered = True
+                    logger.info("register_gold_layer completed for session %s", session_id)
 
                 # Track save_semantic_view for generation safety net
                 if tool_name == "save_semantic_view":
@@ -1059,202 +1173,13 @@ async def _run_agent(
                 "data": {"message": _sanitize_error_for_user(e)},
             })
     except Exception as e:
-        # Check if this is a transient LLM error that should trigger fallback
-        if _is_transient_llm_error(e):
-            logger.warning(
-                "Primary LLM failed with transient error for session %s: %s. Attempting fallback...",
-                session_id, e,
-            )
-            try:
-                from services.llm import get_fallback_chat_model
-                from agents.orchestrator import build_fallback_orchestrator
-
-                fallback_model = get_fallback_chat_model()
-                if fallback_model is None:
-                    logger.warning("No fallback LLM configured — surfacing original error")
-                    raise  # Re-raise original error
-
-                # Notify user via SSE
-                await queue.put({
-                    "type": "status",
-                    "data": {"message": "Switching to backup model..."},
-                })
-
-                # Rebuild orchestrator with fallback model (one-shot, doesn't affect cache)
-                fallback_graph = await build_fallback_orchestrator(fallback_model)
-                fallback_config = {
-                    "configurable": {"thread_id": session_id},
-                    "recursion_limit": _settings.agent_recursion_limit,
-                }
-
-                # Retry with fallback model — same checkpoint state
-                content = _build_multimodal_content(actual_message, file_contents)
-                fallback_input = {"messages": [HumanMessage(content=content)]}
-
-                # Reset gating flags for fallback retry.
-                # Mirror primary path: discovery pre-sets _inside_task = True (line 626)
-                # so orchestrator direct output flows through as a safety net.
-                # Non-discovery: orchestrator tokens are gated; only subagent tokens pass.
-                _inside_task = is_discovery
-                _subagent_completed = False
-
-                logger.info("Fallback: starting astream_events (session=%s, input_msg_len=%d)", session_id, len(str(fallback_input)))
-                _fallback_event_idx = 0
-                _iter = fallback_graph.astream_events(fallback_input, config=fallback_config, version="v2").__aiter__()
-                while True:
-                    try:
-                        event = await _iter.__anext__()
-                    except StopAsyncIteration:
-                        logger.info("Fallback: astream_events finished after %d events (session=%s)", _fallback_event_idx, session_id)
-                        break
-
-                    _fallback_event_idx += 1
-                    if _fallback_event_idx <= 3 or _fallback_event_idx % 100 == 0:
-                        logger.info("Fallback event #%d: %s (session=%s)", _fallback_event_idx, event.get("event", "?"), session_id)
-
-                    _stream_event_count += 1
-                    kind = event.get("event", "")
-                    data = event.get("data", {})
-
-                    if kind == "on_chat_model_stream":
-                        run_id = event.get("run_id", "")
-                        chunk = data.get("chunk")
-                        if chunk and hasattr(chunk, "content") and chunk.content:
-                            if run_id and run_id != _current_run_id:
-                                if _current_run_id is not None and current_assistant_content.strip():
-                                    _assistant_texts.append(current_assistant_content)
-                                    current_assistant_content = ""
-                                    await queue.put({"type": "message_done", "data": {"content": ""}})
-                                _current_run_id = run_id
-
-                            # Gate: only emit tokens from subagent runs (same as primary path)
-                            if not _inside_task:
-                                _stream_gated_out += 1
-                                continue
-
-                            content_text = chunk.content
-                            if isinstance(content_text, list):
-                                text_parts = [
-                                    block.get("text", "") if isinstance(block, dict) else str(block)
-                                    for block in content_text
-                                ]
-                                content_text = "".join(text_parts)
-
-                            current_assistant_content += content_text
-
-                            # Suppress [INTERNAL] sections that LLMs sometimes leak
-                            if "[INTERNAL" in current_assistant_content:
-                                continue
-
-                            _stream_token_count += 1
-                            await queue.put({"type": "token", "data": {"content": content_text}})
-
-                    elif kind == "on_tool_start":
-                        tool_name = event.get("name", "unknown")
-                        tool_input = data.get("input", {})
-                        if tool_name == "task" and isinstance(tool_input, dict):
-                            _stream_task_calls += 1
-                            _inside_task = True
-                            _subagent_completed = False
-                            subagent_type = tool_input.get("subagent_type", "")
-                            logger.info(
-                                "Fallback task() call #%d: subagent=%s (session=%s)",
-                                _stream_task_calls, subagent_type, session_id,
-                            )
-                            # Track phase-specific flags (same as primary path)
-                            phase_name = _SUBAGENT_PHASE_MAP.get(subagent_type)
-                            if phase_name == "discovery":
-                                _discovery_invocation_count += 1
-                                if _discovery_invocation_count > 1:
-                                    _discovery_conversation_ran = True
-                            if phase_name == "requirements":
-                                _requirements_phase_ran = True
-                            if phase_name == "generation":
-                                _generation_phase_ran = True
-                            if phase_name and phase_name != _current_phase:
-                                old_phase = _current_phase
-                                _current_phase = phase_name
-                                await queue.put({
-                                    "type": "phase_change",
-                                    "data": {"from": old_phase, "to": phase_name},
-                                })
-                                logger.info("Fallback phase change: %s → %s (session %s)", old_phase, phase_name, session_id)
-                        else:
-                            logger.info(
-                                "Fallback tool_start: %s (session=%s, inside_task=%s)",
-                                tool_name, session_id, _inside_task,
-                            )
-                        # Emit tool_call SSE event for non-task tools (shows "Working" badges)
-                        if tool_name != "task":
-                            await queue.put({
-                                "type": "tool_call",
-                                "data": {
-                                    "tool": tool_name,
-                                    "input": tool_input if isinstance(tool_input, dict) else str(tool_input),
-                                },
-                            })
-                        if tool_name == "upload_artifact" and isinstance(tool_input, dict):
-                            art_type = tool_input.get("artifact_type", "")
-                            art_filename = tool_input.get("filename", "")
-                            if "data-description" in art_filename.lower() and art_type != "data_description":
-                                art_type = "data_description"
-                            if art_type == "brd":
-                                _brd_artifact_uploaded = True
-                            if art_type:
-                                _ARTIFACT_TYPE_MAP = {"quality_report": "data_quality"}
-                                mapped_type = _ARTIFACT_TYPE_MAP.get(art_type, art_type)
-                                await queue.put({
-                                    "type": "artifact",
-                                    "data": {"artifact_id": str(uuid4()), "artifact_type": mapped_type},
-                                })
-                                logger.info("Fallback emitted artifact event: type=%s", mapped_type)
-                    elif kind == "on_tool_end":
-                        tool_name = event.get("name", "unknown")
-                        if tool_name == "save_brd":
-                            _brd_tool_called = True
-                            logger.info("Fallback save_brd completed for session %s", session_id)
-                        if tool_name == "save_semantic_view":
-                            _yaml_tool_called = True
-                            logger.info("Fallback save_semantic_view completed for session %s", session_id)
-                        if tool_name == "save_data_description":
-                            _dd_tool_called = True
-                            logger.info("Fallback save_data_description completed for session %s", session_id)
-                        if tool_name == "build_erd_from_description":
-                            _erd_build_called = True
-                            logger.info("Fallback build_erd_from_description completed for session %s", session_id)
-                        if tool_name == "task":
-                            _inside_task = False
-                            _subagent_completed = True
-                            logger.info("Fallback subagent completed for session %s", session_id)
-
-                logger.info(
-                    "Fallback LLM completed for session %s (tokens=%d, task_calls=%d, gated_out=%d)",
-                    session_id, _stream_token_count, _stream_task_calls, _stream_gated_out,
-                )
-
-            except Exception as fallback_err:
-                if fallback_err is e:
-                    # Re-raised original error (no fallback configured)
-                    logger.exception("Agent execution failed for session %s: %s", session_id, e)
-                    await queue.put({
-                        "type": "error",
-                        "data": {"message": _sanitize_error_for_user(e)},
-                    })
-                else:
-                    logger.exception(
-                        "Fallback LLM also failed for session %s: %s (original: %s)",
-                        session_id, fallback_err, e,
-                    )
-                    await queue.put({
-                        "type": "error",
-                        "data": {"message": _sanitize_error_for_user(fallback_err)},
-                    })
-        else:
-            logger.exception("Agent execution failed for session %s: %s", session_id, e)
-            await queue.put({
-                "type": "error",
-                "data": {"message": _sanitize_error_for_user(e)},
-            })
+        # LiteLLM Router handles retries and fallback automatically when enabled.
+        # Just log and emit the error to the user.
+        logger.exception("Agent execution failed for session %s: %s", session_id, e)
+        await queue.put({
+            "type": "error",
+            "data": {"message": _sanitize_error_for_user(e)},
+        })
 
     finally:
         # Flush any remaining dedup buffer from the last run
@@ -1441,12 +1366,13 @@ async def _run_agent(
             for text in _assistant_texts:
                 if '"tables"' in text and ('"facts"' in text or '"dimensions"' in text):
                     try:
-                        from agents.generation import extract_json_from_text, assemble_semantic_view_yaml, build_table_metadata, _build_fqn_sample_values
+                        from agents.generation import extract_json_from_text, assemble_semantic_view_yaml, build_table_metadata, _build_fqn_sample_values, build_working_layer_map
                         structure = extract_json_from_text(text)
                         if structure and "tables" in structure:
                             meta = await build_table_metadata(data_product_id, structure)
                             sv_map = await _build_fqn_sample_values(data_product_id)
-                            yaml_content = assemble_semantic_view_yaml(structure, table_metadata=meta, sample_values_map=sv_map)
+                            wl_map = await build_working_layer_map(data_product_id)
+                            yaml_content = assemble_semantic_view_yaml(structure, table_metadata=meta, sample_values_map=sv_map, working_layer_map=wl_map)
                             break
                     except Exception as e:
                         logger.warning("Generation safety net: failed to assemble YAML from JSON: %s", e)
@@ -1528,6 +1454,17 @@ async def _run_agent(
             logger.info("Updated data product %s with session_id %s", data_product_id, session_id)
         except Exception as e:
             logger.warning("Failed to update data product session_id: %s", e)
+
+        # Transition to explorer phase ONLY when the full pipeline completed
+        # (i.e. publishing was the last active phase). Otherwise the stepper
+        # incorrectly shows all phases as completed when pausing mid-pipeline.
+        if _current_phase == "publishing":
+            await queue.put({
+                "type": "phase_change",
+                "data": {"from": _current_phase, "to": "explorer"},
+            })
+            logger.info("Phase change: %s → explorer (session %s, stream end)", _current_phase, session_id)
+            await _persist_phase(data_product_id, "explorer")
 
         # Signal stream end
         await queue.put({
@@ -1695,6 +1632,10 @@ async def _run_agent_from_checkpoint(
         from agents.orchestrator import get_orchestrator
         from langchain_core.messages import RemoveMessage
         from tools.snowflake_tools import set_data_isolation_context
+        from tools.postgres_tools import set_data_product_context
+
+        # Set data_product_id contextvar for tools
+        set_data_product_context(data_product_id)
 
         # Set up data isolation
         dp_info = await _get_data_product_info(data_product_id)
@@ -1902,20 +1843,27 @@ async def _infer_phase(session_id: str, all_messages: list) -> str:
       create_cortex_agent / grant_agent_access → explorer (publishing done)
       update_validation_status                 → publishing (validation done)
       save_semantic_view                       → generation (YAML generated)
+      register_gold_layer / save_data_catalog  → modeling (Gold layer done)
       save_brd                                 → requirements (BRD done)
+      register_transformed_layer               → transformation (Silver done)
       otherwise                                → discovery
     """
     phase_rank = {
         "discovery": 0,
-        "requirements": 1,
-        "generation": 2,
-        "publishing": 3,
-        "explorer": 4,
+        "transformation": 1,
+        "requirements": 2,
+        "modeling": 3,
+        "generation": 4,
+        "publishing": 5,
+        "explorer": 6,
     }
     tool_to_phase = {
         "save_data_description": "discovery",
         "build_erd_from_description": "discovery",
+        "register_transformed_layer": "transformation",
         "save_brd": "requirements",
+        "register_gold_layer": "modeling",
+        "save_data_catalog": "modeling",
         "save_semantic_view": "generation",
         "update_validation_status": "publishing",
         "create_cortex_agent": "explorer",
@@ -1925,7 +1873,31 @@ async def _infer_phase(session_id: str, all_messages: list) -> str:
     best_phase = "discovery"
     best_rank = 0
 
-    # 1. Scan checkpoint messages for tool calls
+    # 1. Check persisted current_phase in data_products.state (most reliable,
+    #    updated by _persist_phase on every phase transition).
+    dp_published = False
+    try:
+        from services import postgres as pg_service
+        pool = pg_service._pool
+        dp_rows = await pg_service.query(
+            pool,
+            "SELECT id, state->>'current_phase' AS persisted_phase, (state->>'published')::boolean AS published FROM data_products WHERE state->>'session_id' = $1 LIMIT 1",
+            session_id,
+        )
+        if dp_rows:
+            dp_id = str(dp_rows[0]["id"])
+            dp_published = bool(dp_rows[0].get("published"))
+            persisted = dp_rows[0].get("persisted_phase")
+            if persisted and persisted in phase_rank:
+                p_rank = phase_rank[persisted]
+                if p_rank > best_rank:
+                    best_phase = persisted
+                    best_rank = p_rank
+    except Exception as e:
+        logger.warning("Phase inference persisted-phase lookup failed: %s", e)
+        dp_id = None
+
+    # 2. Scan checkpoint messages for tool calls
     for msg in all_messages:
         tool_calls = getattr(msg, "tool_calls", None) or []
         for tc in tool_calls:
@@ -1935,22 +1907,22 @@ async def _infer_phase(session_id: str, all_messages: list) -> str:
                 best_phase = mapped
                 best_rank = phase_rank[mapped]
 
-    # 2. If checkpoint alone suggests early phase, cross-check with database
-    #    (covers truncated checkpoints from service restarts/testing)
-    if best_rank < phase_rank["generation"]:
+    # 3. Cross-check with database artifacts unless we already know we're at
+    #    explorer (covers truncated checkpoints, manual publishing, restarts).
+    if best_rank < phase_rank["explorer"]:
         try:
             from services import postgres as pg_service
             pool = pg_service._pool
 
-            # Look up data_product_id from session_id
-            dp_rows = await pg_service.query(
-                pool,
-                "SELECT id FROM data_products WHERE state->>'session_id' = $1 LIMIT 1",
-                session_id,
-            )
-            if dp_rows:
-                dp_id = str(dp_rows[0]["id"])
+            if not dp_id:
+                dp_rows = await pg_service.query(
+                    pool,
+                    "SELECT id FROM data_products WHERE state->>'session_id' = $1 LIMIT 1",
+                    session_id,
+                )
+                dp_id = str(dp_rows[0]["id"]) if dp_rows else None
 
+            if dp_id:
                 # Check for semantic views (most definitive)
                 sv_rows = await pg_service.query(
                     pool,
@@ -1960,30 +1932,48 @@ async def _infer_phase(session_id: str, all_messages: list) -> str:
                 if sv_rows:
                     status = sv_rows[0].get("validation_status")
                     if status == "valid":
-                        # Check if Cortex Agent was also created (artifacts with type 'yaml' after validation)
-                        # Use audit_logs or just assume publishing since we have valid yaml
-                        log_rows = await pg_service.query(
-                            pool,
-                            "SELECT 1 FROM audit_logs WHERE data_product_id = $1::uuid AND action_type = 'publish' LIMIT 1",
-                            dp_id,
-                        )
-                        if log_rows:
-                            best_phase = "explorer"
+                        # Check audit log OR state.published flag (covers manual publishing)
+                        if dp_published:
+                            db_phase = "explorer"
                         else:
-                            best_phase = "publishing"
+                            log_rows = await pg_service.query(
+                                pool,
+                                "SELECT 1 FROM audit_logs WHERE data_product_id = $1::uuid AND action_type = 'publish' LIMIT 1",
+                                dp_id,
+                            )
+                            if log_rows:
+                                db_phase = "explorer"
+                            else:
+                                db_phase = "publishing"
                     elif status == "invalid":
-                        best_phase = "generation"
+                        db_phase = "generation"
                     else:
-                        best_phase = "generation"
+                        db_phase = "generation"
                 else:
-                    # No semantic view — check for BRD
-                    brd_rows = await pg_service.query(
+                    # No semantic view — check for Gold layer (data_catalog table)
+                    catalog_rows = await pg_service.query(
                         pool,
-                        "SELECT 1 FROM business_requirements WHERE data_product_id = $1::uuid LIMIT 1",
+                        "SELECT 1 FROM data_catalog WHERE data_product_id = $1::uuid LIMIT 1",
                         dp_id,
                     )
-                    if brd_rows:
-                        best_phase = "requirements"
+                    if catalog_rows:
+                        db_phase = "modeling"
+                    else:
+                        # No Gold layer — check for BRD
+                        brd_rows = await pg_service.query(
+                            pool,
+                            "SELECT 1 FROM business_requirements WHERE data_product_id = $1::uuid LIMIT 1",
+                            dp_id,
+                        )
+                        if brd_rows:
+                            db_phase = "requirements"
+                        else:
+                            db_phase = None
+
+                # Only promote, never demote
+                if db_phase and phase_rank.get(db_phase, 0) > best_rank:
+                    best_phase = db_phase
+                    best_rank = phase_rank[db_phase]
         except Exception as e:
             logger.warning("Phase inference DB fallback failed: %s", e)
 

@@ -26,6 +26,7 @@ STEPS = [
     {"key": "metadata", "label": "Reading data structure"},
     {"key": "profiling", "label": "Analyzing data patterns"},
     {"key": "classification", "label": "Classifying data"},
+    {"key": "maturity", "label": "Classifying data maturity"},
     {"key": "quality", "label": "Checking data quality"},
     {"key": "artifacts", "label": "Saving quality report"},
 ]
@@ -169,12 +170,17 @@ async def run_discovery_pipeline(
         await _emit(queue, "classification", STEPS[2]["label"],
                      "completed", "Done", 1, 1, 2)
 
-        # Step 4: Quality score --------------------------------------------
-        results["quality"] = _step_quality(results)
-        await _emit(queue, "quality", STEPS[3]["label"],
-                     "completed", "Done", 1, 1, 3)
+        # Step 4: Data maturity classification -----------------------------
+        results["maturity_classifications"] = await _step_classify_maturity(
+            queue, results["profiles"], results["metadata"],
+        )
 
-        # Step 5: Artifact persistence (quality report only) ---------------
+        # Step 5: Quality score --------------------------------------------
+        results["quality"] = _step_quality(results)
+        await _emit(queue, "quality", STEPS[4]["label"],
+                     "completed", "Done", 1, 1, 4)
+
+        # Step 6: Artifact persistence (quality report only) ---------------
         results["artifacts"] = await _step_artifacts(
             queue, data_product_id, results,
         )
@@ -547,6 +553,84 @@ def _step_classification(
     return classifications
 
 
+_DUP_CHECK_LIMIT = 10_000  # Row limit for duplicate rate estimation
+
+
+async def _compute_duplicate_rate(fqn: str) -> float:
+    """Compute approximate duplicate row rate for a table.
+
+    Returns a float between 0.0 (no duplicates) and 1.0 (all duplicates).
+    Uses HASH(*) over a 10K-row sample for speed.
+    """
+    from services.snowflake import execute_query
+    from tools.snowflake_tools import _validate_fqn, _quoted_fqn
+
+    parts, err = _validate_fqn(fqn)
+    if err:
+        return 0.0
+
+    quoted = _quoted_fqn(parts)
+
+    try:
+        sql = (
+            f"SELECT COUNT(*) AS total, COUNT(DISTINCT HASH(*)) AS distinct_hashes "
+            f"FROM (SELECT * FROM {quoted} LIMIT {_DUP_CHECK_LIMIT}) AS _dup_sample"
+        )
+        result = await execute_query(sql)
+        if not result:
+            return 0.0
+        row = result[0]
+        total = row.get("TOTAL", 0) or 0
+        distinct = row.get("DISTINCT_HASHES", 0) or 0
+        if total == 0:
+            return 0.0
+        return max(0.0, 1.0 - distinct / total)
+    except Exception as e:
+        logger.warning("Duplicate rate check failed for %s: %s", fqn, e)
+        return 0.0
+
+
+async def _step_classify_maturity(
+    queue: asyncio.Queue[dict | None],
+    profiles: list[dict[str, Any]],
+    metadata: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Step 4: Classify data maturity (bronze/silver/gold) per table."""
+    step_idx = 3
+    total = len(profiles)
+    await _emit(queue, "maturity", STEPS[step_idx]["label"],
+                "running", "Analyzing data maturity...", 0, total, step_idx)
+
+    from agents.discovery import classify_data_maturity
+
+    classifications: dict[str, dict[str, Any]] = {}
+
+    for i, profile in enumerate(profiles):
+        if profile.get("error"):
+            continue
+        fqn = profile.get("table", "")
+        columns = profile.get("columns", [])
+        if not columns:
+            continue
+
+        table_name = fqn.split(".")[-1] if "." in fqn else fqn
+        await _emit(queue, "maturity", STEPS[step_idx]["label"],
+                    "running", f"Classifying {table_name} ({i + 1} of {total})",
+                    i, total, step_idx)
+
+        # Compute duplicate rate (the only signal that needs SQL)
+        dup_rate = await _compute_duplicate_rate(fqn)
+
+        # Use the shared classification function from discovery.py
+        result = classify_data_maturity(columns, duplicate_rate=dup_rate)
+        classifications[fqn] = result
+
+    await _emit(queue, "maturity", STEPS[step_idx]["label"],
+                "completed", f"{len(classifications)} tables classified",
+                total, total, step_idx)
+    return classifications
+
+
 def _step_fk_inference(
     metadata: list[dict[str, Any]],
     profiles: list[dict[str, Any]],
@@ -776,8 +860,8 @@ async def _step_artifacts(
     data_product_id: str,
     results: dict[str, Any],
 ) -> dict[str, Any]:
-    """Step 5: Persist quality report to PostgreSQL + MinIO (Phase 1 only)."""
-    step_idx = 4
+    """Step 6: Persist quality report to PostgreSQL + MinIO (Phase 1 only)."""
+    step_idx = 5
     await _emit(queue, "artifacts", STEPS[step_idx]["label"],
                 "running", "Saving quality report...", 0, 1, step_idx)
 

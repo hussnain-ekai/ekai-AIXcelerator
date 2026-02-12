@@ -112,6 +112,12 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   get_latest_semantic_view: 'Loading semantic model',
   update_validation_status: 'Updating status',
   get_latest_brd: 'Loading requirements',
+  // Transformation agent tools
+  profile_source_table: 'Profiling source table',
+  generate_dynamic_table_ddl: 'Generating transformation',
+  execute_transformation_ddl: 'Applying transformation',
+  validate_transformation: 'Validating transformation',
+  register_transformed_layer: 'Registering data layer',
 };
 
 function getToolDisplayName(toolName: string): string {

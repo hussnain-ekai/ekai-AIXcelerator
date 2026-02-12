@@ -860,28 +860,54 @@ def validate_semantic_view_yaml(yaml_content: str, target_schema: str) -> str:
     if not yaml_content or not yaml_content.strip():
         return _tool_error("validate_semantic_view_yaml", "yaml_content cannot be empty")
 
+    # Safety: extract actual DATABASE.SCHEMA from the YAML's base_table to avoid
+    # LLM-invented schema names (e.g. gpt-5-mini sent "SEMANTIC_VALIDATION")
+    import yaml as _check_yaml
+    try:
+        _check_parsed = _check_yaml.safe_load(yaml_content)
+        if isinstance(_check_parsed, dict) and _check_parsed.get("tables"):
+            _bt = _check_parsed["tables"][0].get("base_table", {})
+            _real_db = _bt.get("database", "")
+            _real_schema = _bt.get("schema", "")
+            if _real_db and _real_schema:
+                _real_target = f"{_real_db}.{_real_schema}"
+                if _real_target.upper() != target_schema.upper():
+                    logger.warning(
+                        "validate_semantic_view_yaml: overriding LLM target_schema %r with %r from YAML",
+                        target_schema, _real_target,
+                    )
+                    target_schema = _real_target
+                    schema_parts = target_schema.split(".")
+    except Exception:
+        pass  # Fall through with original target_schema
+
     # Guard: if LLM passed truncated/summarized YAML (missing tables section),
     # auto-fetch the latest version from the database instead.
     import yaml as _yaml
     if "tables:" not in yaml_content:
         logger.warning("validate_semantic_view_yaml: yaml_content has no 'tables:' section (%d chars) — LLM likely passed truncated content. Auto-fetching from DB.", len(yaml_content))
         try:
-            import psycopg2
-            from config import get_settings as _get_settings
-            _s = _get_settings()
-            _db_url = _s.database_url
-            if _db_url.startswith("postgres://"):
-                _db_url = "postgresql://" + _db_url[len("postgres://"):]
-            with psycopg2.connect(_db_url) as _conn:
-                with _conn.cursor() as _cur:
-                    _cur.execute(
-                        "SELECT yaml_content FROM semantic_views WHERE yaml_content LIKE %s ORDER BY created_at DESC LIMIT 1",
-                        (f"%{schema_parts[0]}.{schema_parts[1]}%",),
+            import asyncpg, os, asyncio
+
+            async def _fetch_latest_yaml() -> str | None:
+                db_url = os.environ.get("DATABASE_URL", "")
+                if not db_url:
+                    return None
+                conn = await asyncpg.connect(db_url)
+                try:
+                    row = await conn.fetchrow(
+                        "SELECT yaml_content FROM semantic_views "
+                        "WHERE yaml_content LIKE $1 ORDER BY created_at DESC LIMIT 1",
+                        f"%{schema_parts[0]}.{schema_parts[1]}%",
                     )
-                    _row = _cur.fetchone()
-                    if _row and _row[0]:
-                        yaml_content = _row[0]
-                        logger.info("validate_semantic_view_yaml: auto-fetched %d chars from DB (matched schema %s)", len(yaml_content), target_schema)
+                    return row["yaml_content"] if row else None
+                finally:
+                    await conn.close()
+
+            fetched = asyncio.run(_fetch_latest_yaml())
+            if fetched:
+                yaml_content = fetched
+                logger.info("validate_semantic_view_yaml: auto-fetched %d chars from DB (matched schema %s)", len(yaml_content), target_schema)
         except Exception as fetch_err:
             logger.warning("validate_semantic_view_yaml: auto-fetch failed: %s", fetch_err)
 

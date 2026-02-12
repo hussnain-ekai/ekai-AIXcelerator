@@ -5,7 +5,7 @@ import { connectSSE } from '@/lib/sse';
 import type { SSEHandlers } from '@/lib/sse';
 import { api } from '@/lib/api';
 import { useChatStore, useChatStoreApi } from '@/stores/chatStoreProvider';
-import type { AgentPhase, ArtifactType, ChatMessageAttachment } from '@/stores/chatStore';
+import type { AgentPhase, ArtifactType, ChatMessageAttachment, DataTier } from '@/stores/chatStore';
 
 interface AgentResponse {
   session_id: string;
@@ -54,6 +54,7 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
   const addArtifact = useChatStore((s) => s.addArtifact);
   const setPipelineProgress = useChatStore((s) => s.setPipelineProgress);
   const setPipelineRunning = useChatStore((s) => s.setPipelineRunning);
+  const setDataTier = useChatStore((s) => s.setDataTier);
   const sessionId = useChatStore((s) => s.sessionId);
 
   const connectToStream = useCallback(
@@ -95,7 +96,9 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
           if (to === prevPhase) return;
 
           const PHASE_LABELS: Record<string, string> = {
+            prepare: 'Preparing your data for modeling...',
             requirements: 'Moving on to capture your business requirements...',
+            modeling: 'Designing your analytical data model...',
             generation: 'Generating your semantic model...',
             validation: 'Validating the semantic model against your data...',
             publishing: 'Preparing to publish your model...',
@@ -130,6 +133,9 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
             content: description,
             timestamp: new Date().toISOString(),
           });
+        },
+        onDataMaturity: (tier: string) => {
+          setDataTier(tier as DataTier);
         },
         onStatus: (message: string) => {
           if (message) {
@@ -228,6 +234,7 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
       addArtifact,
       setPipelineProgress,
       setPipelineRunning,
+      setDataTier,
     ],
   );
 

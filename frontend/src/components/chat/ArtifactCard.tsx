@@ -7,6 +7,11 @@ import CodeIcon from '@mui/icons-material/Code';
 import DescriptionIcon from '@mui/icons-material/Description';
 import TableChartIcon from '@mui/icons-material/TableChart';
 import LibraryBooksIcon from '@mui/icons-material/LibraryBooks';
+import StorageIcon from '@mui/icons-material/Storage';
+import MenuBookIcon from '@mui/icons-material/MenuBook';
+import SpeedIcon from '@mui/icons-material/Speed';
+import VerifiedIcon from '@mui/icons-material/Verified';
+import AccountTreeIcon from '@mui/icons-material/AccountTree';
 import type { ArtifactType } from '@/stores/chatStore';
 
 interface ArtifactCardProps {
@@ -18,13 +23,18 @@ interface ArtifactCardProps {
 
 const GOLD = '#D4A843';
 
-const ARTIFACT_META: Record<ArtifactType, { icon: typeof SchemaIcon; label: string; description: string }> = {
+const ARTIFACT_META: Partial<Record<ArtifactType, { icon: typeof SchemaIcon; label: string; description: string }>> = {
   erd: { icon: SchemaIcon, label: 'ERD Diagram', description: 'Entity-relationship diagram of discovered tables' },
   data_quality: { icon: AssessmentIcon, label: 'Data Quality Report', description: 'Source data health assessment' },
   yaml: { icon: CodeIcon, label: 'Semantic View YAML', description: 'Generated semantic model definition' },
   brd: { icon: DescriptionIcon, label: 'Business Requirements', description: 'Structured requirements document' },
   data_preview: { icon: TableChartIcon, label: 'Data Preview', description: 'Sample query results' },
   data_description: { icon: LibraryBooksIcon, label: 'Data Description', description: 'Business context and domain analysis' },
+  data_catalog: { icon: StorageIcon, label: 'Data Catalog', description: 'Gold layer table and column documentation' },
+  business_glossary: { icon: MenuBookIcon, label: 'Business Glossary', description: 'Business term definitions and mappings' },
+  metrics: { icon: SpeedIcon, label: 'Metrics & KPIs', description: 'Metric definitions with formulas and calculations' },
+  validation_rules: { icon: VerifiedIcon, label: 'Validation Rules', description: 'Data quality and integrity rules' },
+  lineage: { icon: AccountTreeIcon, label: 'Data Lineage', description: 'Source to Gold layer data flow' },
 };
 
 export function ArtifactCard({ type, title, description, onClick }: ArtifactCardProps): React.ReactNode {

@@ -113,6 +113,114 @@ def detect_primary_key(column_profile: dict[str, Any], row_count: int) -> bool:
     return uniqueness_ratio >= _get_uniqueness_threshold()
 
 
+def _compute_naming_score(column_names: list[str]) -> float:
+    """Score column naming conventions (0.0 = poor, 1.0 = excellent).
+
+    Positive: UPPER_SNAKE_CASE (Snowflake convention), lower_snake_case.
+    Negative: camelCase, generic prefixes (col_, raw_, sys_, src_, tmp_).
+    """
+    if not column_names:
+        return 0.5  # neutral
+
+    snake_re = re.compile(r"^[a-z][a-z0-9]*(_[a-z0-9]+)*$")
+    upper_re = re.compile(r"^[A-Z][A-Z0-9]*(_[A-Z0-9]+)*$")
+    camel_re = re.compile(r"^[a-z]+[A-Z]")
+    bad_prefixes = ("col_", "raw_", "sys_", "src_", "tmp_", "x_", "xx_")
+
+    total = len(column_names)
+    score_sum = 0.0
+
+    for name in column_names:
+        col_score = 0.5  # baseline
+        if upper_re.match(name):
+            col_score = 1.0  # Snowflake standard
+        elif snake_re.match(name):
+            col_score = 0.9  # Good convention
+        elif camel_re.match(name):
+            col_score = 0.3  # Unusual for data
+
+        if name.lower().startswith(bad_prefixes):
+            col_score -= 0.3
+
+        score_sum += max(0.0, min(1.0, col_score))
+
+    return round(score_sum / total, 2)
+
+
+def classify_data_maturity(
+    columns: list[dict[str, Any]],
+    duplicate_rate: float = 0.0,
+) -> dict[str, Any]:
+    """Classify data maturity for a single table as bronze/silver/gold.
+
+    Used by the discovery pipeline and transformation agent tools.
+
+    Args:
+        columns: Profile column dicts with data_type, null_pct, is_likely_pk,
+                 and column (or name) fields.
+        duplicate_rate: Pre-computed duplicate row rate (0.0–1.0).
+
+    Returns:
+        Dict with maturity level, composite score, and individual signals.
+    """
+    total_cols = len(columns)
+    if total_cols == 0:
+        return {"maturity": "bronze", "score": 0.0, "signals": {}}
+
+    varchar_types = {"TEXT", "VARCHAR", "STRING", "VARIANT", "OBJECT", "ARRAY"}
+    nested_types = {"VARIANT", "OBJECT", "ARRAY"}
+
+    varchar_count = sum(
+        1 for c in columns
+        if c.get("data_type", "").upper() in varchar_types
+    )
+    varchar_ratio = varchar_count / total_cols
+
+    null_pcts = [c.get("null_pct", 0) for c in columns]
+    avg_null_pct = sum(null_pcts) / len(null_pcts) if null_pcts else 0
+
+    col_names = [c.get("column", c.get("name", "")) for c in columns]
+    naming_score = _compute_naming_score(col_names)
+
+    pk_candidates = [c for c in columns if c.get("is_likely_pk", False)]
+    pk_confidence = 1.0 if pk_candidates else 0.0
+
+    nested_count = sum(
+        1 for c in columns
+        if c.get("data_type", "").upper() in nested_types
+    )
+
+    # Composite score (0–100), weighted by importance
+    score = (
+        (1 - varchar_ratio) * 25
+        + (1 - min(avg_null_pct / 100, 1.0)) * 20
+        + (1 - min(duplicate_rate, 1.0)) * 15
+        + naming_score * 15
+        + pk_confidence * 15
+        + (1 - min(nested_count / 5, 1.0)) * 10
+    )
+
+    if score >= 80:
+        maturity = "gold"
+    elif score >= 50:
+        maturity = "silver"
+    else:
+        maturity = "bronze"
+
+    return {
+        "maturity": maturity,
+        "score": round(score, 1),
+        "signals": {
+            "varchar_ratio": round(varchar_ratio, 2),
+            "avg_null_pct": round(avg_null_pct, 1),
+            "duplicate_rate": round(duplicate_rate, 3),
+            "naming_score": round(naming_score, 2),
+            "pk_confidence": pk_confidence,
+            "nested_col_count": nested_count,
+        },
+    }
+
+
 def classify_table(table_name: str, column_names: list[str], row_count: int) -> str:
     """Classify a table as FACT or DIMENSION based on naming and structure.
 

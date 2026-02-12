@@ -44,7 +44,14 @@ CREATE TYPE artifact_type AS ENUM (
     'brd',
     'quality_report',
     'document',
-    'export'
+    'export',
+    'data_description',
+    'data_catalog',
+    'business_glossary',
+    'metrics_definitions',
+    'metrics',
+    'validation_rules',
+    'lineage'
 );
 
 CREATE TYPE extraction_status AS ENUM (

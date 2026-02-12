@@ -3,7 +3,7 @@
 import { useEffect, useRef } from 'react';
 import { api } from '@/lib/api';
 import { useChatStore, useChatStoreApi } from '@/stores/chatStoreProvider';
-import type { ChatMessage, AgentPhase } from '@/stores/chatStore';
+import type { ChatMessage, AgentPhase, DataTier } from '@/stores/chatStore';
 import type { DataProduct } from '@/hooks/useDataProducts';
 
 interface HistoryResponse {
@@ -117,8 +117,9 @@ function useSessionRecovery(dataProduct: DataProduct | undefined): UseSessionRec
 
           // Determine phase from response or data product
           const phase = (response.phase ?? dataProduct?.state?.current_phase ?? 'idle') as AgentPhase;
+          const dataTier = (dataProduct?.state?.data_tier ?? null) as DataTier;
 
-          hydrateFromHistory(chatMessages, storedSessionId, phase);
+          hydrateFromHistory(chatMessages, storedSessionId, phase, dataTier);
         } else {
           // No messages in history — clear any stale messages from previous product
           storeApi.getState().clearMessages();

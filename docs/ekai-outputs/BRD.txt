@@ -1,0 +1,132 @@
+Business Requirements Document: Renewable Project Pipeline Tracker
+
+1. Executive Summary
+
+1.1 Business Problem
+
+Business development teams currently lack a consolidated, forward-looking view of the renewable energy market. Identifying emerging markets and forecasting future capacity additions is difficult without a centralized list of projects that are in the development pipeline but not yet operational. This lack of visibility risks missing market entry opportunities before competitors establish a presence.
+
+1.2 Proposed Solution
+
+Development of a "Renewable Project Pipeline Tracker." This solution will provide a list of all proposed solar, wind, and storage projects across the country that are awaiting construction. It will enable the business to identify emerging geographic markets and forecast future capacity additions by technology type.
+
+2. Business Context
+
+2.1 Business Drivers
+
+Market Identification: Ability to spot states and counties with high volumes of proposed activity.
+Capacity Forecasting: Accurate estimation of future megawatts (MW) coming online.
+Competitive Intelligence: Visibility into the pre-operational landscape.
+2.2 Core Business Concepts (Glossary)
+
+The following terms define the semantic layer of the pipeline tracker:
+
+Renewable Project Pipeline: A collection of all proposed renewable energy projects awaiting construction to identify emerging markets and forecast future capacity.
+Proposed Project: A renewable energy project that has been planned but is awaiting construction and has not yet become operational (Status must equal 'proposed').
+Operational Status: The current state of a generator project indicating whether it is proposed, operational, retired, or in another status.
+Generator Identifier (Project ID): A unique identifier assigned to each proposed renewable energy project in the pipeline.
+Plant Identifier (EIA ID): The EIA assigned identifier for a power plant facility; used to link generators to location data.
+Plant Name: The human-readable name or facility name of a power plant.
+Plant Location: The geographic location of a renewable energy facility identified by state and county.
+Prime Mover: The technology type or equipment that generates electricity (PV, WT, BA, FW, CE, CP).
+Energy Source: The primary fuel or natural resource used (e.g., SUN, WND, MWH).
+Planned Capacity: The expected megawatt (MW) output of a proposed renewable energy project when it becomes operational.
+Planned Online Date: The expected date when a proposed renewable energy project will become operational.
+Wind Turbine (WT): Wind energy technology that converts wind kinetic energy into electricity.
+Photovoltaic (PV): Solar technology that converts sunlight directly into electricity using semiconductor materials.
+DC Capacity: The direct current (DC) capacity measured in megawatts for solar photovoltaic projects.
+Concentrated Solar Power (CP): Solar technology that uses mirrors or lenses to concentrate sunlight to generate heat and electricity.
+Battery Storage (BA): Energy storage technology using battery systems to store electrical energy.
+Flywheel (FW): Energy storage technology that stores energy in a rotating mass.
+Compressed Air Energy Storage (CE): Storage technology that compresses air for later expansion.
+Snapshot: A point-in-time view of data representing the state of information at a specific date.
+Refresh: The frequency at which the dataset is updated (Monthly).
+2.3 Key Metrics & Formulae
+
+State Pipeline Total: Total planned capacity in megawatts for all proposed renewable projects grouped by state.
+Formula: SUM(capacity_mw) GROUP BY state
+Technology Pipeline Total: Total planned capacity in megawatts for all proposed renewable projects grouped by technology type.
+Formula: SUM(capacity_mw) GROUP BY prime_mover_code
+Project Count by State: Count of distinct proposed renewable energy projects grouped by state.
+Formula: COUNT(DISTINCT generator_id) GROUP BY state
+Planned Capacity: Measurement of expected output.
+Solar DC Capacity: Measurement of DC capacity (Specific to Solar PV).
+3. Data Quality Rules
+
+The following rules must be applied to ensure the integrity of the Pipeline Tracker.
+
+3.1 Grain Determination & Status Scope
+
+Grain: Entity. The dataset must represent one row per unique Project (generator_id) per reporting period (report_date).
+Proposed Status Filter (Critical): Only projects with operational_status equal to 'proposed' are included. This is the defining constraint of the "Pipeline."
+Technology Code Enumeration: prime_mover_code must be one of the following valid renewable types: 'PV', 'WT', 'BA', 'FW', 'CE', 'CP'.
+Energy Source Enumeration: energy_source_code_1 must be one of: 'SUN', 'WND', 'MWH'.
+3.2 Measure Classification
+
+Additive Measures: capacity_mw and net_capacity_mwdc (DC Capacity) are additive. They can be summed across States and Technology types to derive pipeline totals.
+Non-Additive Measures: generator_id counts are distinct.
+3.3 Referential Checks & Joins
+
+Plant Location Join: Every proposed generator must link to a valid Plant entity via plant_id_eia to retrieve State, County, and Plant Name.
+Solar DC Capacity Logic: The field net_capacity_mwdc is only relevant/populated where prime_mover_code = 'PV'.
+3.4 Temporal Constraints
+
+Snapshot Logic: Data should reflect the latest available report_date snapshot to ensure the pipeline is current.
+Monthly Refresh: The dataset is expected to be refreshed monthly.
+4. Data Requirements
+
+4.1 Data Modeling Approach
+
+The data model requires joining the central Generator attributes (Status, Capacity, Online Date) with specific technology tables (Solar, Wind, Storage) and Plant location data.
+
+Primary Key: generator_id (within a specific report_date snapshot).
+Filtering: Apply the "Proposed" status filter early in the pipeline.
+4.2 Identified Entities & Metadata
+
+The following specific technology entities have been identified as relevant for the pipeline details:
+
+Table: CORE_EIA860__SCD_GENERATORS_SOLAR
+
+Used for PV and CP technology details.
+
+Column Name	Data Type	Requirement	Description
+generator_id	text	Required	Unique identifier for the generator project.
+plant_id_eia	number	Required	Link to the parent plant entity.
+report_date	date	Required	The effective date of the report.
+standard_testing_conditions_capacity_mwdc	float	Optional	DC Capacity measurement.
+virtual_net_metering_capacity_mwdc	float	Optional	Capacity for virtual net metering.
+net_metering_capacity_mwdc	float	Optional	Capacity for net metering.
+tilt_angle_deg	float	Optional	Panel tilt angle.
+azimuth_angle_deg	float	Optional	Panel orientation angle.
+Table: CORE_EIA860__SCD_GENERATORS_WIND
+
+Used for WT technology details.
+
+Column Name	Data Type	Requirement	Description
+generator_id	text	Required	Unique identifier for the generator project.
+plant_id_eia	number	Required	Link to the parent plant entity.
+report_date	date	Required	The effective date of the report.
+predominant_turbine_model	text	Optional	Model of the wind turbine.
+turbine_hub_height_feet	float	Optional	Height of the turbine hub.
+wind_quality_class	number	Optional	Quality classification of wind resource.
+predominant_turbine_manufacturer	text	Optional	Manufacturer of the turbine.
+design_wind_speed_mph	float	Optional	Rated wind speed design.
+Table: CORE_EIA860__SCD_GENERATORS_ENERGY_STORAGE
+
+Used for BA, FW, CE technology details.
+
+Column Name	Data Type	Requirement	Description
+generator_id	text	Required	Unique identifier for the generator project.
+plant_id_eia	number	Required	Link to the parent plant entity.
+report_date	date	Required	The effective date of the report.
+max_discharge_rate_mw	float	Optional	Maximum discharge capability.
+max_charge_rate_mw	float	Optional	Maximum charge capability.
+storage_technology_code_1	text	Optional	Specific storage tech classification.
+is_dc_coupled	boolean	Optional	Flag for DC coupling configuration.
+(Note: While not listed in the specific 'Identified Entities' provided for this section, the Business Context explicitly notes the reliance on CORE_EIA860__SCD_GENERATORS for the operational_status and capacity_mw columns, and CORE_EIA__ENTITY_PLANTS for state/county locations.)
+
+5. Technical Constraints
+
+Refresh Frequency: The pipeline tracker must be updated monthly to reflect the latest EIA Form 860 data.
+Performance: Queries aggregating by State or Technology should perform efficiently (target < 60s) to support interactive dashboards.
+Access Control: Data visibility should be restricted to authorized Business Development personnel.

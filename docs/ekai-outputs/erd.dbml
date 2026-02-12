@@ -1,0 +1,741 @@
+Table CORE_EIA860__ASSN_BOILER_COOLING {
+  report_date date [note: "Indicates the reporting period date for the record, defining the specific data capture or reporting time frame."]
+  data_maturity text [note: "Represents the level of data maturity, identifying the stage (e.g., preliminary or final) of the reported data."]
+  cooling_id_eia text [note: "Foreign key referencing the cooling equipment identifier within the EIA dataset, used to link to the specific cooling system record."]
+  boiler_id text [note: "Foreign key representing the boiler identifier that is part of the physical infrastructure, linking to the associated boiler record."]
+  plant_id_eia number [pk, note: "Identifier of the plant associated with the record, facilitating the linkage between the plant and its corresponding boiler and cooling equipment."]
+  Note: "This table serves as an association table linking boilers with their corresponding cooling equipment as reported in the EIA Form 860 dataset. It maps the physical connection between boiler records and cooling system records while referencing the associated plant."
+}
+
+Table CORE_EIA860__ASSN_BOILER_GENERATOR {
+  steam_plant_type_code number [note: "Numeric code indicating the classification type of the steam plant. This field helps categorize the plant based on predefined type codes."]
+  unit_id_eia text [note: "EIA provided text identifier for the unit. It links the record to a specific power generation unit in the dataset."]
+  report_date date [note: "Date when the record was reported, serving as the temporal marker for historical and current analysis."]
+  plant_id_eia number [note: "Numeric identifier for the plant as per EIA records. Acts as a foreign key that may link to plant details in other tables."]
+  bga_source text [note: "Text field indicating the source or origin of the boiler-generator association data."]
+  generator_id text [note: "Text identifier for the generator involved in the association. Serves as a foreign key reference to the GENERATORS table."]
+  boiler_id text [note: "Text identifier for the boiler involved in the association. Serves as a foreign key reference to the BOILERS table."]
+  boiler_generator_assn_type_code text [note: "Text code denoting the type of association between the boiler and generator. Limited unique values indicate predefined association types."]
+  data_maturity text [note: "Text field indicating the maturity or quality level of the data, used for assessing the readiness or validation status of the record."]
+  unit_id_pudl number [note: "Numeric identifier for the unit as defined in the PUDL system, allowing cross-reference with PUDL data."]
+
+  indexes {
+    (plant_id_eia, unit_id_pudl) [pk]
+  }
+  Note: "Association table linking boilers and generators within the EIA Form 860 dataset. This table maps the physical connection between boilers and generators and supports historical and current infrastructure analysis."
+}
+
+Table CORE_EIA860__ASSN_BOILER_STACK_FLUE {
+  boiler_id text [note: "Identifier for the boiler, used as a reference to the corresponding boiler record. This serves as a foreign key linking to boiler details in the related dataset."]
+  flue_id_eia text [note: "EIA-specific identifier for the flue associated with the boiler. It helps in linking the boiler to its flue component in the EIA Form 860 dataset."]
+  stack_flue_id_eia text [note: "EIA-specific identifier that represents the association between a stack and a flue. It is used to map the stack-flue relationship within the EIA data."]
+  stack_id_eia text [note: "EIA-specific identifier for the stack. This column is used to connect the stack information to the related flue and boiler data in the system."]
+  stack_flue_id_pudl text [note: "PUDL-generated identifier for the stack-flue combination, providing a cross-reference between EIA and PUDL data systems."]
+  report_date date [note: "The date the record was reported, marking the period for which the data is valid. This column is essential for temporal tracking and period-specific analysis."]
+  plant_id_eia number [pk, note: "EIA-specific identifier for the plant associated with the boiler. This links the boiler to its parent plant in the regulatory and operational hierarchy."]
+  Note: "Association table that maps the relationships between boilers and their corresponding stack and flue components using data from EIA Form 860 and PUDL sources. The table includes identifiers from both systems to facilitate linking and historical tracking of physical infrastructure elements."
+}
+
+Table CORE_EIA860__ASSN_YEARLY_BOILER_EMISSIONS_CONTROL_EQUIPMENT {
+  data_maturity text [note: "Indicates the maturity or validation state of the data record, helping users gauge the reliability or stage of the dataset."]
+  report_date date [note: "The date corresponding to the report period for which the association record is valid."]
+  emission_control_id_type text [note: "Specifies the type or category of the emissions control identifier, providing context regarding the classification of the emissions control equipment."]
+  emission_control_id_eia text [note: "Contains the unique identifier for the emissions control equipment as provided in the EIA records."]
+  boiler_id text [note: "Foreign key representing the unique boiler identifier, linking this record to a specific boiler in the dataset."]
+  plant_id_eia number [pk, note: "Represents the plant identifier from EIA records, providing context for the physical location or ownership of the boiler asset."]
+  Note: "This table stores the yearly association details between boilers and their corresponding emissions control equipment from the EIA Form 860 dataset. It captures the report date, emissions control identifiers, and links to the related boiler and plant entities, serving as a junction to track physical asset associations over time."
+}
+
+Table CORE_EIA860__SCD_BOILERS {
+  mercury_control_existing_strategy_5 text [note: "Represents the existing mercury control strategy (version 5) applied to the boiler."]
+  mercury_control_proposed_strategy_3 text [note: "Indicates the proposed mercury control strategy (version 3) for the boiler."]
+  boiler_fuel_code_2 text [note: "Represents the fuel code type (version 2) associated with the boiler`s fuel."]
+  so2_control_planned_caaa_compliance_strategy_1 text [note: "Denotes the planned SO2 control strategy according to CAAA compliance (version 1)."]
+  so2_control_existing_caaa_compliance_strategy_2 text [note: "Indicates the existing SO2 control strategy under CAAA compliance (version 2)."]
+  data_maturity text [note: "Represents the data maturity level or quality indicator for the record."]
+  nox_control_existing_strategy_1 text [note: "Stores the existing NOx control strategy (version 1) for the boiler."]
+  firing_type_3 text [note: "Describes the firing type (version 3) for the boiler operation."]
+  efficiency_50pct_load float [note: "Indicates the boiler efficiency at 50% load, as a floating point value."]
+  new_source_review_date date [note: "Records the date for new source review in the context of compliance."]
+  nox_control_out_of_compliance_strategy_2 text [note: "Represents the strategy to address NOx control when out of compliance (version 2)."]
+  compliance_year_so2 number [note: "Denotes the compliance year for SO2 regulation, capturing the relevant year."]
+  boiler_fuel_code_4 text [note: "Represents the boiler fuel code (version 4) used to classify the fuel type."]
+  nox_control_status_code text [note: "Stores the status code related to NOx control operations."]
+  boiler_fuel_code_3 text [note: "Captures the boiler fuel code (version 3) representing fuel categorization."]
+  mercury_control_proposed_strategy_2 text [note: "Indicates the proposed mercury control strategy (version 2) for the boiler."]
+  new_source_review boolean [note: "Boolean flag indicating if a new source review has been completed."]
+  boiler_type text [note: "Specifies the classification or type of boiler."]
+  boiler_fuel_code_1 text [note: "Represents the primary fuel code for the boiler (version 1)."]
+  plant_id_eia number [note: "Updated: part of composite primary key (plant_id_eia, boiler_id, report_date)"]
+  nox_control_planned_caaa_compliance_strategy_1 text [note: "Indicates the planned NOx control strategy under CAAA compliance (version 1)."]
+  standard_so2_percent_scrubbed float [note: "Records the standard percentage of SO2 scrubbed, used for compliance calculations."]
+  firing_rate_using_gas_mcf_per_hour float [note: "Measures the firing rate using gas consumption in Mcf per hour."]
+  boiler_id text [note: "Updated: part of composite primary key (plant_id_eia, boiler_id, report_date)"]
+  nox_control_existing_strategy_3 text [note: "Represents the existing NOx control strategy (version 3) for the boiler."]
+  mercury_control_proposed_strategy_1 text [note: "Denotes the proposed mercury control strategy (version 1) for the boiler."]
+  so2_control_existing_strategy_3 text [note: "Indicates the existing SO2 control strategy (version 3) for the boiler."]
+  standard_so2_rate float [note: "Captures the benchmark rate for SO2 emissions in relevant units."]
+  particulate_control_out_of_compliance_strategy_2 text [note: "Represents the particulate control strategy when out of compliance (version 2)."]
+  unit_nox text [note: "Specifies the measurement unit for NOx emissions."]
+  efficiency_100pct_load float [note: "Records the boiler efficiency at 100% load as a floating point number."]
+  compliance_year_mercury number [note: "Denotes the compliance year for mercury control, capturing the relevant year."]
+  unit_particulate text [note: "Specifies the measurement unit for particulate matter emissions."]
+  so2_control_existing_caaa_compliance_strategy_3 text [note: "Represents the existing SO2 control strategy under CAAA compliance (version 3)."]
+  wet_dry_bottom text [note: "Indicates whether the boiler uses a wet or dry bottom configuration."]
+  new_source_review_permit text [note: "Stores information on the new source review permit associated with the boiler."]
+  so2_control_out_of_compliance_strategy_1 text [note: "Denotes the out-of-compliance strategy for SO2 control (version 1)."]
+  so2_control_out_of_compliance_strategy_3 text [note: "Represents the out-of-compliance strategy for SO2 control (version 3)."]
+  firing_rate_using_oil_bbls_per_hour float [note: "Measures the firing rate based on oil consumption in barrels per hour."]
+  particulate_control_out_of_compliance_strategy_1 text [note: "Indicates the out-of-compliance strategy for particulate control (version 1)."]
+  mercury_control_existing_strategy_6 text [note: "Represents the existing mercury control strategy (version 6) for the boiler."]
+  so2_control_existing_caaa_compliance_strategy_1 text [note: "Indicates the existing SO2 control strategy under CAAA compliance (version 1)."]
+  nox_control_manufacturer_code text [note: "Stores the manufacturer code for NOx control equipment."]
+  nox_control_manufacturer text [note: "Captures the name of the manufacturer for NOx control equipment."]
+  boiler_operating_date date [note: "Records the operating start date of the boiler."]
+  firing_type_1 text [note: "Describes the firing type (version 1) for boiler operation."]
+  nox_control_planned_caaa_compliance_strategy_2 text [note: "Denotes the planned NOx control strategy under CAAA compliance (version 2)."]
+  regulation_so2 text [note: "Indicates the regulatory standard or guideline for SO2 emissions."]
+  report_date date [note: "Updated: part of composite primary key (plant_id_eia, boiler_id, report_date)"]
+  mercury_control_existing_strategy_2 text [note: "Represents the existing mercury control strategy (version 2) for the boiler."]
+  mercury_control_existing_strategy_1 text [note: "Denotes the existing mercury control strategy (version 1) for the boiler."]
+  firing_rate_using_other_fuels float [note: "Measures the firing rate when using fuels other than gas or oil."]
+  compliance_year_nox number [note: "Indicates the compliance year for NOx emissions, capturing the relevant year."]
+  regulation_particulate text [note: "Specifies the regulatory standard for particulate emissions."]
+  max_steam_flow_1000_lbs_per_hour float [note: "Records the maximum steam flow in units of 1000 lbs per hour."]
+  standard_particulate_rate float [note: "Captures the standard rate for particulate emissions."]
+  nox_control_planned_caaa_compliance_strategy_3 text [note: "Indicates the planned NOx control strategy under CAAA compliance (version 3)."]
+  mercury_control_existing_strategy_3 text [note: "Represents the existing mercury control strategy (version 3) for the boiler."]
+  nox_control_proposed_strategy_3 text [note: "Denotes the proposed NOx control strategy (version 3) for the boiler."]
+  nox_control_existing_caaa_compliance_strategy_3 text [note: "Indicates the existing NOx control strategy under CAAA compliance (version 3)."]
+  nox_control_out_of_compliance_strategy_3 text [note: "Represents the out-of-compliance strategy for NOx control (version 3)."]
+  nox_control_out_of_compliance_strategy_1 text [note: "Denotes the out-of-compliance strategy for NOx control (version 1)."]
+  boiler_retirement_date date [note: "Records the date on which the boiler was retired from operation."]
+  nox_control_existing_caaa_compliance_strategy_1 text [note: "Represents the existing NOx control strategy under CAAA compliance (version 1)."]
+  boiler_status text [note: "Indicates the current operating status of the boiler."]
+  so2_control_planned_caaa_compliance_strategy_2 text [note: "Denotes the planned SO2 control strategy under CAAA compliance (version 2)."]
+  particulate_control_out_of_compliance_strategy_3 text [note: "Represents the out-of-compliance strategy for particulate control (version 3), unique value column."]
+  regulation_mercury text [note: "Specifies the regulatory standard for mercury emissions."]
+  regulation_nox text [note: "Indicates the regulatory standard for NOx emissions."]
+  turndown_ratio float [note: "Captures the turndown ratio of the boiler, representing its operational flexibility."]
+  firing_type_2 text [note: "Describes the firing type (version 2) for boiler operation."]
+  so2_control_out_of_compliance_strategy_2 text [note: "Indicates the out-of-compliance strategy for SO2 control (version 2)."]
+  hrsg boolean [note: "Boolean flag indicating the presence of a Heat Recovery Steam Generator (HRSG) associated with the boiler."]
+  fly_ash_reinjection boolean [note: "Boolean flag indicating if fly ash is reinjected into the process."]
+  mercury_control_existing_strategy_4 text [note: "Represents the existing mercury control strategy (version 4) for the boiler."]
+  compliance_year_particulate number [note: "Denotes the compliance year for particulate control, capturing the relevant year."]
+  air_flow_100pct_load_cubic_feet_per_minute float [note: "Measures the air flow at 100% load in cubic feet per minute."]
+  so2_control_proposed_strategy_3 text [note: "Indicates the proposed SO2 control strategy (version 3) for the boiler."]
+  so2_control_planned_caaa_compliance_strategy_3 text [note: "Denotes the planned SO2 control strategy under CAAA compliance (version 3)."]
+  nox_control_proposed_strategy_1 text [note: "Represents the proposed NOx control strategy (version 1) for the boiler."]
+  nox_control_proposed_strategy_2 text [note: "Indicates the proposed NOx control strategy (version 2) for the boiler."]
+  nox_control_existing_caaa_compliance_strategy_2 text [note: "Denotes the existing NOx control strategy under CAAA compliance (version 2)."]
+  nox_control_existing_strategy_2 text [note: "Represents the existing NOx control strategy (version 2) for the boiler."]
+  firing_rate_using_coal_tons_per_hour float [note: "Measures the firing rate based on coal consumption in tons per hour."]
+  waste_heat_input_mmbtu_per_hour float [note: "Records the waste heat input in MMBtu per hour."]
+  unit_so2 text [note: "Specifies the measurement unit for SO2 emissions."]
+  so2_control_proposed_strategy_1 text [note: "Denotes the proposed SO2 control strategy (version 1) for the boiler."]
+  so2_control_existing_strategy_2 text [note: "Indicates the existing SO2 control strategy (version 2) for the boiler."]
+  standard_nox_rate float [note: "Captures the benchmark rate for NOx emissions."]
+  so2_control_existing_strategy_1 text [note: "Represents the existing SO2 control strategy (version 1) for the boiler."]
+  so2_control_proposed_strategy_2 text [note: "Denotes the proposed SO2 control strategy (version 2) for the boiler."]
+
+  indexes {
+    (plant_id_eia, boiler_id, report_date) [pk]
+  }
+  Note: "This table stores historical boiler records from the EIA Form 860 dataset. It captures time-variant boiler attributes including various control strategies (mercury, NOx, SO2, particulate), fuel codes, operational parameters, and compliance information. The table is designed as a Slowly Changing Dimension (SCD) to maintain a history of changes over reporting periods."
+}
+
+Table CORE_EIA860__SCD_EMISSIONS_CONTROL_EQUIPMENT {
+  so2_control_id_eia text [note: "Holds the EIA-assigned identifier for SO2 emission control equipment. Stored as TEXT."]
+  mercury_control_id_eia text [note: "Stores the identifier for mercury emission control equipment as provided by EIA. Stored as TEXT."]
+  report_year number [note: "Indicates the reporting year for the record, used to segment historical data. Stored as NUMBER."]
+  particulate_control_id_eia text [note: "Contains the identifier for particulate emission control equipment from EIA. Stored as TEXT."]
+  emission_control_retirement_date date [note: "Records the date when the emissions control equipment was retired. Stored as DATE."]
+  data_maturity text [note: "Indicates the maturity or quality of the data, potentially flagging the status of the record as final or draft. Stored as TEXT."]
+  plant_id_eia number [note: "Represents the EIA plant identifier to link the equipment record to a specific plant. Stored as NUMBER."]
+  nox_control_id_eia text [note: "Contains the identifier for NOx emission control equipment as provided by EIA. Stored as TEXT."]
+  acid_gas_control boolean [note: "A boolean flag indicating whether acid gas control is implemented. Stored as BOOLEAN."]
+  emission_control_operating_date date [note: "Records the operating start date of the emissions control equipment. Stored as DATE."]
+  emission_control_equipment_cost float [note: "Stores the cost associated with the emissions control equipment. Stored as FLOAT."]
+  emission_control_equipment_type_code text [note: "Holds a code representing the type of emissions control equipment. Stored as TEXT."]
+  operational_status_code text [note: "Contains a code that signifies the current operational status of the equipment. Stored as TEXT."]
+  emission_control_id_pudl float [note: "This identifier is used by the PUDL system to uniquely track the emissions control equipment. Stored as FLOAT."]
+
+  indexes {
+    (report_year, plant_id_eia, emission_control_id_pudl) [pk]
+  }
+  Note: "This table stores historical (SCD) records for emissions control equipment as reported by EIA Form 860. It captures various control identifiers (SO2, Mercury, Particulate, NOx), operation and retirement dates, equipment cost, type codes, and associated plant identifiers, enabling the tracking of equipment changes over time."
+}
+
+Table CORE_EIA860__SCD_GENERATORS {
+  distributed_generation boolean [note: "Boolean flag indicating whether the generator supports distributed generation."]
+  planned_modifications boolean [note: "Boolean flag indicating if any modifications to the generator are planned."]
+  planned_net_winter_capacity_uprate_mw float [note: "Float value representing the planned net uprate of capacity for the winter season in megawatts."]
+  energy_source_code_3 text [note: "Text code representing the tertiary energy source associated with the generator."]
+  uprate_derate_completed_date date [note: "Date marking the completion of an uprate or derate action on the generator."]
+  planned_new_capacity_mw float [note: "Float value indicating the planned new generation capacity, in megawatts."]
+  winter_estimated_capability_mw float [note: "Float representing the estimated generation capability during the winter season."]
+  minimum_load_mw float [note: "Float value indicating the minimum load capacity of the generator in megawatts."]
+  startup_source_code_3 text [note: "Text code representing the third category for the generator`s startup source method."]
+  energy_source_1_transport_1 text [note: "Text code relating to the primary energy source transportation method (first variant)."]
+  turbines_inverters_hydrokinetics number [note: "Numeric field capturing parameters related to turbines, inverters, or hydrokinetic systems associated with the generator."]
+  summer_capacity_mw float [note: "Float value indicating the generator`s summer capacity, measured in megawatts."]
+  data_maturity text [note: "Text field that indicates the level of data maturity or quality for the generator record."]
+  energy_source_1_transport_3 text [note: "Text code representing an alternative transportation code for the primary energy source."]
+  fuel_type_code_pudl text [note: "Text code indicating the fuel type as defined by the PUDL dataset."]
+  planned_net_summer_capacity_uprate_mw float [note: "Float value showing the planned uprate in summer capacity, in megawatts."]
+  planned_generator_retirement_date date [note: "Date when the generator is scheduled to be retired."]
+  planned_energy_source_code_1 text [note: "Text code indicating the planned primary energy source for the generator."]
+  startup_source_code_1 text [note: "Text code representing the primary startup source for the generator."]
+  energy_storage_capacity_mwh float [note: "Float value indicating the energy storage capacity in megawatt-hours."]
+  nameplate_power_factor float [note: "Float value detailing the rated power factor as per the generator`s nameplate specifications."]
+  planned_net_summer_capacity_derate_mw float [note: "Float value representing the planned derate (reduction) of summer capacity in megawatts."]
+  capacity_mw float [note: "Float indicating the overall capacity of the generator in megawatts."]
+  energy_source_2_transport_1 text [note: "Text code for the first transportation method related to the secondary energy source."]
+  energy_source_code_1 text [note: "Text field representing the primary energy source code for the generator."]
+  other_planned_modifications boolean [note: "Boolean flag indicating whether there are additional planned modifications for the generator."]
+  report_date date [note: "Updated: Now added as part of composite primary key (plant_id_eia, generator_id, report_date)."]
+  summer_capacity_estimate boolean [note: "Boolean flag showing whether a summer capacity estimate is available."]
+  summer_estimated_capability_mw float [note: "Float value representing the estimated capability during the summer season in megawatts."]
+  prime_mover_code text [note: "Text code specifying the type of prime mover used in the generator."]
+  utility_id_eia number [note: "Numeric identifier for the utility as provided in the EIA data, linking the generator to its owning utility."]
+  energy_source_code_5 text [note: "Text field containing an alternative or fifth energy source code for the generator."]
+  winter_capacity_mw float [note: "Float value representing the generator`s winter capacity in megawatts."]
+  other_modifications_date date [note: "Date indicating when additional modifications (other than standard planned ones) were made."]
+  planned_derate_date date [note: "Date scheduling a planned capacity derate for the generator."]
+  startup_source_code_4 text [note: "Text code representing the fourth startup source option for the generator."]
+  planned_uprate_date date [note: "Date specifying when a capacity uprate is planned for the generator."]
+  technology_description text [note: "Text description of the generator`s technology and design."]
+  planned_new_prime_mover_code text [note: "Text code for a new prime mover planned as part of a generator upgrade."]
+  reactive_power_output_mvar float [note: "Float value measuring the generator`s reactive power output in megavolt-ampere reactive (MVAR)."]
+  startup_source_code_2 text [note: "Text code representing the second startup source for the generator."]
+  energy_source_2_transport_2 text [note: "Text code for the second transportation method related to the secondary energy source."]
+  time_cold_shutdown_full_load_code text [note: "Text code indicating the duration required for a cold shutdown at full load."]
+  can_cofire_fuels boolean [note: "Boolean flag specifying whether the generator is capable of cofiring multiple fuels."]
+  generator_id text [note: "Updated: Now added as part of composite primary key (plant_id_eia, generator_id, report_date)."]
+  turbines_num number [note: "Numeric field indicating the number of turbines associated with the generator."]
+  can_switch_oil_gas boolean [note: "Boolean flag indicating the capability of switching between oil and gas fuels."]
+  energy_source_code_4 text [note: "Text code representing the fourth energy source associated with the generator."]
+  owned_by_non_utility boolean [note: "Boolean flag indicating if the generator is owned by an entity other than a utility."]
+  energy_source_2_transport_3 text [note: "Text code for the third transportation option related to the secondary energy source."]
+  ferc_qualifying_facility boolean [note: "Boolean flag showing whether the generator qualifies as a facility under FERC guidelines."]
+  energy_source_1_transport_2 text [note: "Text code for the second transportation method related to the primary energy source."]
+  synchronized_transmission_grid boolean [note: "Boolean indicator specifying if the generator is connected to a synchronized transmission grid."]
+  operational_status text [note: "Text field representing the current operational status of the generator."]
+  net_capacity_mwdc float [note: "Float value showing the net capacity measured in megawatts direct current (MWdc)."]
+  planned_net_winter_capacity_derate_mw float [note: "Float value representing the planned reduction (derate) in winter capacity, in megawatts."]
+  energy_source_code_2 text [note: "Text field representing the secondary energy source code for the generator."]
+  can_burn_multiple_fuels boolean [note: "Boolean flag indicating whether the generator can burn multiple fuels concurrently."]
+  ownership_code text [note: "Text code representing the ownership type of the generator."]
+  operational_status_code text [note: "Text code that provides a more granular detail of the generator`s operational status."]
+  deliver_power_transgrid boolean [note: "Boolean flag indicating if the generator delivers power to the transmission grid."]
+  uprate_derate_during_year boolean [note: "Boolean flag indicating whether an uprate or derate occurred during the year."]
+  planned_repower_date date [note: "Date scheduled for repowering activities for the generator."]
+  plant_id_eia number [note: "Updated: Now part of composite primary key (plant_id_eia, generator_id, report_date). Previous definition retained but now in a composite context."]
+  energy_source_code_6 text [note: "Text field representing the sixth energy source code associated with the generator."]
+  carbon_capture boolean [note: "Boolean flag indicating the presence of carbon capture technology in the generator."]
+  winter_capacity_estimate boolean [note: "Boolean flag showing whether a winter capacity estimate is available for the generator."]
+  current_planned_generator_operating_date date [note: "Date representing the current planned operating date for the generator."]
+  generator_retirement_date date [note: "Date marking the actual retirement of the generator."]
+
+  indexes {
+    (plant_id_eia, generator_id, report_date) [pk]
+  }
+  Note: "This table stores historical snapshots of generator attributes from the EIA Form 860 dataset. It implements a Type 2 Slowly Changing Dimension (SCD) to capture temporal changes in generator details such as capacity, fuel types, modifications, and operational status."
+}
+
+Table CORE_EIA860__SCD_GENERATORS_ENERGY_STORAGE {
+  storage_technology_code_1 text [note: "Code representing the primary classification of the energy storage technology used. It categorizes the technology type according to established standards."]
+  max_discharge_rate_mw float [note: "Specifies the maximum discharge rate in megawatts, indicating the upper limit of energy that the system can deliver."]
+  served_transmission_and_distribution_deferral boolean [note: "Boolean flag indicating if the energy storage system supports deferral of transmission and distribution upgrades."]
+  served_system_peak_shaving boolean [note: "Indicates whether the energy storage system is used for system peak shaving during periods of high demand."]
+  storage_technology_code_2 text [note: "Represents an alternative or secondary storage technology classification for additional categorization."]
+  served_ramping_spinning_reserve boolean [note: "Boolean flag showing if the energy storage system participates in ramping and spinning reserve services."]
+  generator_id_direct_support_2 text [note: "Identifier for a generator receiving direct support from the energy storage system. May act as a foreign key reference."]
+  stored_excess_wind_and_solar_generation boolean [note: "Indicates if the system is utilized to store surplus wind and solar generation."]
+  plant_id_eia number [note: "EIA designated plant identifier linking the energy storage record to its corresponding power plant. Now part of composite primary key (plant_id_eia, generator_id, report_date)."]
+  report_date date [note: "The date when the record was reported, used for temporal tracking of the historical data. Updated to be part of composite primary key along with plant_id_eia and generator_id."]
+  served_co_located_renewable_firming boolean [note: "Indicates if the energy storage system is employed to firm power from co-located renewable energy sources."]
+  storage_technology_code_3 text [note: "An additional technology code that may be used for further classification. Data availability might be limited."]
+  served_backup_power boolean [note: "Indicates whether the energy storage system provides backup power support."]
+  plant_id_eia_direct_support_2 number [note: "EIA plant identifier used for tracking direct support relationships, linking to alternative plant records."]
+  max_charge_rate_mw float [note: "Specifies the maximum charging rate in megawatts, representing the system`s capacity to absorb energy."]
+  served_load_following boolean [note: "Boolean flag that indicates whether the energy storage system adjusts its output to follow load demand."]
+  generator_id text [note: "Primary generator identifier associated with the energy storage system. Often used as a foreign key in generator relationships. Updated to be part of composite primary key along with plant_id_eia and report_date."]
+  generator_id_direct_support_1 text [note: "Identifier linking to a generator receiving direct support, used for auxiliary control scenarios."]
+  storage_technology_code_4 text [note: "Fourth classification code for the storage technology. Although currently sparse, it is reserved for future use."]
+  is_dc_coupled boolean [note: "Boolean flag indicating whether the energy storage system configuration is DC coupled."]
+  is_transmission_and_distribution_asset_support boolean [note: "Specifies if the system supports adjacent transmission and distribution assets, indicating integrated grid support."]
+  is_dc_coupled_tightly boolean [note: "Indicates whether the DC coupling configuration of the energy storage system is tightly integrated."]
+  plant_id_eia_direct_support_1 number [note: "EIA plant identifier for direct support purposes, linking to the primary plant record."]
+  is_ac_coupled boolean [note: "Boolean flag that identifies if the energy storage system is AC coupled, detailing its power conversion approach."]
+  served_frequency_regulation boolean [note: "Indicates if the system is configured to provide frequency regulation to stabilize grid operations."]
+  served_voltage_or_reactive_power_support boolean [note: "Specifies whether the storage system supplies voltage support or reactive power to the grid."]
+  plant_id_eia_direct_support_3 number [note: "A unique EIA plant identifier used for direct support tracking, potentially forming part of a composite key."]
+  served_load_management boolean [note: "Boolean flag representing if the energy storage system is engaged in load management services."]
+  is_independent boolean [note: "Indicates whether the energy storage system operates independently without reliance on direct support structures."]
+  generator_id_direct_support_3 text [note: "Unique generator identifier for direct support, used to reference auxiliary generator relationships."]
+  served_arbitrage boolean [note: "Boolean flag showing if the system is used for energy arbitrage by leveraging pricing differences over time."]
+  is_direct_support boolean [note: "Indicates if the energy storage system itself provides direct operational support, linking it to direct support relationships."]
+  storage_enclosure_code text [note: "Code identifying the enclosure or housing for the energy storage system, used for tracking physical assets."]
+
+  indexes {
+    (plant_id_eia, generator_id, report_date) [pk]
+  }
+  Note: "Contains historical records for energy storage generators as reported in the EIA Form 860 dataset. This table uses Slowly Changing Dimension (SCD) methodology to track time-variant technical specifications, service flags, and associated plant/generator identifiers."
+}
+
+Table CORE_EIA860__SCD_GENERATORS_MULTIFUEL {
+  can_cofire_100_oil boolean [note: "Boolean indicator that specifies if the generator can co-fire 100% oil as part of its fuel mix."]
+  can_switch_when_operating boolean [note: "Boolean flag that indicates whether the generator is capable of switching fuel sources while operating."]
+  plant_name_eia text [note: "Text field containing the name of the plant as reported by EIA."]
+  utility_id_eia number [note: "Numeric identifier for the utility as provided by the EIA, linking records to utility entities."]
+  winter_capacity_mw float [note: "Measured winter capacity of the generator in megawatts."]
+  energy_source_code_1 text [note: "Primary energy source code indicating the main fuel type used by the generator."]
+  prime_mover_code text [note: "Text code denoting the type of prime mover used in the generator (e.g., steam, gas turbine)."]
+  summer_capacity_mw float [note: "Measured summer capacity of the generator in megawatts."]
+  fuel_switch_energy_source_3 text [note: "Alternate fuel switching configuration code (third option) for the generator."]
+  time_to_switch_oil_to_gas text [note: "Time required to switch the generator from oil to gas, represented as text."]
+  can_cofire_oil_and_gas boolean [note: "Boolean indicating if the generator is capable of co-firing both oil and gas simultaneously."]
+  operational_status_code text [note: "Code representing the current operational status of the generator."]
+  fuel_switch_energy_source_2 text [note: "Alternate fuel switching configuration code (second option) for the generator."]
+  technology_description text [note: "Descriptive field that provides details on the technology employed by the generator."]
+  cofire_energy_source_2 text [note: "Alternate co-firing energy source configuration code (second option) for the generator."]
+  can_fuel_switch boolean [note: "Boolean flag indicating if the generator is capable of switching between fuel types."]
+  can_cofire_fuels boolean [note: "Boolean flag indicating whether the generator can co-fire fuels concurrently."]
+  max_oil_heat_input float [note: "Maximum heat input when burning oil, used as an operational or design parameter."]
+  state text [note: "Text field representing the state where the plant is located."]
+  fuel_switch_energy_source_6 text [note: "Alternate fuel switching configuration code (sixth option) for the generator."]
+  has_regulatory_limits boolean [note: "Boolean indicator that specifies whether the generator is subject to regulatory limits."]
+  sector_name_eia text [note: "Text field denoting the sector name as categorized by the EIA."]
+  cofire_energy_source_6 text [note: "Alternate co-firing energy source configuration code (sixth option) for the generator."]
+  report_date date [note: "Date field indicating the reporting date for the record."]
+  net_winter_capacity_oil_mw float [note: "Net winter capacity specifically for oil-fired operations, measured in megawatts."]
+  generator_id text [note: "Unique identifier for the generator as designated in the record."]
+  has_air_permit_limits boolean [note: "Boolean flag that indicates whether there are air permit restrictions impacting generator operations."]
+  net_winter_capacity_natural_gas_mw float [note: "Net winter capacity for natural gas operations, measured in megawatts."]
+  cofire_energy_source_5 text [note: "Alternate co-firing energy source configuration code (fifth option) for the generator."]
+  net_summer_capacity_oil_mw float [note: "Net summer capacity specifically for oil-fired operations, measured in megawatts."]
+  fuel_switch_energy_source_1 text [note: "Primary fuel switching configuration code for the generator."]
+  can_burn_multiple_fuels boolean [note: "Boolean flag indicating whether the generator is capable of burning multiple fuels concurrently."]
+  sector_id_eia number [note: "Numeric sector identifier provided by the EIA, linking the record to a specific energy sector."]
+  capacity_mw float [note: "Overall rated capacity of the generator in megawatts."]
+  current_planned_generator_operating_date date [note: "Date indicating the current or planned operating start date for the generator."]
+  utility_name_eia text [note: "Text field containing the name of the utility as reported by the EIA."]
+  cofire_energy_source_1 text [note: "Primary co-firing energy source configuration code for the generator."]
+  fuel_switch_energy_source_5 text [note: "Alternate fuel switching configuration code (fifth option) for the generator."]
+  energy_source_code_2 text [note: "Secondary energy source code indicating an alternative fuel type for the generator."]
+  can_switch_oil_gas boolean [note: "Boolean flag indicating whether the generator is capable of switching between oil and gas."]
+  plant_id_eia number [note: "Numeric identifier for the plant as provided by the EIA, linking records to plant entities."]
+  fuel_switch_energy_source_4 text [note: "Alternate fuel switching configuration code (fourth option) for the generator."]
+  time_to_switch_gas_to_oil text [note: "Time required to switch the generator from gas to oil, represented as text."]
+  has_factors_that_limit_switching boolean [note: "Boolean indicator that specifies if there are factors limiting the generator`s ability to switch fuel types."]
+  cofire_energy_source_4 text [note: "Alternate co-firing energy source configuration code (fourth option) for the generator."]
+  has_storage_limits boolean [note: "Boolean flag indicating whether there are storage capacity limits affecting the generator."]
+  max_oil_output_mw float [note: "Maximum output capacity when burning oil, measured in megawatts."]
+  net_summer_capacity_natural_gas_mw float [note: "Net summer capacity for natural gas operations, measured in megawatts."]
+  county text [note: "Text field representing the county where the plant is located."]
+  cofire_energy_source_3 text [note: "Alternate co-firing energy source configuration code (third option) for the generator."]
+  has_other_factors_that_limit_switching boolean [note: "Boolean indicator that specifies additional factors that may limit the generator`s fuel switching capabilities."]
+
+  indexes {
+    (plant_id_eia, sector_id_eia) [pk]
+  }
+  Note: "Stores historical records of multifuel attributes for generators, capturing both fuel switching capabilities and capacity metrics. This table tracks temporal changes in generator characteristics following a Type 2 SCD pattern."
+}
+
+Table CORE_EIA860__SCD_GENERATORS_SOLAR {
+  uses_technology_parabolic_trough boolean [note: "Indicator specifying whether the solar generator employs parabolic trough technology."]
+  uses_technology_dish_engine boolean [note: "Indicator specifying whether the solar generator utilizes dish engine technology."]
+  uses_technology_fixed_tilt boolean [note: "Indicator specifying whether the solar generator employs fixed tilt mounting technology."]
+  uses_bifacial_panels boolean [note: "Indicator specifying whether the solar generator uses bifacial panel technology."]
+  uses_virtual_net_metering_agreement boolean [note: "Indicator specifying if there is a virtual net metering agreement in place for the solar generator."]
+  uses_material_thin_film_a_si boolean [note: "Indicator specifying whether the solar generator employs thin film amorphous silicon material."]
+  uses_technology_dual_axis_tracking boolean [note: "Indicator specifying whether the solar generator utilizes dual axis tracking technology."]
+  report_date date [note: "Updated to be a component of the new composite primary key."]
+  uses_material_thin_film_other boolean [note: "Indicator specifying whether the solar generator employs other types of thin film materials not categorized elsewhere."]
+  plant_id_eia number [note: "Previously the sole primary key, now updated to be part of a composite primary key with generator_id and report_date."]
+  uses_technology_other boolean [note: "Indicator specifying whether the solar generator utilizes other unspecified solar technologies."]
+  uses_material_thin_film_cdte boolean [note: "Indicator specifying whether the solar generator employs cadmium telluride (CdTe) thin film material."]
+  standard_testing_conditions_capacity_mwdc float [note: "Capacity measurement under standard testing conditions (MWDC) for the solar generator."]
+  uses_technology_lenses_mirrors boolean [note: "Indicator specifying whether the solar generator uses technologies involving lenses or mirrors."]
+  uses_technology_linear_fresnel boolean [note: "Indicator specifying whether the solar generator utilizes linear Fresnel technology."]
+  azimuth_angle_deg float [note: "The azimuth angle in degrees that represents the orientation of the solar panels."]
+  uses_material_thin_film_cigs boolean [note: "Indicator specifying whether the solar generator employs Copper Indium Gallium Selenide (CIGS) thin film technology."]
+  uses_net_metering_agreement boolean [note: "Indicator specifying whether the solar generator is covered by a net metering agreement."]
+  uses_material_other boolean [note: "Indicator specifying whether the solar generator employs materials that do not fall under the specified categories."]
+  uses_technology_single_axis_tracking boolean [note: "Indicator specifying whether the solar generator utilizes single axis tracking technology."]
+  generator_id text [note: "Updated to be a component of the new composite primary key."]
+  uses_technology_east_west_fixed_tilt boolean [note: "Indicator specifying whether the solar generator employs an east-west fixed tilt mounting configuration."]
+  tilt_angle_deg float [note: "The tilt angle in degrees of the solar panels."]
+  uses_material_crystalline_silicon boolean [note: "Indicator specifying whether the solar generator utilizes crystalline silicon material."]
+  uses_technology_power_tower boolean [note: "Indicator specifying whether the solar generator employs power tower technology."]
+  virtual_net_metering_capacity_mwdc float [note: "Capacity measurement (MWDC) associated with virtual net metering agreements for the solar generator."]
+  net_metering_capacity_mwdc float [note: "Capacity measurement (MWDC) associated with net metering agreements for the solar generator."]
+
+  indexes {
+    (plant_id_eia, generator_id, report_date) [pk]
+  }
+  Note: "This table stores historical records for solar generator assets sourced from the EIA Form 860 dataset. It captures various technology usage flags, capacity measurements, and configuration parameters to support slowly changing dimension (SCD) tracking of solar generators over time."
+}
+
+Table CORE_EIA860__SCD_GENERATORS_WIND {
+  plant_id_eia number [note: "Part of composite primary key (plant_id_eia, generator_id, report_date) that uniquely identifies a wind generator entry. (Updated from being the sole PK.)"]
+  obstacle_id_faa text [note: "FAA obstacle identifier possibly representing nearby obstructions that may influence turbine operations. Contains numerous null values indicating it may be optional."]
+  predominant_turbine_model text [note: "Specifies the most common turbine model in operation at the wind generator plant."]
+  report_date date [note: "Part of composite primary key (plant_id_eia, generator_id, report_date) that uniquely identifies a wind generator entry."]
+  generator_id text [note: "Part of composite primary key (plant_id_eia, generator_id, report_date) that uniquely identifies a wind generator entry."]
+  turbine_hub_height_feet float [note: "Represents the height of the turbine hub in feet, an important specification for performance and design calculations."]
+  wind_quality_class number [note: "A numerical classification (typically 1 to 4) indicating the quality of the wind resource at the generator location."]
+  predominant_turbine_manufacturer text [note: "Records the manufacturer of the predominant turbine model, aiding in asset tracking and vendor analysis."]
+  design_wind_speed_mph float [note: "The design wind speed in miles per hour, which is a critical parameter in turbine design and suitability assessments."]
+
+  indexes {
+    (plant_id_eia, generator_id, report_date) [pk]
+  }
+  Note: "This table is an SCD (Slowly Changing Dimension) table that captures historical attributes of wind generators reported under EIA Form 860. It contains details such as plant association, turbine specifications, wind quality classification, and design wind speeds, enabling tracking of changes in wind generator characteristics over time."
+}
+
+Table CORE_EIA860__SCD_OWNERSHIP {
+  plant_id_eia number [note: "Identifier of the plant as per EIA records. Now part of composite primary key (plant_id_eia, generator_id, report_date, owner_utility_id_eia)."]
+  owner_street_address text [note: "Street address of the owner, used for locating the physical address of the owning entity."]
+  report_date date [note: "Report date marking the effective date of the ownership record. Now included as part of composite primary key."]
+  owner_utility_name_eia text [note: "Name of the utility company that owns the asset according to EIA data."]
+  fraction_owned float [note: "Fractional ownership value (ranging from 0 to 1) indicating the proportion of the asset owned by the specified utility."]
+  owner_zip_code text [note: "Postal zip code corresponding to the owner`s address."]
+  owner_city text [note: "City where the owner is located."]
+  owner_state text [note: "State abbreviation for the owner`s location."]
+  operator_utility_id_eia number [note: "Identifier for the operating utility associated with the asset in the EIA dataset."]
+  data_maturity text [note: "Indicates the quality or processing level of the data entry, which may differentiate between raw and curated information."]
+  owner_utility_id_eia number [note: "Identifier for the owning utility as per EIA records. Now included as part of composite primary key."]
+  owner_country text [note: "Country of the owning utility, providing geographical context for the ownership information."]
+  generator_id text [note: "Identifier for the generator asset, establishing linkage with the generator records in the dataset. Now included as part of composite primary key."]
+
+  indexes {
+    (plant_id_eia, generator_id, report_date, owner_utility_id_eia) [pk]
+  }
+  Note: "Tracks historical changes in ownership details for EIA Form 860 assets. This SCD table stores time-variant attributes related to plant and generator ownership, allowing for effective historical analysis."
+}
+
+Table CORE_EIA860__SCD_PLANTS {
+  ferc_cogen_docket_no text [note: "FERC docket identifier for cogeneration facilities, used to track regulatory cases related to cogeneration."]
+  reporting_frequency_code text [note: "Code indicating the frequency of reporting (e.g., monthly, quarterly) for the plant`s data submissions."]
+  pipeline_notes text [note: "Notes or clarifications related to pipeline information associated with the plant."]
+  has_net_metering boolean [note: "Boolean flag indicating if the plant operates under net metering practices."]
+  primary_purpose_id_naics number [note: "Numeric identifier representing the plant`s primary NAICS code, reflecting its main operational purpose."]
+  balancing_authority_code_eia text [note: "EIA-assigned code for the balancing authority that oversees the plant`s operations."]
+  regulatory_status_code text [note: "Code that denotes the regulatory status of the plant, used for compliance tracking."]
+  service_area text [note: "Specifies the service area associated with the plant, often detailing the geographic region served."]
+  natural_gas_local_distribution_company text [note: "Identifies the local natural gas distribution company linked with the plant."]
+  water_source text [note: "Details the source of water used in plant operations, critical for environmental and operational assessments."]
+  utility_id_eia number [note: "The EIA identifier for the utility that owns or operates the plant."]
+  ferc_qualifying_facility_docket_no text [note: "FERC docket number associated with facilities that meet qualifying criteria under regulated conditions."]
+  datum text [note: "Specifies the datum used for spatial measurements or geolocation reference of the plant."]
+  iso_rto_code text [note: "Code representing the Independent System Operator or Regional Transmission Organization managing grid operations."]
+  ferc_exempt_wholesale_generator_docket_no text [note: "Docket number used in cases where a plant is exempted from wholesale generator requirements by FERC."]
+  transmission_distribution_owner_state text [note: "State identifier for the owner of the plant`s transmission and distribution network."]
+  data_maturity text [note: "Indicator that reflects the maturity level or quality of the data reported, potentially flagging completeness or validation status."]
+  natural_gas_pipeline_name_3 text [note: "Name or identifier for the tertiary natural gas pipeline associated with the plant."]
+  ferc_small_power_producer_docket_no text [note: "Docket number assigned for plants qualifying as small power producers under FERC regulations."]
+  sector_id_eia number [note: "Numeric identifier for the sector classification of the plant as defined by the EIA."]
+  ferc_small_power_producer boolean [note: "Boolean flag indicating whether the plant qualifies as a small power producer according to FERC standards."]
+  transmission_distribution_owner_id number [note: "Unique identifier for the entity that owns the transmission and distribution network related to the plant."]
+  report_date date [note: "The date when the plant`s data record was reported. Now used as part of a composite primary key (plant_id_eia, report_date) to enable temporal tracking of plant attribute changes."]
+  plant_id_eia number [note: "Unique plant identifier assigned by the EIA. Now used as part of a composite primary key (plant_id_eia, report_date) to track historical snapshots of plant attributes over time."]
+  balancing_authority_name_eia text [note: "Name of the balancing authority as recorded by the EIA."]
+  grid_voltage_3_kv float [note: "Grid voltage measurement in kilovolts for the third (3-phase) configuration, critical for electrical system analysis."]
+  ferc_cogen_status boolean [note: "Boolean status indicating FERC compliance for cogeneration facilities."]
+  natural_gas_storage boolean [note: "Boolean flag that indicates whether the plant features natural gas storage capabilities."]
+  ash_impoundment boolean [note: "Indicator showing if the plant utilizes ash impoundment facilities for waste management."]
+  sector_name_eia text [note: "Textual description of the sector name under which the plant is classified by the EIA."]
+  liquefied_natural_gas_storage boolean [note: "Boolean flag indicating the presence of liquefied natural gas (LNG) storage at the plant."]
+  grid_voltage_1_kv float [note: "Grid voltage measurement in kilovolts for the primary configuration."]
+  grid_voltage_2_kv float [note: "Grid voltage measurement in kilovolts for the secondary configuration."]
+  natural_gas_pipeline_name_1 text [note: "Name or identifier of the primary natural gas pipeline associated with the plant."]
+  natural_gas_pipeline_name_2 text [note: "Name or identifier of the secondary natural gas pipeline associated with the plant."]
+  transmission_distribution_owner_name text [note: "Name of the entity that owns the transmission and distribution network related to the plant."]
+  energy_storage boolean [note: "Boolean flag indicating if the plant incorporates energy storage systems."]
+  ash_impoundment_lined boolean [note: "Indicator denoting whether the ash impoundment area is lined for environmental protection."]
+  ferc_exempt_wholesale_generator boolean [note: "Boolean indicator showing if the plant is classified as an exempt wholesale generator by FERC."]
+  ash_impoundment_status text [note: "Text field describing the status or condition of the ash impoundment facility."]
+  nerc_region text [note: "Specifies the NERC region in which the plant is located, aiding in regional analysis."]
+
+  indexes {
+    (plant_id_eia, report_date) [pk]
+  }
+  Note: "Stores historical snapshots of plant attributes from the EIA Form 860 dataset. This Slowly Changing Dimension (SCD) table tracks changes over time in plant details, ensuring both current and historical data are maintained for regulatory and analytical purposes."
+}
+
+Table CORE_EIA860__SCD_UTILITIES {
+  phone_number_2 text [note: "Alternate phone number for the utility contact."]
+  phone_extension text [note: "Phone extension corresponding to the primary phone number."]
+  contact_firstname_2 text [note: "Alternate contact first name for the utility."]
+  contact_lastname_2 text [note: "Alternate contact last name for the utility."]
+  plants_reported_asset_manager boolean [note: "Boolean flag indicating if the utility is reported as an asset manager."]
+  plants_reported_owner boolean [note: "Boolean flag indicating if the utility is reported as the owner."]
+  street_address text [note: "Primary street address for the utility location."]
+  contact_lastname text [note: "Primary contact`s last name used for utility communications."]
+  zip_code text [note: "Primary postal code for the utility`s address."]
+  contact_title text [note: "Title of the primary contact person for the utility."]
+  state text [note: "State associated with the utility`s address."]
+  zip_code_4 text [note: "Extended portion of the zip code, if applicable, to provide additional postal detail."]
+  report_date date [note: "Snapshot date of the record, critical for tracking historical changes in the utility data."]
+  phone_number text [note: "Primary phone number for the utility."]
+  utility_id_eia number [note: "EIA-assigned identifier for the utility, serving as a business key."]
+  contact_firstname text [note: "Primary contact`s first name for communications regarding the utility."]
+  entity_type text [note: "Classification of the utility entity, indicating its type or category."]
+  data_maturity text [note: "Indicator of the record`s data quality or maturity level."]
+  phone_extension_2 text [note: "Additional phone extension information for an alternate contact number."]
+  contact_title_2 text [note: "Alternate contact title for the utility, supporting further contact details."]
+  plants_reported_operator boolean [note: "Boolean flag indicating if the utility is reported as the operator."]
+  attention_line text [note: "Additional address or contact detail intended for attention purposes."]
+  plants_reported_other_relationship boolean [note: "Boolean flag indicating if the utility has another defined relationship not covered by typical roles."]
+  address_2 text [note: "Secondary address line providing extra location details for the utility."]
+  city text [note: "City in which the utility is located."]
+
+  indexes {
+    (utility_id_eia, report_date) [pk]
+  }
+  Note: "This table captures historical snapshots of utility information from the EIA Form 860 dataset using a Slowly Changing Dimension (SCD) approach. It stores detailed contact, address, and classification data along with role-based flags that indicate the utility’s reported position (owner, operator, asset manager, etc.) over time."
+}
+
+Table CORE_EIA__ENTITY_BOILERS {
+  boiler_id text [note: "Updated: boiler_id is now included as part of the composite primary key to ensure unique identification of boiler records."]
+  plant_id_eia number [note: "Updated: plant_id_eia is now part of a composite primary key with boiler_id to uniquely identify each boiler."]
+  boiler_manufacturer_code text [note: "A code representing the boiler manufacturer. This field may be null if manufacturer information is not available."]
+  boiler_manufacturer text [note: "Name of the boiler manufacturer. This field supports human-readable identification and may be null if no data is provided."]
+
+  indexes {
+    (plant_id_eia, boiler_id) [pk]
+  }
+  Note: "Stores boiler asset details from the EIA dataset. This table captures information about each boiler including its identifier, associated plant, and manufacturer details. It is used to support analysis of power generation infrastructure and track historical as well as current asset attributes."
+}
+
+Table CORE_EIA__ENTITY_GENERATORS {
+  duct_burners boolean [note: "Indicates whether the generator is equipped with duct burners."]
+  can_switch_when_operating boolean [note: "Flag determining if the generator can switch its configuration while operating."]
+  ultrasupercritical_tech boolean [note: "Specifies if the generator utilizes ultrasupercritical technology for efficiency improvements."]
+  associated_combined_heat_power boolean [note: "Indicates whether the generator is associated with combined heat and power systems."]
+  bypass_heat_recovery boolean [note: "Flag indicating the presence of a bypass heat recovery mechanism in the generator design."]
+  generator_id text [note: "Now part of a composite primary key (plant_id_eia, generator_id) to ensure unique generator identification across all plants in the dataset. Previously a non-primary key unique text identifier for the generator."]
+  rto_iso_lmp_node_id text [note: "Represents the Regional Transmission Organization/Independent System Operator node ID used for locational marginal pricing."]
+  solid_fuel_gasification boolean [note: "Indicates if the generator employs solid fuel gasification technology."]
+  generator_operating_date date [note: "The date when the generator began operating."]
+  previously_canceled boolean [note: "Flag to denote if the generator had been previously canceled."]
+  fluidized_bed_tech boolean [note: "Indicates usage of fluidized bed technology in the generator."]
+  original_planned_generator_operating_date date [note: "The originally planned date for the generator`s operation commencement."]
+  supercritical_tech boolean [note: "Specifies if the generator is built with supercritical technology."]
+  pulverized_coal_tech boolean [note: "Indicates if the generator uses pulverized coal technology."]
+  rto_iso_location_wholesale_reporting_id text [note: "Represents the reporting identifier used for wholesale location within the RTO/ISO framework."]
+  topping_bottoming_code text [note: "Code indicating the generator`s operating mode as topping or bottoming."]
+  subcritical_tech boolean [note: "Specifies if the generator is based on subcritical technology standards."]
+  other_combustion_tech boolean [note: "Flag for other combustion technologies not covered by the standard classifications."]
+  stoker_tech boolean [note: "Indicates the use of stoker technology in the generator."]
+  plant_id_eia number [note: "Now part of a composite primary key (plant_id_eia, generator_id) to ensure unique generator identification across all plants in the dataset. Previously served as the sole primary key linking to plants in the EIA dataset."]
+
+  indexes {
+    (plant_id_eia, generator_id) [pk]
+  }
+  Note: "This table stores generator details from the EIA dataset including various technical flags, operational dates, and identifiers. It captures key technology types such as duct burners, supercritical and subcritical tech, and other combustion methods, along with operational information and plant associations."
+}
+
+Table CORE_EIA__ENTITY_PLANTS {
+  city text [note: "City where the plant is located."]
+  county text [note: "County in which the plant is situated."]
+  timezone text [note: "Time zone corresponding to the plant`s location."]
+  longitude float [note: "Geographical longitude coordinate for the plant`s location."]
+  zip_code text [note: "Postal or ZIP code of the plant`s location."]
+  street_address text [note: "Street address for the plant location, providing further location details."]
+  plant_id_eia number [pk, note: "Unique identifier for the plant as assigned by the EIA, serving as the primary key for this table."]
+  latitude float [note: "Geographical latitude coordinate for the plant`s location."]
+  state text [note: "Two-character state code where the plant is located."]
+  plant_name_eia text [note: "Official name of the plant as recorded by the EIA. This field is unique for each plant."]
+  Note: "Contains static, core information for EIA registered plants including location details and identifiers. This table holds key attributes for each plant such as address, geographical coordinates, and formal EIA identifiers, supporting physical infrastructure mapping in the energy sector."
+}
+
+Table OUT_EIA860__YEARLY_EMISSIONS_CONTROL_EQUIPMENT {
+  plant_id_pudl number [note: "Unique identifier for the plant in the PUDL system. Used to link emissions control details to a specific plant."]
+  so2_control_id_eia text [note: "EIA provided identifier for SO2 control equipment. May be null if the equipment is not applicable or not reported."]
+  operational_status text [note: "Text field indicating the operational status of the emissions control equipment (e.g., active, inactive, or retired)."]
+  mercury_control_id_eia text [note: "EIA provided identifier for mercury control equipment. Null values indicate non-reporting or inapplicability."]
+  utility_name_eia text [note: "Name of the utility as reported by EIA. Provides context for the plant`s ownership or management."]
+  operational_status_code text [note: "Short code representing the operational status of the equipment. Supports standardized status classification."]
+  data_maturity text [note: "Indicates the maturity or quality of the data record, helping to assess data completeness."]
+  report_year number [note: "The calendar year for which the emissions control data is reported. Enables temporal analysis of equipment data."]
+  particulate_control_id_eia text [note: "Identifier for particulate emissions control equipment as provided by EIA. Null values may be present if not applicable."]
+  emission_control_operating_date date [note: "The date when the emissions control equipment began operating, used to track the history of equipment deployment."]
+  nox_control_id_eia text [note: "Identifier for NOx control equipment based on EIA reporting. Useful for linking to specific environmental control measures."]
+  utility_id_pudl number [note: "Unique identifier for the utility in the PUDL system. Helps relate emissions data with utility-level details."]
+  acid_gas_control boolean [note: "Boolean flag indicating whether acid gas control measures are implemented. True if implemented, false otherwise."]
+  plant_name_eia text [note: "Name of the plant as reported by EIA. Provides additional identification context for the emissions control record."]
+  emission_control_retirement_date date [note: "The date when the emissions control equipment was retired, used for historical tracking and asset lifecycle analysis."]
+  emission_control_id_pudl float [note: "Unique identifier within PUDL for the emissions control equipment, used to link and track equipment details over time."]
+  utility_id_eia number [note: "Identifier for the utility as provided by EIA. This field allows cross-referencing utility-specific information across datasets."]
+  emission_control_equipment_cost float [note: "The reported cost associated with the emissions control equipment. Useful for economic and capital expenditure analysis."]
+  emission_control_equipment_type_code text [note: "Code representing the type or category of the emissions control equipment, supporting classification for analysis."]
+  plant_id_eia number [note: "EIA provided identifier for the plant. Used to relate the emissions control data to the specific plant as per EIA reporting."]
+
+  indexes {
+    (report_year, plant_id_eia, emission_control_id_pudl) [pk]
+  }
+  Note: "This table captures annual details about emissions control equipment associated with electric generating plants. It includes identifiers for various environmental control technologies, operational status information, cost data, and key dates related to operations and retirements."
+}
+
+Table OUT_EIA860__YEARLY_OWNERSHIP {
+  generator_id text [note: "Unique identifier for the generator; used to associate ownership records with the corresponding generator details."]
+  utility_id_pudl number [note: "Utility identifier from the PUDL system; connects this record to related utility information in associated datasets."]
+  owner_city text [note: "City where the owning entity is located; useful for geographical analyses and grouping."]
+  owner_country text [note: "Country of the owning entity; typically used to segment data regionally."]
+  plant_id_pudl number [note: "Plant identifier from the PUDL system; serves as a link to plant details in associated tables."]
+  plant_name_eia text [note: "Name of the plant as reported in EIA records; aids in cross-referencing plant data across systems."]
+  operator_utility_id_eia number [note: "Operator utility identifier per EIA data; differentiates the operating utility from the owning utility in records."]
+  plant_id_eia number [pk, note: "Plant identifier from EIA filings; used to align records with the EIA reported plant details."]
+  report_date date [note: "Date representing the reporting period for the ownership record, typically corresponding to the year-end."]
+  owner_utility_name_eia text [note: "Utility name for the owner as listed in EIA records; provides a textual reference for cross-validation of ownership."]
+  owner_utility_id_eia number [note: "Owner utility identifier from EIA data; facilitates joining with utility details on regulatory filings."]
+  owner_zip_code text [note: "Zip code of the owner’s address; helps in regional location analysis."]
+  fraction_owned float [note: "Fraction representing the ownership stake (ranging from 0 to 1); critical for evaluating control and compliance."]
+  owner_state text [note: "State where the owning entity is based; supports grouping and regional analysis."]
+  owner_street_address text [note: "Street address of the owning entity; offers granular location information."]
+  data_maturity text [note: "Indicator of the completeness or reliability of the data; useful for assessing data quality."]
+  Note: "Stores annual ownership details derived from EIA Form 860 reporting. This table captures relationships between generators, plants, and utilities, providing both PUDL and EIA identifiers as well as detailed owner address information and the fraction of ownership, which supports historical analysis and regulatory compliance."
+}
+
+Table _CORE_EIA860__COOLING_EQUIPMENT {
+  percent_dry_cooling float [note: "Represents the percentage of dry cooling used in the cooling system."]
+  water_source_code text [note: "Code indicating the type of water source for the cooling system."]
+  cooling_type_2 text [note: "Specifies the secondary cooling type employed within the system."]
+  report_date date [note: "Date of the data report, capturing the reporting period for the record."]
+  cooling_type_1 text [note: "Designates the primary cooling type used in the equipment."]
+  cooling_id_eia text [note: "Unique identifier for the cooling equipment as assigned by EIA."]
+  state text [note: "State abbreviation where the cooling equipment is located."]
+  pond_cost float [note: "Cost associated with the cooling pond component of the system in dollars."]
+  steam_plant_type_code number [note: "Numeric code representing the type of steam plant associated with the cooling equipment."]
+  intake_distance_surface_feet float [note: "Distance in feet from the surface where the water intake is located."]
+  cooling_water_source text [note: "Describes the source of water used in the cooling process."]
+  tower_type_4 text [note: "Specifies the cooling tower design or type, designated as type 4."]
+  outlet_distance_surface_feet float [note: "Measured distance in feet from the surface to the water outlet point."]
+  utility_name_eia text [note: "Name of the utility company as reported by EIA."]
+  intake_rate_100pct_gallons_per_minute float [note: "Full water intake rate at 100% capacity, measured in gallons per minute."]
+  county text [note: "County in which the cooling equipment operates or is located."]
+  tower_cost float [note: "Cost associated with the cooling tower component in dollars."]
+  outlet_distance_shore_feet float [note: "Distance in feet from the shore to the water outlet point."]
+  water_source text [note: "Detailed description of the water source used in the cooling process."]
+  intake_distance_shore_feet float [note: "Distance in feet from the shore to the water intake point."]
+  tower_operating_date date [note: "Date when the cooling tower began operation."]
+  pond_volume_acre_feet float [note: "Volume of the cooling pond, measured in acre-feet."]
+  water_type_code text [note: "Code indicating the type of water (e.g., fresh, saltwater) used in the system."]
+  power_requirement_mw float [note: "Power requirement for the cooling system, measured in megawatts."]
+  chlorine_equipment_cost float [note: "Cost associated with chlorine equipment used for water treatment in the cooling process."]
+  cooling_type_3 text [note: "Specifies the tertiary cooling type if applicable."]
+  tower_type_1 text [note: "Indicates the cooling tower design designated as type 1."]
+  cooling_type_4 text [note: "Specifies the quaternary or additional cooling type if applicable."]
+  tower_type_2 text [note: "Indicates the cooling tower design designated as type 2."]
+  cooling_system_operating_date date [note: "Date when the complete cooling system started operations."]
+  pond_surface_area_acres float [note: "Surface area of the cooling pond, measured in acres."]
+  tower_water_rate_100pct_gallons_per_minute float [note: "Maximum water rate for the cooling tower at full capacity, in gallons per minute."]
+  cooling_equipment_total_cost float [note: "Total cost of the cooling equipment, incorporating all components, in dollars."]
+  utility_id_eia number [note: "Unique numeric identifier for the utility based on EIA records."]
+  chlorine_equipment_operating_date date [note: "Operating start date of the chlorine equipment used for water treatment."]
+  pond_operating_date date [note: "Date when the cooling pond began operations."]
+  tower_type_3 text [note: "Specifies the cooling tower design designated as type 3."]
+  cooling_status_code text [note: "Operational status code of the cooling system."]
+  plant_name_eia text [note: "Name of the power plant as listed in the EIA data."]
+  plant_summer_capacity_mw float [note: "The summer capacity of the plant, measured in megawatts."]
+  cooling_water_discharge text [note: "Description or classification of the method used for cooling water discharge."]
+  plant_id_eia number [note: "Unique numeric identifier for the plant provided by the EIA."]
+
+  indexes {
+    (utility_id_eia, plant_id_eia, steam_plant_type_code) [pk]
+  }
+  Note: "Stores detailed cooling equipment data from EIA Form 860 records, including operational, cost, and configuration parameters for cooling systems used in electric power plants."
+}
+
+Table _CORE_EIA860__FGD_EQUIPMENT {
+  data_maturity text [note: "Indicates the level of data processing maturity or quality for the record."]
+  so2_equipment_type_3 text [note: "Classifies the third type of SO2 equipment, representing a specific equipment subtype."]
+  plant_summer_capacity_mw float [note: "Shows the plant`s summer capacity in megawatts."]
+  fgd_other_cost float [note: "Records additional costs associated with the FGD system not covered by primary cost fields."]
+  so2_emission_rate_lbs_per_hour float [note: "Indicates the rate of SO2 emissions in pounds per hour from the FGD equipment."]
+  water_source text [note: "Specifies the water source utilized in operations, which may impact FGD performance."]
+  sorbent_type_2 text [note: "Captures the secondary sorbent classification used in emissions control processes."]
+  so2_equipment_type_4 text [note: "Represents the fourth classification of SO2 equipment; flagged as unique in this context."]
+  sludge_pond boolean [note: "Indicates with a boolean flag whether a sludge pond is present for byproduct disposal."]
+  fgd_structure_cost float [note: "Documents the cost of the physical structure of the FGD system."]
+  fgd_manufacturer text [note: "Records the name of the manufacturer supplying the FGD equipment."]
+  specifications_of_coal_ash float [note: "Numeric metric representing the specifications or quality of coal ash produced."]
+  fgd_operating_date date [note: "The date on which the FGD system began operation."]
+  utility_id_eia number [note: "Unique identifier for the utility as provided in the EIA dataset."]
+  sorbent_type_4 text [note: "Denotes the fourth category of sorbent type used in the emission control process."]
+  pond_landfill_requirements_acre_foot_per_year float [note: "Annual water requirement for pond or landfill operations measured in acre-feet."]
+  county text [note: "Name of the county where the facility is located."]
+  fgd_operational_status_code text [note: "A code indicating the operational status of the FGD system."]
+  state_id_fips text [note: "FIPS code for the state where the facility operates."]
+  flue_gas_entering_fgd_pct_of_total float [note: "Percentage of the total flue gas that enters the FGD system."]
+  sludge_pond_lined boolean [note: "Boolean flag indicating if the sludge pond is lined for enhanced environmental protection."]
+  utility_name_eia text [note: "Name of the utility as reported in the EIA dataset."]
+  fgd_trains_total float [note: "Total number of FGD trains installed at the facility."]
+  so2_equipment_type_1 text [note: "Specifies the first type classification of SO2 equipment."]
+  sludge_disposal_cost float [note: "Represents the cost incurred for the disposal of sludge generated by the FGD process."]
+  flue_gas_exit_rate_cubic_feet_per_minute float [note: "Measures the exit rate of flue gas from the FGD system in cubic feet per minute."]
+  so2_control_id_eia text [note: "Identifier for the SO2 control equipment as per EIA records."]
+  fgd_trains_100pct float [note: "Indicates the number of FGD trains operating at full (100%) capacity."]
+  report_date date [note: "The date on which the record was reported."]
+  total_fgd_equipment_cost float [note: "Total cost of the FGD equipment installation, capturing all related capital expenses."]
+  sorbent_type_3 text [note: "Describes the third classification of sorbent type used in FGD operations."]
+  specifications_of_coal_sulfur float [note: "Numeric indicator for coal sulfur specifications, reflecting fuel quality or emissions properties."]
+  so2_equipment_type_2 text [note: "Represents the second classification of SO2 equipment, detailing another equipment type."]
+  flue_gas_exit_temperature_fahrenheit float [note: "Records the temperature of the flue gas exiting the FGD system in Fahrenheit."]
+  fgd_manufacturer_code text [note: "Code assigned to the FGD manufacturer for identification purposes."]
+  so2_removal_efficiency_design float [note: "The designed efficiency for SO2 removal, expressed numerically to indicate performance."]
+  plant_id_eia number [note: "Unique identifier for the plant as provided by the EIA dataset."]
+  state text [note: "Name of the state where the plant is located."]
+  county_id_fips text [note: "FIPS code identifier for the county of the facility."]
+  steam_plant_type_code number [note: "Numeric code representing the type of steam plant operation."]
+  byproduct_recovery boolean [note: "Boolean flag indicating whether byproduct recovery processes are employed."]
+  sorbent_type_1 text [note: "Specifies the primary classification of sorbent type used in the FGD process."]
+  flue_gas_bypass_fgd boolean [note: "Indicates with a boolean value if flue gas bypasses the FGD system during operation."]
+
+  indexes {
+    (utility_id_eia, plant_id_eia, steam_plant_type_code) [pk]
+  }
+  Note: "Contains detailed records of flue gas desulfurization (FGD) equipment as reported in the EIA Form 860 dataset. The table includes cost metrics, emission rates, operational dates, manufacturer details, and various technical parameters to support analysis of power plant environmental compliance and performance."
+}
+
+// Relationships
+Ref: CORE_EIA__ENTITY_PLANTS.plant_id_eia < CORE_EIA860__ASSN_BOILER_COOLING.plant_id_eia // one_to_many
+Ref: CORE_EIA__ENTITY_PLANTS.plant_id_eia < CORE_EIA860__ASSN_BOILER_GENERATOR.plant_id_eia // one_to_many
+Ref: CORE_EIA__ENTITY_PLANTS.plant_id_eia < CORE_EIA860__ASSN_BOILER_STACK_FLUE.plant_id_eia // one_to_many
+Ref: CORE_EIA__ENTITY_PLANTS.plant_id_eia < CORE_EIA860__ASSN_YEARLY_BOILER_EMISSIONS_CONTROL_EQUIPMENT.plant_id_eia // one_to_many
+Ref: CORE_EIA__ENTITY_PLANTS.plant_id_eia < CORE_EIA860__SCD_BOILERS.plant_id_eia // one_to_many
+Ref: OUT_EIA860__YEARLY_EMISSIONS_CONTROL_EQUIPMENT.(report_year, plant_id_eia, emission_control_id_pudl) - CORE_EIA860__SCD_EMISSIONS_CONTROL_EQUIPMENT.(report_year, plant_id_eia, emission_control_id_pudl) // one_to_one
+Ref: CORE_EIA__ENTITY_PLANTS.plant_id_eia < CORE_EIA860__SCD_EMISSIONS_CONTROL_EQUIPMENT.plant_id_eia // one_to_many
+Ref: CORE_EIA__ENTITY_PLANTS.plant_id_eia < CORE_EIA860__SCD_GENERATORS.plant_id_eia // one_to_many
+Ref: CORE_EIA__ENTITY_PLANTS.plant_id_eia < CORE_EIA860__SCD_GENERATORS_ENERGY_STORAGE.plant_id_eia // one_to_many
+Ref: CORE_EIA__ENTITY_PLANTS.plant_id_eia < CORE_EIA860__SCD_GENERATORS_ENERGY_STORAGE.plant_id_eia_direct_support_2 // one_to_many
+Ref: CORE_EIA__ENTITY_PLANTS.plant_id_eia < CORE_EIA860__SCD_GENERATORS_ENERGY_STORAGE.plant_id_eia_direct_support_1 // one_to_many
+Ref: CORE_EIA__ENTITY_PLANTS.plant_id_eia < CORE_EIA860__SCD_GENERATORS_ENERGY_STORAGE.plant_id_eia_direct_support_3 // one_to_many
+Ref: CORE_EIA__ENTITY_PLANTS.plant_id_eia < CORE_EIA860__SCD_GENERATORS_MULTIFUEL.plant_id_eia // one_to_many
+Ref: CORE_EIA__ENTITY_PLANTS.plant_id_eia < CORE_EIA860__SCD_GENERATORS_SOLAR.plant_id_eia // one_to_many
+Ref: CORE_EIA__ENTITY_PLANTS.plant_id_eia < CORE_EIA860__SCD_GENERATORS_WIND.plant_id_eia // one_to_many
+Ref: CORE_EIA__ENTITY_PLANTS.plant_id_eia < CORE_EIA860__SCD_OWNERSHIP.plant_id_eia // one_to_many
+Ref: CORE_EIA__ENTITY_PLANTS.plant_id_eia < CORE_EIA860__SCD_PLANTS.plant_id_eia // one_to_many
+Ref: _CORE_EIA860__COOLING_EQUIPMENT.utility_id_eia > CORE_EIA860__SCD_UTILITIES.utility_id_eia // many_to_one
+Ref: CORE_EIA860__ASSN_BOILER_COOLING.(plant_id_eia, boiler_id) > CORE_EIA__ENTITY_BOILERS.(plant_id_eia, boiler_id) // many_to_one
+Ref: CORE_EIA860__ASSN_BOILER_GENERATOR.(plant_id_eia, boiler_id) > CORE_EIA__ENTITY_BOILERS.(plant_id_eia, boiler_id) // many_to_one
+Ref: CORE_EIA860__ASSN_BOILER_STACK_FLUE.(plant_id_eia, boiler_id) > CORE_EIA__ENTITY_BOILERS.(plant_id_eia, boiler_id) // many_to_one
+Ref: CORE_EIA860__ASSN_YEARLY_BOILER_EMISSIONS_CONTROL_EQUIPMENT.(plant_id_eia, boiler_id) > CORE_EIA__ENTITY_BOILERS.(plant_id_eia, boiler_id) // many_to_one
+Ref: CORE_EIA860__SCD_BOILERS.(plant_id_eia, boiler_id) > CORE_EIA__ENTITY_BOILERS.(plant_id_eia, boiler_id) // many_to_one
+Ref: CORE_EIA__ENTITY_PLANTS.plant_id_eia < CORE_EIA__ENTITY_BOILERS.plant_id_eia // one_to_many
+Ref: CORE_EIA860__ASSN_BOILER_GENERATOR.(plant_id_eia, generator_id) > CORE_EIA__ENTITY_GENERATORS.(plant_id_eia, generator_id) // many_to_one
+Ref: CORE_EIA860__SCD_GENERATORS.(plant_id_eia, generator_id) > CORE_EIA__ENTITY_GENERATORS.(plant_id_eia, generator_id) // many_to_one
+Ref: CORE_EIA860__SCD_GENERATORS_ENERGY_STORAGE.(plant_id_eia, generator_id) > CORE_EIA__ENTITY_GENERATORS.(plant_id_eia, generator_id) // many_to_one
+Ref: CORE_EIA860__SCD_GENERATORS_SOLAR.(plant_id_eia, generator_id) > CORE_EIA__ENTITY_GENERATORS.(plant_id_eia, generator_id) // many_to_one
+Ref: CORE_EIA860__SCD_GENERATORS_WIND.(plant_id_eia, generator_id) > CORE_EIA__ENTITY_GENERATORS.(plant_id_eia, generator_id) // many_to_one
+Ref: CORE_EIA860__SCD_OWNERSHIP.(plant_id_eia, generator_id) > CORE_EIA__ENTITY_GENERATORS.(plant_id_eia, generator_id) // many_to_one
+Ref: CORE_EIA__ENTITY_PLANTS.plant_id_eia < CORE_EIA__ENTITY_GENERATORS.plant_id_eia // one_to_many
+Ref: OUT_EIA860__YEARLY_OWNERSHIP.(plant_id_eia, generator_id) > CORE_EIA__ENTITY_GENERATORS.(plant_id_eia, generator_id) // many_to_one
+Ref: OUT_EIA860__YEARLY_EMISSIONS_CONTROL_EQUIPMENT.plant_id_eia > CORE_EIA__ENTITY_PLANTS.plant_id_eia // many_to_one
+Ref: OUT_EIA860__YEARLY_OWNERSHIP.plant_id_eia > CORE_EIA__ENTITY_PLANTS.plant_id_eia // many_to_one
+Ref: _CORE_EIA860__COOLING_EQUIPMENT.plant_id_eia > CORE_EIA__ENTITY_PLANTS.plant_id_eia // many_to_one
+Ref: _CORE_EIA860__FGD_EQUIPMENT.plant_id_eia > CORE_EIA__ENTITY_PLANTS.plant_id_eia // many_to_one

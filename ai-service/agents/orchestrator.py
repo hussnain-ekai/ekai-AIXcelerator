@@ -1,9 +1,11 @@
-"""Main Deep Agents orchestrator with 6 specialized subagents.
+"""Main Deep Agents orchestrator with 8 specialized subagents.
 
 Uses `create_deep_agent` from the deepagents library to build a LangGraph-based
 agent that delegates to specialized subagents based on conversation phase:
     - Discovery: Profiles schemas, detects PKs/FKs, builds ERD
+    - Transformation: Creates Dynamic Tables for bronze/silver data cleanup
     - Requirements: Adaptive BRD capture (confidence-based, 1-4 question rounds)
+    - Modeling: Designs and creates Gold layer star schema (fact + dimension tables)
     - Generation: Creates semantic view YAML from BRD
     - Validation: Tests generated YAML against real data via RCR
     - Publishing: Deploys semantic view + Cortex Agent
@@ -21,9 +23,11 @@ from agents.prompts import (
     DISCOVERY_PROMPT,
     EXPLORER_PROMPT,
     GENERATION_PROMPT,
+    MODELING_PROMPT,
     ORCHESTRATOR_PROMPT,
     PUBLISHING_PROMPT,
     REQUIREMENTS_PROMPT,
+    TRANSFORMATION_PROMPT,
     VALIDATION_PROMPT,
     sanitize_prompt_for_azure,
 )
@@ -32,7 +36,9 @@ logger = logging.getLogger(__name__)
 
 # Tools organized by subagent
 _discovery_tools: list[Any] = []
+_transformation_tools: list[Any] = []
 _requirements_tools: list[Any] = []
+_modeling_tools: list[Any] = []
 _generation_tools: list[Any] = []
 _validation_tools: list[Any] = []
 _publishing_tools: list[Any] = []
@@ -41,8 +47,8 @@ _explorer_tools: list[Any] = []
 
 def _load_tools() -> None:
     """Load all LangChain tools from the tools modules."""
-    global _discovery_tools, _requirements_tools, _generation_tools
-    global _validation_tools, _publishing_tools, _explorer_tools
+    global _discovery_tools, _transformation_tools, _requirements_tools, _modeling_tools
+    global _generation_tools, _validation_tools, _publishing_tools, _explorer_tools
 
     from tools.snowflake_tools import (
         compute_quality_score,
@@ -81,6 +87,27 @@ def _load_tools() -> None:
         upload_artifact,
     )
     from tools.discovery_tools import build_erd_from_description
+    from tools.transformation_tools import (
+        execute_transformation_ddl,
+        generate_dynamic_table_ddl,
+        profile_source_table,
+        register_transformed_layer,
+        validate_transformation,
+    )
+    from tools.modeling_tools import (
+        create_gold_table,
+        generate_gold_table_ddl as generate_gold_ddl,
+        validate_gold_grain,
+        save_data_catalog,
+        save_business_glossary,
+        save_metrics_definitions,
+        save_validation_rules,
+        get_latest_data_catalog,
+        get_latest_business_glossary,
+        get_latest_metrics_definitions,
+        get_latest_validation_rules,
+        register_gold_layer,
+    )
 
     # Discovery Agent tools — conversational discovery + Data Description + ERD building
     _discovery_tools = [
@@ -92,6 +119,16 @@ def _load_tools() -> None:
         build_erd_from_description,
     ]
 
+    # Transformation Agent tools — Dynamic Table creation and validation
+    _transformation_tools = [
+        profile_source_table,
+        generate_dynamic_table_ddl,
+        execute_transformation_ddl,
+        validate_transformation,
+        register_transformed_layer,
+        execute_rcr_query,
+    ]
+
     # Requirements Agent tools — NO execute_rcr_query (discovery context has all
     # field analysis; ad-hoc queries distract from BRD generation)
     _requirements_tools = [
@@ -100,6 +137,26 @@ def _load_tools() -> None:
         upload_artifact,
         get_latest_brd,
         get_latest_data_description,
+    ]
+
+    # Modeling Agent tools — Gold layer star schema design and DDL
+    _modeling_tools = [
+        get_latest_brd,
+        get_latest_data_description,
+        execute_rcr_query,
+        generate_gold_ddl,
+        create_gold_table,
+        validate_gold_grain,
+        save_data_catalog,
+        save_business_glossary,
+        save_metrics_definitions,
+        save_validation_rules,
+        get_latest_data_catalog,
+        get_latest_business_glossary,
+        get_latest_metrics_definitions,
+        get_latest_validation_rules,
+        register_gold_layer,
+        upload_artifact,
     ]
 
     from tools.web_tools import fetch_documentation
@@ -149,7 +206,7 @@ def _load_tools() -> None:
 
 
 def _build_subagents(model: Any, sanitize: bool = False) -> list[dict[str, Any]]:
-    """Build the 6 subagent configurations for create_deep_agent.
+    """Build the 8 subagent configurations for create_deep_agent.
 
     Args:
         model: The LangChain chat model to use for all subagents (same as orchestrator).
@@ -171,6 +228,30 @@ def _build_subagents(model: Any, sanitize: bool = False) -> list[dict[str, Any]]
             ),
             "system_prompt": _s(DISCOVERY_PROMPT),
             "tools": _discovery_tools,
+            "model": model,
+        },
+        {
+            "name": "transformation-agent",
+            "description": (
+                "Prepares non-gold data for semantic modeling by creating "
+                "Snowflake Dynamic Tables. Handles type casting, deduplication, "
+                "null handling, and column renaming. Use after discovery when "
+                "tables are classified as bronze or silver quality."
+            ),
+            "system_prompt": _s(TRANSFORMATION_PROMPT),
+            "tools": _transformation_tools,
+            "model": model,
+        },
+        {
+            "name": "modeling-agent",
+            "description": (
+                "Designs and creates Gold layer star schema (fact and dimension "
+                "tables) as Snowflake Dynamic Tables based on business requirements. "
+                "Generates data catalog, business glossary, metrics definitions, "
+                "and validation rules. Use after BRD is approved."
+            ),
+            "system_prompt": _s(MODELING_PROMPT),
+            "tools": _modeling_tools,
             "model": model,
         },
         {
@@ -293,8 +374,8 @@ async def get_orchestrator() -> CompiledStateGraph:
 
     Returns a compiled LangGraph graph configured with:
     - The LLM from the configured provider (Cortex, Azure OpenAI, Anthropic, OpenAI, Vertex AI)
-    - 6 specialized subagents (all using the same model as orchestrator)
-    - All 19 LangChain tools
+    - 8 specialized subagents (all using the same model as orchestrator)
+    - All LangChain tools (discovery, transformation, modeling, requirements, generation, validation, publishing, explorer)
     - Langfuse tracing for monitoring LLM usage
     - PostgreSQL checkpointer for persistent conversation state
     """
@@ -366,31 +447,3 @@ def _is_azure_model(model: Any) -> bool:
     return False
 
 
-async def build_fallback_orchestrator(fallback_model: Any) -> CompiledStateGraph:
-    """Build a one-shot orchestrator using a specific fallback model.
-
-    Does NOT modify the cached ``_orchestrator`` — this graph is used only
-    for the current request. The next request will use the primary model again.
-
-    If the fallback model is Azure OpenAI, prompts are automatically sanitized
-    to avoid Azure's content filter (jailbreak detection).
-    """
-    from deepagents import create_deep_agent
-
-    checkpointer = await get_checkpointer()
-    needs_sanitize = _is_azure_model(fallback_model)
-    if needs_sanitize:
-        logger.info("Azure fallback detected — sanitizing prompts for content filter")
-    subagents = _build_subagents(fallback_model, sanitize=needs_sanitize)
-
-    orch_prompt = sanitize_prompt_for_azure(ORCHESTRATOR_PROMPT) if needs_sanitize else ORCHESTRATOR_PROMPT
-    graph = create_deep_agent(
-        model=fallback_model,
-        system_prompt=orch_prompt,
-        tools=[],
-        subagents=subagents,
-        name="ekaix-orchestrator",
-        checkpointer=checkpointer,
-    )
-    logger.info("Built fallback orchestrator with model: %s (sanitized=%s)", type(fallback_model).__name__, needs_sanitize)
-    return graph

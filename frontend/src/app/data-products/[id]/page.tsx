@@ -27,10 +27,15 @@ import { YAMLViewer } from '@/components/panels/YAMLViewer';
 import { BRDViewer } from '@/components/panels/BRDViewer';
 import { DataPreview } from '@/components/panels/DataPreview';
 import { DataDescriptionViewer } from '@/components/panels/DataDescriptionViewer';
+import { DataCatalogViewer } from '@/components/panels/DataCatalogViewer';
+import { BusinessGlossaryViewer } from '@/components/panels/BusinessGlossaryViewer';
+import { MetricsViewer } from '@/components/panels/MetricsViewer';
+import { ValidationRulesViewer } from '@/components/panels/ValidationRulesViewer';
+import { LineageDiagramViewer } from '@/components/panels/LineageDiagramViewer';
 import { useDataProduct } from '@/hooks/useDataProducts';
 import { useAgent } from '@/hooks/useAgent';
 import { useSessionRecovery } from '@/hooks/useSessionRecovery';
-import { useArtifacts, useERDData, useQualityReport, useYAMLContent, useBRD, useDataDescription } from '@/hooks/useArtifacts';
+import { useArtifacts, useERDData, useQualityReport, useYAMLContent, useBRD, useDataDescription, useDataCatalog, useBusinessGlossary, useMetricsDefinitions, useValidationRules, useLineageData } from '@/hooks/useArtifacts';
 import { useQueryClient } from '@tanstack/react-query';
 import { ChatStoreProvider, useChatStore, useChatStoreApi } from '@/stores/chatStoreProvider';
 import type { ArtifactType } from '@/stores/chatStore';
@@ -40,7 +45,7 @@ interface ChatWorkspacePageProps {
 }
 
 /** Map chatStore phase to ArtifactsPanel phase label. */
-function phaseForArtifactType(type: ArtifactType): 'DISCOVERY' | 'REQUIREMENTS' | 'GENERATION' | 'VALIDATION' {
+function phaseForArtifactType(type: ArtifactType): 'DISCOVERY' | 'REQUIREMENTS' | 'MODELING' | 'GENERATION' | 'VALIDATION' {
   switch (type) {
     case 'erd':
     case 'data_quality':
@@ -49,6 +54,12 @@ function phaseForArtifactType(type: ArtifactType): 'DISCOVERY' | 'REQUIREMENTS' 
       return 'DISCOVERY';
     case 'brd':
       return 'REQUIREMENTS';
+    case 'data_catalog':
+    case 'business_glossary':
+    case 'metrics':
+    case 'validation_rules':
+    case 'lineage':
+      return 'MODELING';
     case 'yaml':
       return 'GENERATION';
   }
@@ -87,6 +98,7 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
   const artifacts = useChatStore((state) => state.artifacts);
   const activePanel = useChatStore((state) => state.activePanel);
   const setActivePanel = useChatStore((state) => state.setActivePanel);
+  const dataTier = useChatStore((state) => state.dataTier);
   const addArtifact = useChatStore((state) => state.addArtifact);
   const queryClient = useQueryClient();
   const [tablesOpen, setTablesOpen] = useState(false);
@@ -124,6 +136,11 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
       quality_report: 'data_quality',
       document: 'data_preview',
       data_description: 'data_description',
+      data_catalog: 'data_catalog',
+      business_glossary: 'business_glossary',
+      metrics: 'metrics',
+      validation_rules: 'validation_rules',
+      lineage: 'lineage',
     };
     const TITLE_MAP: Record<string, string> = {
       erd: 'ERD Diagram',
@@ -132,6 +149,11 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
       quality_report: 'Data Quality Report',
       document: 'Data Preview',
       data_description: 'Data Description',
+      data_catalog: 'Data Catalog',
+      business_glossary: 'Business Glossary',
+      metrics: 'Metrics & KPIs',
+      validation_rules: 'Validation Rules',
+      lineage: 'Data Lineage',
     };
 
     let hasDiscoveryArtifacts = false;
@@ -185,6 +207,11 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
   const { data: yamlData } = useYAMLContent(id, activePanel === 'yaml');
   const { data: brdData, isLoading: brdLoading } = useBRD(id, activePanel === 'brd');
   const { data: dataDescriptionData, isLoading: dataDescriptionLoading } = useDataDescription(id, activePanel === 'data_description');
+  const { data: dataCatalogData, isLoading: dataCatalogLoading } = useDataCatalog(id, activePanel === 'data_catalog');
+  const { data: glossaryData, isLoading: glossaryLoading } = useBusinessGlossary(id, activePanel === 'business_glossary');
+  const { data: metricsData, isLoading: metricsLoading } = useMetricsDefinitions(id, activePanel === 'metrics');
+  const { data: validationRulesData, isLoading: validationRulesLoading } = useValidationRules(id, activePanel === 'validation_rules');
+  const { data: lineageData, isLoading: lineageLoading } = useLineageData(id, activePanel === 'lineage');
 
   const handleSendMessage = useCallback(
     (content: string, files?: File[]) => {
@@ -388,7 +415,7 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
 
       {/* Phase stepper */}
       <Divider />
-      <PhaseStepper currentPhase={currentPhase} />
+      <PhaseStepper currentPhase={currentPhase} dataTier={dataTier} />
       <Divider />
 
       {/* Message thread */}
@@ -480,6 +507,56 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
           onClose={handleClosePanel}
           dataDescription={dataDescriptionData ?? null}
           isLoading={dataDescriptionLoading}
+        />
+      </ComponentErrorBoundary>
+
+      {/* Data Catalog viewer panel */}
+      <ComponentErrorBoundary fallbackMessage="Data catalog failed to render.">
+        <DataCatalogViewer
+          open={activePanel === 'data_catalog'}
+          onClose={handleClosePanel}
+          data={dataCatalogData ?? null}
+          isLoading={dataCatalogLoading}
+        />
+      </ComponentErrorBoundary>
+
+      {/* Business Glossary viewer panel */}
+      <ComponentErrorBoundary fallbackMessage="Business glossary failed to render.">
+        <BusinessGlossaryViewer
+          open={activePanel === 'business_glossary'}
+          onClose={handleClosePanel}
+          data={glossaryData ?? null}
+          isLoading={glossaryLoading}
+        />
+      </ComponentErrorBoundary>
+
+      {/* Metrics & KPIs viewer panel */}
+      <ComponentErrorBoundary fallbackMessage="Metrics viewer failed to render.">
+        <MetricsViewer
+          open={activePanel === 'metrics'}
+          onClose={handleClosePanel}
+          data={metricsData ?? null}
+          isLoading={metricsLoading}
+        />
+      </ComponentErrorBoundary>
+
+      {/* Validation Rules viewer panel */}
+      <ComponentErrorBoundary fallbackMessage="Validation rules failed to render.">
+        <ValidationRulesViewer
+          open={activePanel === 'validation_rules'}
+          onClose={handleClosePanel}
+          data={validationRulesData ?? null}
+          isLoading={validationRulesLoading}
+        />
+      </ComponentErrorBoundary>
+
+      {/* Lineage Diagram viewer panel */}
+      <ComponentErrorBoundary fallbackMessage="Data lineage failed to render.">
+        <LineageDiagramViewer
+          open={activePanel === 'lineage'}
+          onClose={handleClosePanel}
+          data={lineageData ?? null}
+          isLoading={lineageLoading}
         />
       </ComponentErrorBoundary>
     </Box>

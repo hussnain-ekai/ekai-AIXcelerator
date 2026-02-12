@@ -54,6 +54,7 @@ StreamEventType = Literal[
     "error",
     "done",
     "pipeline_progress",
+    "data_maturity",
 ]
 
 

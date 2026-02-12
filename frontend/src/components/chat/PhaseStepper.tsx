@@ -2,10 +2,11 @@
 
 import { Box, Typography } from '@mui/material';
 import CheckIcon from '@mui/icons-material/Check';
-import type { AgentPhase } from '@/stores/chatStore';
+import type { AgentPhase, DataTier } from '@/stores/chatStore';
 
 interface PhaseStepperProps {
   currentPhase: AgentPhase;
+  dataTier: DataTier;
 }
 
 interface PhaseStep {
@@ -13,7 +14,19 @@ interface PhaseStep {
   label: string;
 }
 
-const PHASES: PhaseStep[] = [
+/** All 7 phases — shown for bronze/silver data that needs preparation + modeling. */
+const ALL_PHASES: PhaseStep[] = [
+  { key: 'discovery', label: 'Discovery' },
+  { key: 'prepare', label: 'Prepare' },
+  { key: 'requirements', label: 'Requirements' },
+  { key: 'modeling', label: 'Modeling' },
+  { key: 'generation', label: 'Generation' },
+  { key: 'validation', label: 'Validation' },
+  { key: 'publishing', label: 'Publishing' },
+];
+
+/** Gold-layer shortcut — 5 phases (transformation + modeling skipped). */
+const GOLD_PHASES: PhaseStep[] = [
   { key: 'discovery', label: 'Discovery' },
   { key: 'requirements', label: 'Requirements' },
   { key: 'generation', label: 'Generation' },
@@ -27,10 +40,10 @@ const GRAY_TEXT = '#9E9E9E';
 
 type StepStatus = 'completed' | 'active' | 'future';
 
-function getPhaseIndex(phase: AgentPhase): number {
-  // 'explorer' comes after publishing — all 5 phases are complete
-  if (phase === 'explorer') return PHASES.length;
-  const index = PHASES.findIndex((p) => p.key === phase);
+function getPhaseIndex(phase: AgentPhase, phases: PhaseStep[]): number {
+  // 'explorer' comes after publishing — all phases are complete
+  if (phase === 'explorer') return phases.length;
+  const index = phases.findIndex((p) => p.key === phase);
   return index >= 0 ? index : -1;
 }
 
@@ -107,14 +120,17 @@ function ConnectorLine({ status }: { status: StepStatus }): React.ReactNode {
   );
 }
 
-export function PhaseStepper({ currentPhase }: PhaseStepperProps): React.ReactNode {
-  const activeIndex = getPhaseIndex(currentPhase);
+export function PhaseStepper({ currentPhase, dataTier }: PhaseStepperProps): React.ReactNode {
+  // Gold data skips transformation + modeling → show 5 phases.
+  // Default (null = before classification) shows all 7.
+  const phases = dataTier === 'gold' ? GOLD_PHASES : ALL_PHASES;
+  const activeIndex = getPhaseIndex(currentPhase, phases);
 
   return (
     <Box sx={{ display: 'flex', alignItems: 'center', px: 3, py: 2 }}>
-      {PHASES.map((phase, index) => {
+      {phases.map((phase, index) => {
         const status = getStepStatus(index, activeIndex);
-        const isLast = index === PHASES.length - 1;
+        const isLast = index === phases.length - 1;
         const textColor = status === 'future' ? GRAY_TEXT : GOLD;
 
         return (

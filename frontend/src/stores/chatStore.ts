@@ -1,8 +1,9 @@
 import { createStore } from 'zustand/vanilla';
 
 type MessageRole = 'user' | 'assistant' | 'system';
-type AgentPhase = 'discovery' | 'requirements' | 'generation' | 'validation' | 'publishing' | 'explorer' | 'idle';
-type ArtifactType = 'erd' | 'yaml' | 'brd' | 'data_quality' | 'data_preview' | 'data_description';
+type AgentPhase = 'discovery' | 'prepare' | 'requirements' | 'modeling' | 'generation' | 'validation' | 'publishing' | 'explorer' | 'idle';
+type ArtifactType = 'erd' | 'yaml' | 'brd' | 'data_quality' | 'data_preview' | 'data_description' | 'data_catalog' | 'business_glossary' | 'metrics' | 'validation_rules' | 'lineage';
+type DataTier = 'gold' | 'silver' | 'bronze' | null;
 
 interface ChatMessageAttachment {
   filename: string;
@@ -61,6 +62,8 @@ interface ChatState {
   pipelineProgress: PipelineProgress | null;
   /** True while discovery pipeline is running — blocks artifact hydration from DB. */
   pipelineRunning: boolean;
+  /** Data maturity tier from discovery pipeline — controls phase stepper display. */
+  dataTier: DataTier;
   addMessage: (message: ChatMessage) => void;
   updateLastAssistantMessage: (content: string) => void;
   finalizeLastMessage: () => void;
@@ -72,12 +75,13 @@ interface ChatState {
   setActivePanel: (panel: ArtifactType | null) => void;
   setPipelineProgress: (progress: PipelineProgress | null) => void;
   setPipelineRunning: (running: boolean) => void;
+  setDataTier: (tier: DataTier) => void;
   attachArtifactToLastAssistant: (artifactType: ArtifactType) => void;
   truncateAfter: (messageId: string) => void;
   editMessage: (messageId: string, newContent: string) => void;
   clearMessages: () => void;
   reset: () => void;
-  hydrateFromHistory: (messages: ChatMessage[], sessionId: string, phase: AgentPhase) => void;
+  hydrateFromHistory: (messages: ChatMessage[], sessionId: string, phase: AgentPhase, dataTier?: DataTier) => void;
   setHydrated: (hydrated: boolean) => void;
 }
 
@@ -91,6 +95,7 @@ const INITIAL_STATE = {
   isHydrated: false,
   pipelineProgress: null as PipelineProgress | null,
   pipelineRunning: false,
+  dataTier: null as DataTier,
 };
 
 export type ChatStore = ReturnType<typeof createChatStore>;
@@ -196,6 +201,9 @@ export function createChatStore() {
     setPipelineRunning: (running: boolean) =>
       set({ pipelineRunning: running }),
 
+    setDataTier: (tier: DataTier) =>
+      set({ dataTier: tier }),
+
     attachArtifactToLastAssistant: (artifactType: ArtifactType) =>
       set((state) => {
         const messages = [...state.messages];
@@ -236,16 +244,18 @@ export function createChatStore() {
         sessionId: null,
         isHydrated: false,
         pipelineProgress: null,
+        dataTier: null,
       }),
 
     reset: () => set(INITIAL_STATE),
 
-    hydrateFromHistory: (messages: ChatMessage[], sessionId: string, phase: AgentPhase) =>
+    hydrateFromHistory: (messages: ChatMessage[], sessionId: string, phase: AgentPhase, dataTier?: DataTier) =>
       set({
         messages,
         sessionId,
         currentPhase: phase,
         isHydrated: true,
+        ...(dataTier !== undefined ? { dataTier } : {}),
       }),
 
     setHydrated: (hydrated: boolean) =>
@@ -262,5 +272,6 @@ export type {
   MessageRole,
   AgentPhase,
   ArtifactType,
+  DataTier,
   PipelineProgress,
 };

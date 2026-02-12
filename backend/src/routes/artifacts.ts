@@ -296,6 +296,86 @@ export async function artifactRoutes(app: FastifyInstance): Promise<void> {
   );
 
   /**
+   * GET /artifacts/:dataProductId/lineage
+   * Get lineage data from Neo4j for a data product.
+   * Returns nodes (Table/SilverTable/GoldTable) and edges (TRANSFORMED_TO/MODELED_TO).
+   */
+  app.get(
+    '/:dataProductId/lineage',
+    async (
+      request: FastifyRequest<{ Params: { dataProductId: string } }>,
+      reply,
+    ) => {
+      const { dataProductId } = request.params;
+
+      try {
+        const lineageData = await neo4jService.executeRead(async (tx) => {
+          // Fetch all Table, SilverTable, GoldTable nodes for this data product
+          const nodesResult = await tx.run(
+            `MATCH (n {data_product_id: $dataProductId})
+             WHERE n:Table OR n:SilverTable OR n:GoldTable
+             RETURN labels(n) as labels, n.fqn as fqn, n.table_type as table_type, n.classification as classification`,
+            { dataProductId },
+          );
+
+          // Fetch TRANSFORMED_TO and MODELED_TO edges
+          const edgesResult = await tx.run(
+            `MATCH (s {data_product_id: $dataProductId})-[r:TRANSFORMED_TO|MODELED_TO]->(t)
+             RETURN s.fqn as source, t.fqn as target, type(r) as relType`,
+            { dataProductId },
+          );
+
+          // Build a set of node FQNs that participate in lineage edges
+          const lineageNodeFqns = new Set<string>();
+          const edges = edgesResult.records.map((record, idx) => {
+            const source = record.get('source') as string;
+            const target = record.get('target') as string;
+            lineageNodeFqns.add(source);
+            lineageNodeFqns.add(target);
+            return {
+              id: `lineage-edge-${idx}`,
+              source,
+              target,
+              relType: record.get('relType') as string,
+            };
+          });
+
+          // Only include nodes that participate in lineage relationships
+          const nodes = nodesResult.records
+            .filter((record) => lineageNodeFqns.has(record.get('fqn') as string))
+            .map((record) => {
+              const labels = record.get('labels') as string[];
+              const fqn = record.get('fqn') as string;
+              const tableType = (record.get('table_type') as string) ?? '';
+              const classification = (record.get('classification') as string) ?? '';
+
+              // Determine layer from Neo4j labels
+              let layer: 'source' | 'silver' | 'gold' = 'source';
+              if (labels.includes('GoldTable')) {
+                layer = 'gold';
+              } else if (labels.includes('SilverTable')) {
+                layer = 'silver';
+              }
+
+              return {
+                fqn,
+                layer,
+                tableType: tableType || classification || '',
+              };
+            });
+
+          return { nodes, edges };
+        });
+
+        return reply.send(lineageData);
+      } catch (err: unknown) {
+        request.log.error({ err, dataProductId }, 'Failed to fetch lineage from Neo4j');
+        return reply.send({ nodes: [], edges: [] });
+      }
+    },
+  );
+
+  /**
    * GET /artifacts/:dataProductId/yaml
    * Get the latest semantic view YAML for a data product.
    */
@@ -565,6 +645,166 @@ export async function artifactRoutes(app: FastifyInstance): Promise<void> {
       };
 
       return reply.send(transformedReport);
+    },
+  );
+
+  /**
+   * GET /artifacts/:dataProductId/data-catalog
+   * Get the latest Data Catalog for a data product.
+   */
+  app.get(
+    '/:dataProductId/data-catalog',
+    async (
+      request: FastifyRequest<{ Params: { dataProductId: string } }>,
+      reply,
+    ) => {
+      const { dataProductId } = request.params;
+      const { snowflakeUser } = request.user;
+
+      const result = await postgresService.query(
+        `SELECT
+           id, data_product_id, version, catalog_json,
+           created_by, created_at
+         FROM data_catalog
+         WHERE data_product_id = $1
+         ORDER BY version DESC
+         LIMIT 1`,
+        [dataProductId],
+        snowflakeUser,
+      );
+
+      const row = result.rows[0] as
+        | { id: string; data_product_id: string; version: number; catalog_json: Record<string, unknown>; created_by: string; created_at: string }
+        | undefined;
+
+      if (!row) {
+        return reply.status(404).send({
+          error: 'NOT_FOUND',
+          message: 'No data catalog found for this data product',
+        });
+      }
+
+      return reply.send(row);
+    },
+  );
+
+  /**
+   * GET /artifacts/:dataProductId/business-glossary
+   * Get the latest Business Glossary for a data product.
+   */
+  app.get(
+    '/:dataProductId/business-glossary',
+    async (
+      request: FastifyRequest<{ Params: { dataProductId: string } }>,
+      reply,
+    ) => {
+      const { dataProductId } = request.params;
+      const { snowflakeUser } = request.user;
+
+      const result = await postgresService.query(
+        `SELECT
+           id, data_product_id, version, glossary_json,
+           created_by, created_at
+         FROM business_glossary
+         WHERE data_product_id = $1
+         ORDER BY version DESC
+         LIMIT 1`,
+        [dataProductId],
+        snowflakeUser,
+      );
+
+      const row = result.rows[0] as
+        | { id: string; data_product_id: string; version: number; glossary_json: Record<string, unknown>; created_by: string; created_at: string }
+        | undefined;
+
+      if (!row) {
+        return reply.status(404).send({
+          error: 'NOT_FOUND',
+          message: 'No business glossary found for this data product',
+        });
+      }
+
+      return reply.send(row);
+    },
+  );
+
+  /**
+   * GET /artifacts/:dataProductId/metrics-definitions
+   * Get the latest Metrics & KPIs definitions for a data product.
+   */
+  app.get(
+    '/:dataProductId/metrics-definitions',
+    async (
+      request: FastifyRequest<{ Params: { dataProductId: string } }>,
+      reply,
+    ) => {
+      const { dataProductId } = request.params;
+      const { snowflakeUser } = request.user;
+
+      const result = await postgresService.query(
+        `SELECT
+           id, data_product_id, version, metrics_json,
+           created_by, created_at
+         FROM metrics_definitions
+         WHERE data_product_id = $1
+         ORDER BY version DESC
+         LIMIT 1`,
+        [dataProductId],
+        snowflakeUser,
+      );
+
+      const row = result.rows[0] as
+        | { id: string; data_product_id: string; version: number; metrics_json: Record<string, unknown>; created_by: string; created_at: string }
+        | undefined;
+
+      if (!row) {
+        return reply.status(404).send({
+          error: 'NOT_FOUND',
+          message: 'No metrics definitions found for this data product',
+        });
+      }
+
+      return reply.send(row);
+    },
+  );
+
+  /**
+   * GET /artifacts/:dataProductId/validation-rules
+   * Get the latest Validation Rules for a data product.
+   */
+  app.get(
+    '/:dataProductId/validation-rules',
+    async (
+      request: FastifyRequest<{ Params: { dataProductId: string } }>,
+      reply,
+    ) => {
+      const { dataProductId } = request.params;
+      const { snowflakeUser } = request.user;
+
+      const result = await postgresService.query(
+        `SELECT
+           id, data_product_id, version, rules_json,
+           created_by, created_at
+         FROM validation_rules
+         WHERE data_product_id = $1
+         ORDER BY version DESC
+         LIMIT 1`,
+        [dataProductId],
+        snowflakeUser,
+      );
+
+      const row = result.rows[0] as
+        | { id: string; data_product_id: string; version: number; rules_json: Record<string, unknown>; created_by: string; created_at: string }
+        | undefined;
+
+      if (!row) {
+        return reply.status(404).send({
+          error: 'NOT_FOUND',
+          message: 'No validation rules found for this data product',
+        });
+      }
+
+      return reply.send(row);
     },
   );
 }

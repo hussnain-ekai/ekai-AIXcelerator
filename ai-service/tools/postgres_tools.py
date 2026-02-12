@@ -7,6 +7,7 @@ Tools manage workspace-scoped application state:
     - Audit log entries
 """
 
+import contextvars
 import json
 import logging
 from typing import Any
@@ -17,6 +18,30 @@ from langchain.tools import tool
 from services import postgres as pg_service
 
 logger = logging.getLogger(__name__)
+
+# Context variable for the real data_product_id (set from agent.py before tool execution).
+# LLMs sometimes truncate UUIDs — this override ensures tools always use the correct one.
+_data_product_id_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_data_product_id_ctx", default=None
+)
+
+
+def set_data_product_context(data_product_id: str | None) -> None:
+    """Set the data_product_id context for the current task."""
+    _data_product_id_ctx.set(data_product_id)
+
+
+def _resolve_dp_id(llm_provided: str) -> str:
+    """Return the contextvar data_product_id if available, else the LLM-provided one."""
+    ctx_id = _data_product_id_ctx.get()
+    if ctx_id:
+        if ctx_id != llm_provided:
+            logger.warning(
+                "data_product_id mismatch — LLM sent %r, using context %r",
+                llm_provided, ctx_id,
+            )
+        return ctx_id
+    return llm_provided
 
 
 async def _get_pool() -> Any:
@@ -90,6 +115,7 @@ async def save_data_description(
         description_json: JSON string containing the structured data description.
         created_by: Username of the person who created the description.
     """
+    data_product_id = _resolve_dp_id(data_product_id)
     pool = await _get_pool()
     dd_id = str(uuid4())
 
@@ -116,6 +142,7 @@ async def get_latest_data_description(data_product_id: str) -> str:
     Args:
         data_product_id: UUID of the data product.
     """
+    data_product_id = _resolve_dp_id(data_product_id)
     pool = await _get_pool()
     rows = await pg_service.query(
         pool,
@@ -142,6 +169,7 @@ async def save_brd(
         brd_json: JSON string containing the structured BRD.
         created_by: Username of the person who created the BRD.
     """
+    data_product_id = _resolve_dp_id(data_product_id)
     pool = await _get_pool()
     brd_id = str(uuid4())
 
@@ -169,6 +197,7 @@ async def get_latest_brd(data_product_id: str) -> str:
     Args:
         data_product_id: UUID of the data product.
     """
+    data_product_id = _resolve_dp_id(data_product_id)
     pool = await _get_pool()
     rows = await pg_service.query(
         pool,
@@ -276,10 +305,11 @@ async def save_semantic_view(
     """
     import yaml as _yaml
 
+    data_product_id = _resolve_dp_id(data_product_id)
     content = yaml_content.strip()
     is_json = content.startswith("{")
-    logger.info("save_semantic_view: received %d chars, is_json=%s, first_100=%s",
-                len(content), is_json, repr(content[:100]))
+    logger.info("save_semantic_view: received %d chars, is_json=%s, dp_id=%s, first_100=%s",
+                len(content), is_json, data_product_id, repr(content[:100]))
 
     pool = await _get_pool()
 
@@ -309,7 +339,7 @@ async def save_semantic_view(
 
     if is_json:
         try:
-            from agents.generation import extract_json_from_text, assemble_semantic_view_yaml, build_table_metadata, _build_fqn_sample_values
+            from agents.generation import extract_json_from_text, assemble_semantic_view_yaml, build_table_metadata, _build_fqn_sample_values, build_working_layer_map
             logger.info("save_semantic_view: extracting JSON from text...")
             structure = extract_json_from_text(content)
             if structure and "tables" in structure:
@@ -317,8 +347,9 @@ async def save_semantic_view(
                 meta = await build_table_metadata(data_product_id, structure)
                 logger.info("save_semantic_view: building sample values map...")
                 sv_map = await _build_fqn_sample_values(data_product_id)
-                logger.info("save_semantic_view: assembling YAML (meta=%d tables, sv_map=%d)...", len(meta), len(sv_map))
-                assembled = assemble_semantic_view_yaml(structure, table_metadata=meta, sample_values_map=sv_map)
+                wl_map = await build_working_layer_map(data_product_id)
+                logger.info("save_semantic_view: assembling YAML (meta=%d tables, sv_map=%d, wl=%d)...", len(meta), len(sv_map), len(wl_map))
+                assembled = assemble_semantic_view_yaml(structure, table_metadata=meta, sample_values_map=sv_map, working_layer_map=wl_map)
                 if assembled and len(assembled) > 50:
                     logger.info("save_semantic_view: auto-assembled JSON to YAML (%d chars, meta=%d tables)", len(assembled), len(meta))
                     content = assembled
@@ -383,6 +414,7 @@ async def get_latest_semantic_view(data_product_id: str) -> str:
     Args:
         data_product_id: UUID of the data product.
     """
+    data_product_id = _resolve_dp_id(data_product_id)
     pool = await _get_pool()
     rows = await pg_service.query(
         pool,
@@ -412,6 +444,7 @@ async def update_validation_status(
         status: New validation status (valid, invalid, pending).
         errors: JSON string of validation errors (empty if valid).
     """
+    data_product_id = _resolve_dp_id(data_product_id)
     pool = await _get_pool()
 
     # Parse errors to ensure valid JSON
@@ -453,6 +486,7 @@ async def save_quality_report(
         check_results: JSON string of detailed per-check results.
         issues: JSON string array of issues found.
     """
+    data_product_id = _resolve_dp_id(data_product_id)
     pool = await _get_pool()
     report_id = str(uuid4())
 
@@ -482,6 +516,7 @@ async def log_agent_action(
         details: JSON string with action details.
         user_name: Username of the acting user.
     """
+    data_product_id = _resolve_dp_id(data_product_id)
     try:
         pool = await _get_pool()
         log_id = str(uuid4())

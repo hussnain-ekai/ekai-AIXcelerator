@@ -8,12 +8,17 @@ import CodeIcon from '@mui/icons-material/Code';
 import AssessmentIcon from '@mui/icons-material/Assessment';
 import TableChartIcon from '@mui/icons-material/TableChart';
 import LibraryBooksIcon from '@mui/icons-material/LibraryBooks';
+import MenuBookIcon from '@mui/icons-material/MenuBook';
+import BarChartIcon from '@mui/icons-material/BarChart';
+import RuleIcon from '@mui/icons-material/Rule';
+import AccountTreeIcon from '@mui/icons-material/AccountTree';
+import StorageIcon from '@mui/icons-material/Storage';
 
 const GOLD = '#D4A843';
 const DRAWER_WIDTH = 380;
 
-type ArtifactType = 'erd' | 'yaml' | 'brd' | 'data_quality' | 'data_preview' | 'data_description';
-type ArtifactPhase = 'DISCOVERY' | 'REQUIREMENTS' | 'GENERATION' | 'VALIDATION';
+type ArtifactType = 'erd' | 'yaml' | 'brd' | 'data_quality' | 'data_preview' | 'data_description' | 'data_catalog' | 'business_glossary' | 'metrics' | 'validation_rules' | 'lineage';
+type ArtifactPhase = 'DISCOVERY' | 'REQUIREMENTS' | 'MODELING' | 'GENERATION' | 'VALIDATION';
 
 interface Artifact {
   id: string;
@@ -39,11 +44,17 @@ const ARTIFACT_ICONS: Record<ArtifactType, React.ReactNode> = {
   data_quality: <AssessmentIcon fontSize="small" />,
   data_preview: <TableChartIcon fontSize="small" />,
   data_description: <LibraryBooksIcon fontSize="small" />,
+  data_catalog: <StorageIcon fontSize="small" />,
+  business_glossary: <MenuBookIcon fontSize="small" />,
+  metrics: <BarChartIcon fontSize="small" />,
+  validation_rules: <RuleIcon fontSize="small" />,
+  lineage: <AccountTreeIcon fontSize="small" />,
 };
 
 const PHASE_ORDER: ArtifactPhase[] = [
   'DISCOVERY',
   'REQUIREMENTS',
+  'MODELING',
   'GENERATION',
   'VALIDATION',
 ];

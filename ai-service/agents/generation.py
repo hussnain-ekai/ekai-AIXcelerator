@@ -235,6 +235,32 @@ async def build_table_metadata(data_product_id: str,
     return meta
 
 
+async def build_working_layer_map(data_product_id: str) -> dict[str, str]:
+    """Load the working layer FQN mapping from Redis.
+
+    Returns a dict mapping original source FQN (uppercased) to transformed
+    target FQN, e.g. ``{"DMTDEMO.BRONZE.RAW_DATA": "DMTDEMO.SILVER_EKAIX.RAW_DATA"}``.
+    Returns empty dict if no transformation layer exists.
+    """
+    from config import get_settings
+    from services import redis as redis_service
+
+    try:
+        settings = get_settings()
+        client = await redis_service.get_client(settings.redis_url)
+        cache_key = f"cache:working_layer:{data_product_id}"
+        cached = await redis_service.get_json(client, cache_key)
+    except Exception as exc:
+        logger.warning("build_working_layer_map: Redis unavailable: %s", exc)
+        return {}
+
+    if not cached or not isinstance(cached, dict):
+        return {}
+
+    # Normalize keys to uppercase for consistent FQN matching
+    return {k.upper(): v for k, v in cached.items()}
+
+
 async def _build_fqn_column_map(data_product_id: str) -> dict[str, set[str]]:
     """Fetch Redis discovery cache and return FQN (uppercased) -> set(actual column names)."""
     from config import get_settings
@@ -403,16 +429,33 @@ async def quote_columns_in_yaml_str(yaml_str: str, data_product_id: str) -> str:
         logger.warning("quote_columns_in_yaml_str: no metadata available, returning YAML as-is")
         return yaml_str
 
+    # Apply working layer FQN resolution to raw YAML base_table entries
+    wl_map = await build_working_layer_map(data_product_id)
+
     # Check if any quoting is needed at all
     any_lowercase = False
     for cols in meta.values():
         if any(needs_quoting(c) for c in cols):
             any_lowercase = True
             break
-    if not any_lowercase:
-        return yaml_str  # All columns are uppercase, no quoting needed
+    if not any_lowercase and not wl_map:
+        return yaml_str  # All columns are uppercase and no working layer, no changes needed
 
     changed = False
+
+    # Rewrite base_table FQNs for working layer (transformation agent)
+    if wl_map:
+        for tbl in doc.get("tables", []):
+            bt = tbl.get("base_table", {})
+            if bt:
+                original_fqn = f"{bt.get('database', '')}.{bt.get('schema', '')}.{bt.get('table', '')}".upper()
+                target_fqn = wl_map.get(original_fqn)
+                if target_fqn:
+                    parts = target_fqn.split(".")
+                    if len(parts) == 3:
+                        bt["database"], bt["schema"], bt["table"] = parts
+                        changed = True
+                        logger.info("quote_columns_in_yaml_str: FQN resolution %s → %s", original_fqn, target_fqn)
 
     # Quote expr fields in facts/dimensions/time_dimensions/metrics/filters
     for tbl in doc.get("tables", []):
@@ -657,7 +700,8 @@ def _sanitize_yaml_strings(obj: Any) -> None:
 
 def assemble_semantic_view_yaml(structure: dict[str, Any],
                                  table_metadata: dict[str, set[str]] | None = None,
-                                 sample_values_map: dict[str, dict[str, dict[str, Any]]] | None = None) -> str:
+                                 sample_values_map: dict[str, dict[str, dict[str, Any]]] | None = None,
+                                 working_layer_map: dict[str, str] | None = None) -> str:
     """Assemble a Snowflake Semantic View YAML from the LLM's structured JSON.
 
     Produces table-scoped YAML: facts, dimensions, and metrics are nested
@@ -673,6 +717,9 @@ def assemble_semantic_view_yaml(structure: dict[str, Any],
         sample_values_map: Optional mapping of FQN -> {column -> {sample_values, distinct_count}}
                            from discovery profiling. If provided, injects sample_values and is_enum
                            on dimensions during the lint pass.
+        working_layer_map: Optional mapping of original FQN (uppercased) to transformed
+                           FQN from the transformation agent. When provided, base_table entries
+                           are rewritten to point to the transformed (Silver) tables.
 
     Returns:
         YAML string conforming to Snowflake's semantic view YAML specification.
@@ -880,10 +927,25 @@ def assemble_semantic_view_yaml(structure: dict[str, Any],
     for tbl in structure.get("tables", []):
         alias = tbl.get("alias", tbl.get("name", ""))
         t: dict[str, Any] = {"name": alias}
+
+        # Resolve working layer FQN: if transformation agent created a Silver
+        # table for this source, rewrite base_table to point there instead.
+        tbl_db = tbl["database"]
+        tbl_schema = tbl["schema"]
+        tbl_table = tbl["table"]
+        if working_layer_map:
+            original_fqn = f"{tbl_db}.{tbl_schema}.{tbl_table}".upper()
+            target_fqn = working_layer_map.get(original_fqn)
+            if target_fqn:
+                parts = target_fqn.split(".")
+                if len(parts) == 3:
+                    tbl_db, tbl_schema, tbl_table = parts
+                    logger.info("Working layer FQN resolution: %s → %s", original_fqn, target_fqn)
+
         t["base_table"] = {
-            "database": tbl["database"],
-            "schema": tbl["schema"],
-            "table": tbl["table"],
+            "database": tbl_db,
+            "schema": tbl_schema,
+            "table": tbl_table,
         }
         if tbl.get("description"):
             t["description"] = tbl["description"]
@@ -983,6 +1045,15 @@ def extract_json_from_text(text: str) -> dict[str, Any] | None:
                 return json.loads(match.group(1))
             except (json.JSONDecodeError, TypeError):
                 continue
+
+    # Last resort: use json_repair for malformed LLM output (unescaped quotes, etc.)
+    try:
+        from json_repair import repair_json
+        repaired = repair_json(text, return_objects=True)
+        if isinstance(repaired, dict):
+            return repaired
+    except Exception:
+        pass
 
     return None
 

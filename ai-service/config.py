@@ -126,11 +126,21 @@ class Settings(BaseSettings):
     agent_stream_timeout: float = 15.0
     discovery_max_columns_per_table: int = 15
 
+    # --- Transformation Agent ---
+    transformation_target_lag: str = "1 hour"
+    transformation_target_schema_suffix: str = "SILVER_EKAIX"
+
     # --- LLM Configuration ---
     llm_temperature: float = 0.1
     llm_max_tokens: int = 64000
     llm_test_timeout: float = 15.0
     llm_test_max_tokens: int = 200
+
+    # --- LiteLLM Router Settings ---
+    litellm_enable: bool = True  # Enable LiteLLM router for automatic failover
+    litellm_allowed_fails: int = 3  # Number of failures before cooldown
+    litellm_cooldown_time: int = 60  # Cooldown duration in seconds
+    litellm_num_retries: int = 2  # Retry attempts per provider
 
     # --- Data Quality Scoring ---
     pk_uniqueness_threshold: float = 0.98
