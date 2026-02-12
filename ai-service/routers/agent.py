@@ -1114,10 +1114,37 @@ async def _run_agent(
                     _brd_tool_called = True
                     logger.info("save_brd completed for session %s", session_id)
 
-                # Track register_gold_layer for modeling phase
+                # Track register_gold_layer for modeling phase + emit lineage artifact
                 if tool_name == "register_gold_layer":
                     _gold_layer_registered = True
                     logger.info("register_gold_layer completed for session %s", session_id)
+                    # Lineage is written to Neo4j inside register_gold_layer —
+                    # emit the lineage artifact event so frontend shows it
+                    await queue.put({
+                        "type": "artifact",
+                        "data": {
+                            "artifact_id": str(uuid4()),
+                            "artifact_type": "lineage",
+                        },
+                    })
+                    logger.info("Emitted lineage artifact event for session %s", session_id)
+
+                # Emit artifact events for modeling save tools
+                _MODELING_TOOL_ARTIFACT_MAP = {
+                    "save_data_catalog": "data_catalog",
+                    "save_business_glossary": "business_glossary",
+                    "save_metrics_definitions": "metrics",
+                    "save_validation_rules": "validation_rules",
+                }
+                if tool_name in _MODELING_TOOL_ARTIFACT_MAP:
+                    await queue.put({
+                        "type": "artifact",
+                        "data": {
+                            "artifact_id": str(uuid4()),
+                            "artifact_type": _MODELING_TOOL_ARTIFACT_MAP[tool_name],
+                        },
+                    })
+                    logger.info("Emitted %s artifact event for session %s", _MODELING_TOOL_ARTIFACT_MAP[tool_name], session_id)
 
                 # Track save_semantic_view for generation safety net
                 if tool_name == "save_semantic_view":
