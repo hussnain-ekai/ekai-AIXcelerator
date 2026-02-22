@@ -17,7 +17,7 @@ from typing import Any
 
 import yaml
 
-from agents.prompts import GENERATION_PROMPT
+from agents.prompts import MODEL_BUILDER_PROMPT as GENERATION_PROMPT  # merged into model-builder
 
 logger = logging.getLogger(__name__)
 
@@ -147,8 +147,15 @@ def _auto_recover_expr(template_name: str, columns: dict[str, str],
 
 def validate_column_exists(column: str, table_alias: str,
                            table_metadata: dict[str, set[str]]) -> bool:
-    """Check whether a column exists in the given table's metadata."""
+    """Check whether a column exists in the given table's metadata.
+
+    If no metadata is available for the table (empty column set), returns True
+    to allow graceful degradation — Snowflake YAML validation will catch real
+    column errors later.
+    """
     cols = table_metadata.get(table_alias, set())
+    if not cols:
+        return True  # No metadata = skip validation (graceful degradation)
     return column.upper() in {c.upper() for c in cols}
 
 
@@ -179,11 +186,52 @@ def safe_col(col_name: str) -> str:
 
 def _resolve_column_case(col_name: str, table_alias: str,
                           table_metadata: dict[str, set[str]]) -> str:
-    """Resolve a column name to its actual stored case via case-insensitive lookup."""
+    """Resolve a column name to its actual stored case via case-insensitive lookup.
+
+    Also handles Gold table column renaming patterns where the modeling agent
+    renames FK/PK columns:
+      - PATIENT → PATIENT_ID  (source FK gets _ID suffix)
+      - ID → PATIENT_ID       (bare ID → entity_ID based on table alias)
+    """
     cols = table_metadata.get(table_alias, set())
+    if not cols:
+        return col_name
+    upper = col_name.upper()
+
+    # 1. Exact case-insensitive match
     for actual in cols:
-        if actual.upper() == col_name.upper():
+        if actual.upper() == upper:
             return actual
+
+    # 2. Try col_name + "_ID" suffix (handles PATIENT → PATIENT_ID)
+    with_id = upper + "_ID"
+    for actual in cols:
+        if actual.upper() == with_id:
+            logger.debug("Column fuzzy resolved: %s → %s (added _ID suffix)", col_name, actual)
+            return actual
+
+    # 3. Bare "ID" → entity_ID based on table alias
+    #    e.g. table alias "patients" → look for PATIENT_ID
+    if upper == "ID" and table_alias:
+        alias_upper = table_alias.upper()
+        # Try common singularization: strip trailing S
+        if alias_upper.endswith("S") and len(alias_upper) > 2:
+            singular = alias_upper[:-1]
+            # Handle IES → Y (e.g. ALLERGIES → ALLERGY)
+            if singular.endswith("IE"):
+                singular = singular[:-2] + "Y"
+            candidate = singular + "_ID"
+            for actual in cols:
+                if actual.upper() == candidate:
+                    logger.debug("Column fuzzy resolved: ID → %s (from alias %s)", actual, table_alias)
+                    return actual
+        # Also try alias as-is + _ID (no singularization)
+        candidate = alias_upper + "_ID"
+        for actual in cols:
+            if actual.upper() == candidate:
+                logger.debug("Column fuzzy resolved: ID → %s (from alias %s)", actual, table_alias)
+                return actual
+
     return col_name  # Not found — return as-is
 
 
@@ -213,23 +261,51 @@ def _quote_columns_in_filter_expr(expr: str, table_alias: str,
     return expr
 
 
+def _fetch_columns_from_snowflake(db: str, schema: str, table: str) -> set[str]:
+    """Fetch actual column names from Snowflake via SHOW COLUMNS.
+
+    Used when a table isn't in the discovery cache (e.g. Gold Dynamic Tables
+    created by the modeling agent). Returns empty set on failure.
+    """
+    try:
+        from services.snowflake import get_connection
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(f'SHOW COLUMNS IN TABLE "{db}"."{schema}"."{table}"')
+        cols = {row[2] for row in cur.fetchall()}
+        cur.close()
+        return cols
+    except Exception as e:
+        logger.debug("_fetch_columns_from_snowflake(%s.%s.%s) failed: %s", db, schema, table, e)
+        return set()
+
+
 async def build_table_metadata(data_product_id: str,
                                 structure: dict[str, Any]) -> dict[str, set[str]]:
     """Build alias -> set(actual_column_names) from discovery pipeline cache.
 
     Maps the LLM's table aliases to actual column sets via FQN matching.
-    Falls back to an empty dict if cache is unavailable (graceful degradation).
+    Falls back to fetching columns from Snowflake if not in cache (e.g. Gold tables).
     """
     fqn_columns = await _build_fqn_column_map(data_product_id)
-    if not fqn_columns:
-        return {}
 
     # Map structure aliases to column sets via FQN
     meta: dict[str, set[str]] = {}
     for tbl in structure.get("tables", []):
         alias = tbl.get("alias", tbl.get("name", ""))
-        fqn = f"{tbl.get('database', '')}.{tbl.get('schema', '')}.{tbl.get('table', '')}".upper()
-        cols = fqn_columns.get(fqn, set())
+        # Handle both flat and nested base_table formats
+        bt = tbl.get("base_table", {})
+        db = bt.get("database", tbl.get("database", ""))
+        sch = bt.get("schema", tbl.get("schema", ""))
+        tb = bt.get("table", tbl.get("table", ""))
+        fqn = f"{db}.{sch}.{tb}".upper()
+        cols = fqn_columns.get(fqn, set()) if fqn_columns else set()
+        if not cols and db and sch and tb:
+            # Gold/transformed tables won't be in discovery cache —
+            # fetch columns directly from Snowflake
+            cols = _fetch_columns_from_snowflake(db, sch, tb)
+            if cols:
+                logger.info("Fetched %d columns from Snowflake for %s (alias=%s)", len(cols), fqn, alias)
         meta[alias] = cols
 
     return meta
@@ -239,7 +315,7 @@ async def build_working_layer_map(data_product_id: str) -> dict[str, str]:
     """Load the working layer FQN mapping from Redis.
 
     Returns a dict mapping original source FQN (uppercased) to transformed
-    target FQN, e.g. ``{"DMTDEMO.BRONZE.RAW_DATA": "DMTDEMO.SILVER_EKAIX.RAW_DATA"}``.
+    target FQN, e.g. ``{"DMTDEMO.BRONZE.RAW_DATA": "EKAIX.DMTDEMO_CURATED.RAW_DATA"}``.
     Returns empty dict if no transformation layer exists.
     """
     from config import get_settings
@@ -521,7 +597,8 @@ def _validate_all_column_refs(columns: dict[str, str], table_alias: str,
 
 def _lint_and_fix_structure(structure: dict[str, Any],
                             table_metadata: dict[str, set[str]] | None = None,
-                            sample_values_map: dict[str, dict[str, dict[str, Any]]] | None = None) -> dict[str, Any]:
+                            sample_values_map: dict[str, dict[str, dict[str, Any]]] | None = None,
+                            working_layer_map: dict[str, str] | None = None) -> dict[str, Any]:
     """Auto-fix common structural issues in the LLM's JSON output.
 
     Runs before YAML assembly. Fixes:
@@ -632,11 +709,21 @@ def _lint_and_fix_structure(structure: dict[str, Any],
 
     # 10. Inject sample_values + is_enum on dimensions from discovery profiling
     if sample_values_map:
-        # Build alias -> FQN mapping from tables
+        # Build reverse map: Gold/Silver FQN → Source FQN
+        reverse_wl: dict[str, str] = {}
+        if working_layer_map:
+            for src_fqn, target_fqn in working_layer_map.items():
+                reverse_wl[target_fqn.upper()] = src_fqn.upper()
+
+        # Build alias -> FQN mapping from tables (handle nested base_table format)
         alias_to_fqn: dict[str, str] = {}
         for tbl in s.get("tables", []):
             alias = tbl.get("alias", tbl.get("name", ""))
-            fqn = f"{tbl.get('database', '')}.{tbl.get('schema', '')}.{tbl.get('table', '')}".upper()
+            bt = tbl.get("base_table", {})
+            db = bt.get("database", tbl.get("database", ""))
+            sch = bt.get("schema", tbl.get("schema", ""))
+            tb = bt.get("table", tbl.get("table", ""))
+            fqn = f"{db}.{sch}.{tb}".upper()
             alias_to_fqn[alias] = fqn
 
         for dim in s.get("dimensions", []):
@@ -645,7 +732,12 @@ def _lint_and_fix_structure(structure: dict[str, Any],
             col_name = dim.get("columns", {}).get("column", "")
             if not fqn or not col_name:
                 continue
+            # Try direct lookup first, then reverse through working_layer_map
             col_info = sample_values_map.get(fqn, {})
+            if not col_info:
+                source_fqn = reverse_wl.get(fqn, "")
+                if source_fqn:
+                    col_info = sample_values_map.get(source_fqn, {})
             # Case-insensitive column lookup
             matched_info = None
             for stored_col, info in col_info.items():
@@ -725,7 +817,8 @@ def assemble_semantic_view_yaml(structure: dict[str, Any],
         YAML string conforming to Snowflake's semantic view YAML specification.
     """
     # Auto-fix common structural issues before assembly
-    structure = _lint_and_fix_structure(structure, table_metadata, sample_values_map)
+    structure = _lint_and_fix_structure(structure, table_metadata, sample_values_map,
+                                        working_layer_map=working_layer_map)
 
     doc: dict[str, Any] = {}
 
@@ -930,9 +1023,10 @@ def assemble_semantic_view_yaml(structure: dict[str, Any],
 
         # Resolve working layer FQN: if transformation agent created a Silver
         # table for this source, rewrite base_table to point there instead.
-        tbl_db = tbl["database"]
-        tbl_schema = tbl["schema"]
-        tbl_table = tbl["table"]
+        bt = tbl.get("base_table", {})
+        tbl_db = bt.get("database", tbl.get("database", ""))
+        tbl_schema = bt.get("schema", tbl.get("schema", ""))
+        tbl_table = bt.get("table", tbl.get("table", ""))
         if working_layer_map:
             original_fqn = f"{tbl_db}.{tbl_schema}.{tbl_table}".upper()
             target_fqn = working_layer_map.get(original_fqn)

@@ -1,9 +1,14 @@
 'use client';
 
+import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   Box,
   IconButton,
+  ListItemIcon,
+  ListItemText,
+  Menu,
+  MenuItem,
   Table,
   TableBody,
   TableCell,
@@ -14,9 +19,13 @@ import {
   Typography,
 } from '@mui/material';
 import MoreVertIcon from '@mui/icons-material/MoreVert';
+import EditOutlinedIcon from '@mui/icons-material/EditOutlined';
+import DeleteOutlinedIcon from '@mui/icons-material/DeleteOutlined';
 import { StatusBadge } from '@/components/dashboard/StatusBadge';
 import { HealthDot } from '@/components/dashboard/HealthDot';
 import { CollaboratorAvatars } from '@/components/dashboard/CollaboratorAvatars';
+import { EditDataProductModal } from '@/components/dashboard/EditDataProductModal';
+import { DeleteDataProductDialog } from '@/components/dashboard/DeleteDataProductDialog';
 import { formatRelativeTime } from '@/lib/utils';
 import type { DataProduct } from '@/hooks/useDataProducts';
 
@@ -50,6 +59,15 @@ export function DataProductTable({
 }: DataProductTableProps): React.ReactNode {
   const router = useRouter();
 
+  // Actions menu state
+  const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null);
+  const [menuProductId, setMenuProductId] = useState<string | null>(null);
+  const [editProduct, setEditProduct] = useState<DataProduct | null>(null);
+  const [deleteProduct, setDeleteProduct] = useState<DataProduct | null>(null);
+
+  const menuOpen = Boolean(menuAnchor);
+  const selectedProduct = products.find((p) => p.id === menuProductId) ?? null;
+
   function handleRowClick(id: string): void {
     router.push(`/data-products/${id}`);
   }
@@ -62,6 +80,31 @@ export function DataProductTable({
     event: React.ChangeEvent<HTMLInputElement>,
   ): void {
     onRowsPerPageChange(parseInt(event.target.value, 10));
+  }
+
+  function handleMenuOpen(event: React.MouseEvent<HTMLElement>, productId: string): void {
+    event.stopPropagation();
+    setMenuAnchor(event.currentTarget);
+    setMenuProductId(productId);
+  }
+
+  function handleMenuClose(): void {
+    setMenuAnchor(null);
+    setMenuProductId(null);
+  }
+
+  function handleRenameClick(): void {
+    if (selectedProduct) {
+      setEditProduct(selectedProduct);
+    }
+    handleMenuClose();
+  }
+
+  function handleDeleteClick(): void {
+    if (selectedProduct) {
+      setDeleteProduct(selectedProduct);
+    }
+    handleMenuClose();
   }
 
   if (products.length === 0) {
@@ -153,9 +196,7 @@ export function DataProductTable({
                 <TableCell>
                   <IconButton
                     size="small"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                    }}
+                    onClick={(e) => handleMenuOpen(e, product.id)}
                   >
                     <MoreVertIcon fontSize="small" />
                   </IconButton>
@@ -174,6 +215,46 @@ export function DataProductTable({
         onRowsPerPageChange={handleRowsPerPageChange}
         rowsPerPageOptions={[10, 20, 50]}
       />
+
+      {/* Actions menu */}
+      <Menu
+        anchorEl={menuAnchor}
+        open={menuOpen}
+        onClose={handleMenuClose}
+        onClick={(e) => e.stopPropagation()}
+        slotProps={{ paper: { sx: { minWidth: 160 } } }}
+      >
+        <MenuItem onClick={handleRenameClick}>
+          <ListItemIcon>
+            <EditOutlinedIcon fontSize="small" />
+          </ListItemIcon>
+          <ListItemText>Rename</ListItemText>
+        </MenuItem>
+        <MenuItem onClick={handleDeleteClick}>
+          <ListItemIcon>
+            <DeleteOutlinedIcon fontSize="small" color="error" />
+          </ListItemIcon>
+          <ListItemText sx={{ color: 'error.main' }}>Delete</ListItemText>
+        </MenuItem>
+      </Menu>
+
+      {/* Edit modal */}
+      {editProduct && (
+        <EditDataProductModal
+          open={Boolean(editProduct)}
+          onClose={() => setEditProduct(null)}
+          product={editProduct}
+        />
+      )}
+
+      {/* Delete dialog */}
+      {deleteProduct && (
+        <DeleteDataProductDialog
+          open={Boolean(deleteProduct)}
+          onClose={() => setDeleteProduct(null)}
+          product={deleteProduct}
+        />
+      )}
     </Box>
   );
 }

@@ -61,6 +61,25 @@ _FALLBACK_ERROR_PATTERNS = (
 )
 
 
+def _coerce_reasoning_text(value: Any) -> str:
+    """Flatten provider reasoning payloads into short callback text."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = [_coerce_reasoning_text(v) for v in value]
+        return " ".join(p for p in parts if p).strip()
+    if isinstance(value, dict):
+        for key in ("text", "content", "reasoning_content", "reasoning", "thinking", "thoughts"):
+            if key in value:
+                candidate = _coerce_reasoning_text(value.get(key))
+                if candidate:
+                    return candidate
+        return ""
+    return str(value)
+
+
 def _should_fallback(error: Exception) -> bool:
     """Check if an error should trigger fallback to the backup provider."""
     error_str = str(error).lower()
@@ -79,6 +98,7 @@ class ChatLiteLLMRouterWithFallback(ChatLiteLLMRouter):
     """
 
     fallback_model_group: Optional[str] = None
+    reasoning_effort: Optional[str] = None
 
     async def _astream(
         self,
@@ -126,6 +146,10 @@ class ChatLiteLLMRouterWithFallback(ChatLiteLLMRouter):
         params = {**params, **kwargs, "stream": True}
         params = {k: v for k, v in params.items() if v is not None}
         params["stream_options"] = self.stream_options
+        if self.reasoning_effort and "reasoning_effort" not in params:
+            # Vertex/Gemini: enables reasoning_content in stream when supported.
+            # Unsupported providers ignore this because litellm.drop_params=True.
+            params["reasoning_effort"] = self.reasoning_effort
         self._prepare_params_for_router(params)
 
         # Override model group for fallback
@@ -160,8 +184,12 @@ class ChatLiteLLMRouterWithFallback(ChatLiteLLMRouter):
             default_chunk_class = chunk.__class__
             cg_chunk = ChatGenerationChunk(message=chunk)
             if run_manager:
+                callback_token = chunk.content
+                if not callback_token and isinstance(chunk, AIMessageChunk):
+                    reasoning_payload = chunk.additional_kwargs.get("reasoning_content")
+                    callback_token = _coerce_reasoning_text(reasoning_payload)
                 await run_manager.on_llm_new_token(
-                    chunk.content, chunk=cg_chunk, **params
+                    callback_token, chunk=cg_chunk, **params
                 )
             yield cg_chunk
 
@@ -171,6 +199,7 @@ def create_langchain_compatible_router(
     primary_provider: str = "",
     temperature: float = 0.1,
     max_tokens: int = 64000,
+    reasoning_effort: str | None = "low",
     callbacks: list[Any] | None = None,
     fallback_model_group: str | None = None,
 ) -> BaseChatModel:
@@ -184,6 +213,7 @@ def create_langchain_compatible_router(
         primary_provider: Primary provider name (for logging)
         temperature: LLM temperature
         max_tokens: Max output tokens
+        reasoning_effort: Optional LLM reasoning level for providers that support it
         callbacks: Optional LangChain callbacks (e.g. Langfuse)
         fallback_model_group: Fallback model group name for streaming errors
 
@@ -198,6 +228,7 @@ def create_langchain_compatible_router(
         streaming=True,
         temperature=temperature,
         max_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
         callbacks=callbacks,
         fallback_model_group=fallback_model_group,
     )

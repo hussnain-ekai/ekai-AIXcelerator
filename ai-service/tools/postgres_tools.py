@@ -10,6 +10,7 @@ Tools manage workspace-scoped application state:
 import contextvars
 import json
 import logging
+import re
 from typing import Any
 from uuid import uuid4
 
@@ -29,6 +30,22 @@ _data_product_id_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVa
 def set_data_product_context(data_product_id: str | None) -> None:
     """Set the data_product_id context for the current task."""
     _data_product_id_ctx.set(data_product_id)
+
+
+# Context variable for the data product NAME (used by naming.py for schema derivation).
+_data_product_name_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_data_product_name_ctx", default=None
+)
+
+
+def set_data_product_name_context(name: str | None) -> None:
+    """Set the data product name context for the current task."""
+    _data_product_name_ctx.set(name)
+
+
+def get_data_product_name() -> str | None:
+    """Return the data product name from the current context."""
+    return _data_product_name_ctx.get()
 
 
 def _resolve_dp_id(llm_provided: str) -> str:
@@ -391,6 +408,31 @@ async def save_semantic_view(
             for key in ("database", "schema", "table"):
                 if not bt.get(key):
                     return json.dumps({"status": "error", "error": f"Table #{i} base_table missing '{key}'"})
+
+        # Data isolation guard: semantic model can only use selected source tables
+        # plus internal EKAIX-managed curated/marts objects.
+        try:
+            from tools.snowflake_tools import _allowed_tables
+
+            allowed_tables = {t.upper() for t in (_allowed_tables.get() or [])}
+            if allowed_tables:
+                for i, tbl in enumerate(parsed["tables"]):
+                    bt = tbl.get("base_table", {})
+                    db = str(bt.get("database", "")).strip('"').upper()
+                    schema = str(bt.get("schema", "")).strip('"').upper()
+                    table = str(bt.get("table", "")).strip('"').upper()
+                    base_fqn = f"{db}.{schema}.{table}"
+                    if db != "EKAIX" and base_fqn not in allowed_tables:
+                        return json.dumps({
+                            "status": "error",
+                            "error": (
+                                f"Table #{i} base_table '{base_fqn}' is outside the selected "
+                                "data product scope."
+                            ),
+                        })
+        except Exception as scope_err:
+            logger.warning("save_semantic_view: scope validation skipped due to internal error: %s", scope_err)
+
         logger.info("save_semantic_view: YAML structure validation passed (%d tables)", len(parsed["tables"]))
     except _yaml.YAMLError as e:
         logger.error("save_semantic_view: YAML parse error: %s", e)
@@ -468,6 +510,30 @@ async def update_validation_status(
     return json.dumps({"status": "ok", "validation_status": status})
 
 
+def _extract_agent_fqn(details: Any) -> str | None:
+    """Extract DATABASE.SCHEMA.OBJECT from action details when available."""
+    if isinstance(details, dict):
+        for key in ("agent_fqn", "published_agent_fqn", "ai_agent_fqn", "cortex_agent_fqn"):
+            value = details.get(key)
+            if isinstance(value, str) and value.count(".") == 2:
+                return value.strip('"')
+        # Fallback: search the serialized payload
+        haystack = json.dumps(details)
+    elif isinstance(details, str):
+        haystack = details
+    else:
+        haystack = str(details)
+
+    matches = re.findall(r'\b([A-Za-z0-9_]+\.[A-Za-z0-9_]+\.[A-Za-z0-9_]+)\b', haystack)
+    if not matches:
+        return None
+    for candidate in matches:
+        obj_name = candidate.split(".")[-1].upper()
+        if "AGENT" in obj_name:
+            return candidate
+    return matches[0]
+
+
 @tool
 async def save_quality_report(
     data_product_id: str,
@@ -521,6 +587,13 @@ async def log_agent_action(
         pool = await _get_pool()
         log_id = str(uuid4())
 
+        # Normalize details into valid JSONB payload
+        try:
+            parsed_details = json.loads(details) if isinstance(details, str) else details
+        except (json.JSONDecodeError, TypeError):
+            parsed_details = {"message": str(details)}
+        details_json = json.dumps(parsed_details if parsed_details is not None else {})
+
         # Resolve workspace_id from data_product_id
         ws_rows = await pg_service.query(
             pool,
@@ -537,9 +610,141 @@ async def log_agent_action(
         INSERT INTO audit_logs (id, workspace_id, data_product_id, action_type, action_details, user_name, created_at)
         VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::jsonb, $6, NOW())
         """
-        await pg_service.execute(pool, sql, log_id, workspace_id, data_product_id, action_type, details, user_name)
+        await pg_service.execute(pool, sql, log_id, workspace_id, data_product_id, action_type, details_json, user_name)
+
+        # Publishing side-effects: persist canonical published state and metadata.
+        if action_type.strip().lower() == "publish":
+            agent_fqn = _extract_agent_fqn(parsed_details)
+            try:
+                await pg_service.execute(
+                    pool,
+                    """UPDATE data_products
+                       SET status = 'published'::data_product_status,
+                           published_at = NOW(),
+                           published_agent_fqn = COALESCE($1, published_agent_fqn),
+                           state = jsonb_set(
+                               jsonb_set(COALESCE(state, '{}'::jsonb), '{current_phase}', '"explorer"'::jsonb),
+                               '{published}',
+                               'true'::jsonb
+                           ),
+                           updated_at = NOW()
+                       WHERE id = $2::uuid""",
+                    agent_fqn,
+                    data_product_id,
+                )
+            except Exception as publish_err:
+                logger.warning("log_agent_action: failed to persist publish metadata: %s", publish_err)
 
         return json.dumps({"status": "ok", "log_id": log_id})
     except Exception as e:
         logger.error("log_agent_action failed: %s", e)
         return json.dumps({"status": "ok", "log_id": str(uuid4()), "note": "audit log skipped due to internal error"})
+
+
+@tool
+async def verify_brd_completeness(data_product_id: str) -> str:
+    """Verify that the latest BRD is complete and well-formed.
+
+    Checks:
+    - All 7 sections present
+    - No placeholder text ([TBD], [TODO], etc.)
+    - Table references match discovered tables from Redis metadata cache
+
+    Args:
+        data_product_id: UUID of the data product.
+
+    Returns:
+        JSON: {"status": "pass"|"fail", "issues": [...], "section_count": N}
+    """
+    data_product_id = _resolve_dp_id(data_product_id)
+    issues: list[str] = []
+
+    try:
+        pool = await _get_pool()
+
+        # Load latest BRD
+        rows = await pg_service.query(
+            pool,
+            "SELECT brd_json FROM business_requirements WHERE data_product_id = $1::uuid ORDER BY version DESC LIMIT 1",
+            data_product_id,
+        )
+        if not rows:
+            return json.dumps({"status": "fail", "issues": ["No BRD found"], "section_count": 0})
+
+        brd_json = rows[0].get("brd_json")
+        brd_text = ""
+        if isinstance(brd_json, dict):
+            brd_text = brd_json.get("document", str(brd_json))
+        elif isinstance(brd_json, str):
+            try:
+                parsed = json.loads(brd_json)
+                brd_text = parsed.get("document", brd_json)
+            except (json.JSONDecodeError, TypeError):
+                brd_text = brd_json
+
+        # Check sections
+        section_markers = {
+            "SECTION 1:": "Executive Summary",
+            "SECTION 2:": "Metrics and Calculations",
+            "SECTION 3:": "Dimensions and Filters",
+            "SECTION 4:": "Table Relationships",
+            "SECTION 5:": "Data Requirements",
+            "SECTION 6:": "Data Quality Rules",
+            "SECTION 7:": "Sample Questions",
+        }
+        section_count = 0
+        for marker, name in section_markers.items():
+            if marker in brd_text:
+                section_count += 1
+            else:
+                issues.append(f"Missing {name} ({marker})")
+
+        # Check for placeholder text
+        placeholders = ["[TBD]", "[TODO]", "[PLACEHOLDER]", "[FILL IN]", "[INSERT"]
+        for p in placeholders:
+            count = brd_text.upper().count(p.upper())
+            if count > 0:
+                issues.append(f"Found {count} instance(s) of placeholder '{p}'")
+
+        # Check table references against Redis metadata cache
+        try:
+            from services.redis import get_client as get_redis
+            redis = await get_redis()
+            if redis:
+                cache_keys = await redis.keys(f"cache:metadata:{data_product_id}:*")
+                discovered_tables = set()
+                for key in cache_keys:
+                    # Key format: cache:metadata:{dp_id}:{DB}.{SCHEMA}.{TABLE}
+                    parts = key.split(":")
+                    if len(parts) >= 4:
+                        fqn = parts[3] if isinstance(parts[3], str) else parts[3].decode()
+                        table_name = fqn.split(".")[-1]
+                        discovered_tables.add(table_name.upper())
+
+                if discovered_tables:
+                    # Extract table names mentioned in SECTION 5
+                    import re
+                    section5_match = re.search(r'SECTION 5.*?(?=SECTION 6|---END|$)', brd_text, re.DOTALL)
+                    if section5_match:
+                        section5 = section5_match.group(0)
+                        # Look for table name patterns (ALL_CAPS words)
+                        brd_tables = set(re.findall(r'\b([A-Z][A-Z0-9_]{2,})\b', section5))
+                        # Filter to likely table names (not generic words)
+                        generic = {"SECTION", "TABLE", "PURPOSE", "FIELDS", "DATA", "PRODUCT", "QUALITY",
+                                   "RULES", "SAMPLE", "QUESTIONS", "METRICS", "DIMENSIONS", "FILTERS",
+                                   "REQUIREMENTS", "EXECUTIVE", "SUMMARY", "RELATIONSHIPS", "THE",
+                                   "FOR", "AND", "NOT", "ALL", "BRD", "BEGIN", "END", "NUMBER",
+                                   "VARCHAR", "DATE", "BOOLEAN", "TIMESTAMP"}
+                        brd_tables -= generic
+                        for t in brd_tables:
+                            if t not in discovered_tables and not any(t in dt for dt in discovered_tables):
+                                issues.append(f"BRD references table '{t}' not found in discovered tables")
+        except Exception as e:
+            logger.debug("verify_brd: Redis check failed: %s", e)
+
+        status = "pass" if not issues else "fail"
+        return json.dumps({"status": status, "issues": issues, "section_count": section_count})
+
+    except Exception as e:
+        logger.error("verify_brd_completeness failed: %s", e)
+        return json.dumps({"status": "error", "issues": [str(e)], "section_count": 0})

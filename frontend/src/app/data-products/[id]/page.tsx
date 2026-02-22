@@ -1,19 +1,26 @@
 'use client';
 
 import { use, useCallback, useEffect, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import {
   Badge,
   Box,
   Breadcrumbs,
   Button,
   Divider,
+  IconButton,
   Link as MuiLink,
+  Tooltip,
   Typography,
 } from '@mui/material';
 import FolderOpenIcon from '@mui/icons-material/FolderOpen';
 import TableChartOutlinedIcon from '@mui/icons-material/TableChartOutlined';
 import RestartAltIcon from '@mui/icons-material/RestartAlt';
+import EditOutlinedIcon from '@mui/icons-material/EditOutlined';
+import DeleteOutlinedIcon from '@mui/icons-material/DeleteOutlined';
 import NextLink from 'next/link';
+import { EditDataProductModal } from '@/components/dashboard/EditDataProductModal';
+import { DeleteDataProductDialog } from '@/components/dashboard/DeleteDataProductDialog';
 import { ComponentErrorBoundary } from '@/components/ErrorBoundary';
 import { PhaseStepper } from '@/components/chat/PhaseStepper';
 import { MessageThread } from '@/components/chat/MessageThread';
@@ -84,10 +91,13 @@ export default function ChatWorkspacePage({
  * Inner component: all hooks consume the scoped store via context.
  */
 function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
+  const router = useRouter();
   const { data: dataProduct } = useDataProduct(id);
   const { isHydrated } = useSessionRecovery(dataProduct);
-  const { sendMessage, retryMessage, interrupt, isConnected } = useAgent({ dataProductId: id });
+  const { sendMessage, retryMessage, interrupt } = useAgent({ dataProductId: id });
   const storeApi = useChatStoreApi();
+  const [editOpen, setEditOpen] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
   const truncateAfter = useChatStore((state) => state.truncateAfter);
   const editMessage = useChatStore((state) => state.editMessage);
   const messages = useChatStore((state) => state.messages);
@@ -98,7 +108,6 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
   const artifacts = useChatStore((state) => state.artifacts);
   const activePanel = useChatStore((state) => state.activePanel);
   const setActivePanel = useChatStore((state) => state.setActivePanel);
-  const dataTier = useChatStore((state) => state.dataTier);
   const addArtifact = useChatStore((state) => state.addArtifact);
   const queryClient = useQueryClient();
   const [tablesOpen, setTablesOpen] = useState(false);
@@ -134,11 +143,13 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
       yaml: 'yaml',
       brd: 'brd',
       quality_report: 'data_quality',
+      data_quality: 'data_quality',
       document: 'data_preview',
       data_description: 'data_description',
       data_catalog: 'data_catalog',
       business_glossary: 'business_glossary',
       metrics: 'metrics',
+      metrics_definitions: 'metrics',
       validation_rules: 'validation_rules',
       lineage: 'lineage',
     };
@@ -147,18 +158,39 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
       yaml: 'Semantic View YAML',
       brd: 'Business Requirements',
       quality_report: 'Data Quality Report',
+      data_quality: 'Data Quality Report',
       document: 'Data Preview',
       data_description: 'Data Description',
       data_catalog: 'Data Catalog',
       business_glossary: 'Business Glossary',
       metrics: 'Metrics & KPIs',
+      metrics_definitions: 'Metrics Definitions',
       validation_rules: 'Validation Rules',
       lineage: 'Data Lineage',
     };
 
+    // Find the most recent quality_report — marks the start of the current
+    // pipeline run.  Non-discovery artifacts older than this are stale from a
+    // previous run and should not appear in the panel.
+    const DISCOVERY_DB_TYPES = new Set(['quality_report', 'erd', 'data_description']);
+    let currentRunCutoff = 0;
+    for (const a of persistedArtifacts.data) {
+      if (a.artifact_type === 'quality_report') {
+        const t = new Date(a.created_at).getTime();
+        if (t > currentRunCutoff) currentRunCutoff = t;
+      }
+    }
+
     let hasDiscoveryArtifacts = false;
     for (const a of persistedArtifacts.data) {
-      const mappedType = TYPE_MAP[a.artifact_type] ?? 'erd';
+      const mappedType = TYPE_MAP[a.artifact_type];
+      if (!mappedType) continue; // Skip unknown artifact types
+
+      // Skip stale artifacts from previous pipeline runs
+      if (currentRunCutoff > 0 && !DISCOVERY_DB_TYPES.has(a.artifact_type)) {
+        if (new Date(a.created_at).getTime() < currentRunCutoff) continue;
+      }
+
       if (mappedType === 'erd' || mappedType === 'data_quality' || mappedType === 'data_description') {
         hasDiscoveryArtifacts = true;
       }
@@ -349,32 +381,44 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
           borderColor: 'divider',
         }}
       >
-        <Breadcrumbs>
-          <MuiLink
-            component={NextLink}
-            href="/data-products"
-            underline="hover"
-            color="text.secondary"
-            sx={{ fontSize: '0.875rem' }}
-          >
-            Data Products
-          </MuiLink>
-          <Typography
-            variant="body2"
-            sx={{ color: 'primary.main', fontWeight: 600 }}
-          >
-            {productName}
-          </Typography>
-        </Breadcrumbs>
-        {dataProduct?.description && (
-          <Typography
-            variant="caption"
-            sx={{ color: 'text.secondary', ml: 2, maxWidth: 400, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-            title={dataProduct.description}
-          >
-            {dataProduct.description}
-          </Typography>
-        )}
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, minWidth: 0 }}>
+          <Breadcrumbs>
+            <MuiLink
+              component={NextLink}
+              href="/data-products"
+              underline="hover"
+              color="text.secondary"
+              sx={{ fontSize: '0.875rem' }}
+            >
+              Data Products
+            </MuiLink>
+            <Typography
+              variant="body2"
+              sx={{ color: 'primary.main', fontWeight: 600 }}
+            >
+              {productName}
+            </Typography>
+          </Breadcrumbs>
+          <Tooltip title="Edit name & description">
+            <IconButton size="small" onClick={() => setEditOpen(true)}>
+              <EditOutlinedIcon sx={{ fontSize: 16 }} />
+            </IconButton>
+          </Tooltip>
+          <Tooltip title="Delete data product">
+            <IconButton size="small" onClick={() => setDeleteOpen(true)}>
+              <DeleteOutlinedIcon sx={{ fontSize: 16, color: 'error.main' }} />
+            </IconButton>
+          </Tooltip>
+          {dataProduct?.description && (
+            <Typography
+              variant="caption"
+              sx={{ color: 'text.secondary', ml: 1, maxWidth: 400, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+              title={dataProduct.description}
+            >
+              {dataProduct.description}
+            </Typography>
+          )}
+        </Box>
         <Box sx={{ display: 'flex', gap: 1 }}>
           <Button
             variant="outlined"
@@ -415,7 +459,7 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
 
       {/* Phase stepper */}
       <Divider />
-      <PhaseStepper currentPhase={currentPhase} dataTier={dataTier} />
+      <PhaseStepper currentPhase={currentPhase} />
       <Divider />
 
       {/* Message thread */}
@@ -433,7 +477,7 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
       <ChatInput
         onSend={handleSendMessage}
         onStop={handleStop}
-        disabled={isStreaming || isConnected}
+        disabled={isStreaming}
         isStreaming={isStreaming}
       />
 
@@ -559,6 +603,25 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
           isLoading={lineageLoading}
         />
       </ComponentErrorBoundary>
+
+      {/* Edit data product modal */}
+      {dataProduct && (
+        <EditDataProductModal
+          open={editOpen}
+          onClose={() => setEditOpen(false)}
+          product={dataProduct}
+        />
+      )}
+
+      {/* Delete data product dialog */}
+      {dataProduct && (
+        <DeleteDataProductDialog
+          open={deleteOpen}
+          onClose={() => setDeleteOpen(false)}
+          product={dataProduct}
+          onDeleted={() => router.push('/data-products')}
+        />
+      )}
     </Box>
   );
 }

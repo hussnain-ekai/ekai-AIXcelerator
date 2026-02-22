@@ -86,7 +86,9 @@ const PROVIDERS: ProviderDef[] = [
       'GCP Vertex AI with Gemini and Claude models. Requires service account JSON credentials.',
     badges: [],
     models: [
-      // Gemini 3 (Preview - Latest 2026)
+      // Gemini 3.1 (Preview - Latest 2026)
+      'gemini-3.1-pro-preview',
+      // Gemini 3 (Preview)
       'gemini-3-pro-preview', 'gemini-3-flash-preview',
       // Gemini 2.5 (GA)
       'gemini-2-5-pro', 'gemini-2-5-flash', 'gemini-2-5-flash-lite',
@@ -112,7 +114,9 @@ const PROVIDERS: ProviderDef[] = [
         label: 'Model',
         type: 'select',
         options: [
-          // Gemini 3 (Preview - Latest 2026)
+          // Gemini 3.1 (Preview - Latest 2026)
+          'gemini-3.1-pro-preview',
+          // Gemini 3 (Preview)
           'gemini-3-pro-preview', 'gemini-3-flash-preview',
           // Gemini 2.5 (GA)
           'gemini-2-5-pro', 'gemini-2-5-flash', 'gemini-2-5-flash-lite',

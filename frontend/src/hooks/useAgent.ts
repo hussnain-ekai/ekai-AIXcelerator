@@ -55,6 +55,8 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
   const setPipelineProgress = useChatStore((s) => s.setPipelineProgress);
   const setPipelineRunning = useChatStore((s) => s.setPipelineRunning);
   const setDataTier = useChatStore((s) => s.setDataTier);
+  const setReasoningUpdate = useChatStore((s) => s.setReasoningUpdate);
+  const clearReasoningLog = useChatStore((s) => s.clearReasoningLog);
   const sessionId = useChatStore((s) => s.sessionId);
 
   const connectToStream = useCallback(
@@ -78,7 +80,16 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
             });
           }
         },
-        onMessageDone: () => {
+        onReasoningUpdate: (message: string, source?: string) => {
+          const trimmed = message.trim();
+          if (!trimmed) return;
+          setReasoningUpdate(trimmed, source === 'llm' ? 'llm' : 'fallback');
+        },
+        onMessageDone: (content?: string) => {
+          const finalized = (content ?? '').trim();
+          if (finalized) {
+            updateLastAssistantMessage(finalized);
+          }
           finalizeLastMessage();
         },
         onToolCall: (toolName: string) => {
@@ -202,6 +213,7 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
         },
         onError: (_code: string, message: string) => {
           setStreaming(false);
+          setIsConnected(false);
           setPipelineProgress(null);
           setPipelineRunning(false);
           addMessage({
@@ -212,6 +224,7 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
           });
         },
         onDone: () => {
+          finalizeLastMessage();
           setStreaming(false);
           setIsConnected(false);
           setPipelineProgress(null);
@@ -235,6 +248,8 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
       setPipelineProgress,
       setPipelineRunning,
       setDataTier,
+      setReasoningUpdate,
+      clearReasoningLog,
     ],
   );
 
@@ -268,6 +283,7 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
         });
       }
 
+      clearReasoningLog();
       setStreaming(true);
 
       // Use existing session ID from store (may have been recovered from history)
@@ -293,19 +309,38 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
         }
       }
 
-      const response = await api.post<AgentResponse>(
-        `/agent/message`,
-        {
-          session_id: sid,
-          message: content,
-          data_product_id: dataProductId,
-          ...(fileContents.length > 0 ? { file_contents: fileContents } : {}),
-        },
-      );
+      try {
+        const response = await api.post<AgentResponse>(
+          `/agent/message`,
+          {
+            session_id: sid,
+            message: content,
+            data_product_id: dataProductId,
+            ...(fileContents.length > 0 ? { file_contents: fileContents } : {}),
+          },
+        );
 
-      connectToStream(response.session_id);
+        connectToStream(response.session_id);
+      } catch (error) {
+        setStreaming(false);
+        setIsConnected(false);
+        addMessage({
+          id: crypto.randomUUID(),
+          role: 'system',
+          content: `Error: ${error instanceof Error ? error.message : 'Failed to send message'}`,
+          timestamp: new Date().toISOString(),
+        });
+      }
     },
-    [dataProductId, storeApi, addMessage, setStreaming, setSessionId, connectToStream],
+    [
+      dataProductId,
+      storeApi,
+      addMessage,
+      setStreaming,
+      setSessionId,
+      connectToStream,
+      clearReasoningLog,
+    ],
   );
 
   const retryMessage = useCallback(
@@ -313,22 +348,34 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
       const sid = storeApi.getState().sessionId;
       if (!sid) return;
 
+      clearReasoningLog();
       setStreaming(true);
 
-      const response = await api.post<AgentResponse>(
-        `/agent/retry`,
-        {
-          session_id: sid,
-          data_product_id: dataProductId,
-          message_id: opts.messageId,
-          edited_content: opts.editedContent,
-          original_content: opts.originalContent,
-        },
-      );
+      try {
+        const response = await api.post<AgentResponse>(
+          `/agent/retry`,
+          {
+            session_id: sid,
+            data_product_id: dataProductId,
+            message_id: opts.messageId,
+            edited_content: opts.editedContent,
+            original_content: opts.originalContent,
+          },
+        );
 
-      connectToStream(response.session_id);
+        connectToStream(response.session_id);
+      } catch (error) {
+        setStreaming(false);
+        setIsConnected(false);
+        addMessage({
+          id: crypto.randomUUID(),
+          role: 'system',
+          content: `Error: ${error instanceof Error ? error.message : 'Failed to retry message'}`,
+          timestamp: new Date().toISOString(),
+        });
+      }
     },
-    [dataProductId, storeApi, setStreaming, connectToStream],
+    [dataProductId, storeApi, addMessage, setStreaming, connectToStream, clearReasoningLog],
   );
 
   const interrupt = useCallback(async () => {

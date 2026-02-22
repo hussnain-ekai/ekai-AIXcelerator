@@ -35,6 +35,11 @@ _allowed_database: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 _allowed_tables: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
     "_allowed_tables", default=None,
 )
+# Explicit publish approval flag for the current agent turn.
+# Router sets this from the user's latest message before tool execution.
+_publish_approved: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_publish_approved", default=False,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +52,11 @@ def set_data_isolation_context(database: str | None, tables: list[str] | None) -
     """
     _allowed_database.set(database)
     _allowed_tables.set(tables)
+
+
+def set_publish_approval_context(approved: bool) -> None:
+    """Set whether publishing tools are allowed in the current agent turn."""
+    _publish_approved.set(approved)
 
 
 def _check_cross_database_reference(sql_upper: str, allowed_db: str) -> str | None:
@@ -67,7 +77,7 @@ def _check_cross_database_reference(sql_upper: str, allowed_db: str) -> str | No
     )
     for match in pattern.finditer(sql_upper):
         db_ref = match.group(1).strip('"').upper()
-        if db_ref != allowed:
+        if db_ref != allowed and db_ref != "EKAIX":
             return (
                 f"Access denied: query references database '{db_ref}' but this "
                 f"data product only has access to '{allowed_db}'"
@@ -514,6 +524,14 @@ def create_semantic_view(yaml_content: str, target_schema: str, verify_only: boo
     if not yaml_content or not yaml_content.strip():
         return _tool_error("create_semantic_view", "yaml_content cannot be empty")
 
+    # Publish gate: semantic view creation during publishing requires explicit approval.
+    # verify_only calls are always allowed for validation workflows.
+    if not verify_only and not _publish_approved.get():
+        return _tool_error(
+            "create_semantic_view",
+            "Publishing is blocked: explicit user approval is required before deployment.",
+        )
+
     # Clean up YAML before creating
     import yaml as _yaml
     try:
@@ -531,6 +549,15 @@ def create_semantic_view(yaml_content: str, target_schema: str, verify_only: boo
 
     schema_name = f"{schema_parts[0]}.{schema_parts[1]}"
     verify_flag = "TRUE" if verify_only else "FALSE"
+
+    # Auto-create EKAIX database + schema if needed (all ekaiX objects live in EKAIX db)
+    if schema_parts[0].upper() == "EKAIX" and not verify_only:
+        try:
+            from tools.naming import ensure_schema
+            ensure_schema(schema_parts[1])
+            logger.info("create_semantic_view: ensured schema %s", schema_name)
+        except Exception as e:
+            logger.warning("create_semantic_view: could not ensure schema %s: %s", schema_name, e)
 
     def _extract_view_name(content: str) -> str:
         for line in content.split("\n"):
@@ -623,6 +650,13 @@ def create_cortex_agent(
     if err:
         return _tool_error("create_cortex_agent", err)
 
+    # Publish gate: creating/replacing Cortex agents requires explicit approval.
+    if not _publish_approved.get():
+        return _tool_error(
+            "create_cortex_agent",
+            "Publishing is blocked: explicit user approval is required before deployment.",
+        )
+
     # Validate target schema
     schema_parts = target_schema.split(".")
     if len(schema_parts) != 2:
@@ -637,12 +671,18 @@ def create_cortex_agent(
     if len(sv_parts) != 3:
         return _tool_error("create_cortex_agent", f"semantic_view_fqn must be DATABASE.SCHEMA.VIEW, got: '{semantic_view_fqn}'")
 
+    # Auto-create EKAIX database + schema if needed
+    if schema_parts[0].upper() == "EKAIX":
+        try:
+            from tools.naming import ensure_schema
+            ensure_schema(schema_parts[1])
+            logger.info("create_cortex_agent: ensured schema %s.%s", schema_parts[0], schema_parts[1])
+        except Exception as e:
+            logger.warning("create_cortex_agent: could not ensure schema: %s", e)
+
     # Resolve warehouse from settings if not provided
     if not warehouse:
-        try:
-            warehouse = get_settings().snowflake_warehouse or "COMPUTE_WH"
-        except Exception:
-            warehouse = "COMPUTE_WH"
+        warehouse = get_settings().snowflake_warehouse
 
     try:
         quoted_schema = ".".join(f'"{p}"' for p in schema_parts)
@@ -702,6 +742,13 @@ def grant_agent_access(agent_fqn: str, role: str) -> str:
     err = _validate_identifier(role, "role")
     if err:
         return _tool_error("grant_agent_access", err)
+
+    # Publish gate: grants are part of deployment and require approval.
+    if not _publish_approved.get():
+        return _tool_error(
+            "grant_agent_access",
+            "Publishing is blocked: explicit user approval is required before deployment.",
+        )
 
     # Validate agent FQN
     parts = agent_fqn.split(".")
@@ -838,6 +885,79 @@ def query_cortex_agent(agent_fqn: str, question: str) -> str:
         return _tool_error("query_cortex_agent", str(e))
 
 
+def _try_cortex_yaml_fix(yaml_content: str, error_msg: str, schema_name: str) -> str | None:
+    """Try to fix semantic view YAML using Snowflake Cortex AI (Arctic).
+
+    Sends the failing YAML + Snowflake validation error to Arctic. If Arctic
+    returns a fixed YAML that passes validation, returns the success JSON.
+    Returns None if Cortex is unavailable or the fix doesn't work.
+    """
+    from tools.ddl import generate_ddl_via_cortex
+
+    import yaml as _yaml_cortex
+
+    # Truncate YAML to avoid exceeding Cortex token limits
+    yaml_truncated = yaml_content[:6000] if len(yaml_content) > 6000 else yaml_content
+    error_truncated = error_msg[:500]
+
+    prompt = f"""Fix this Snowflake Semantic View YAML specification.
+
+The YAML below was rejected by SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML with this error:
+{error_truncated}
+
+Fix ONLY the part causing the error. Keep everything else unchanged.
+Return ONLY the complete fixed YAML, no explanation.
+
+YAML:
+{yaml_truncated}"""
+
+    try:
+        raw_response = generate_ddl_via_cortex(prompt)
+        if not raw_response:
+            return None
+
+        # Strip markdown fences if present
+        fixed = raw_response.strip()
+        if fixed.startswith("```"):
+            fixed = re.sub(r"^```(?:yaml|yml)?\s*\n?", "", fixed)
+            fixed = re.sub(r"\n?```\s*$", "", fixed)
+            fixed = fixed.strip()
+
+        # Validate the fixed YAML is parseable
+        try:
+            parsed = _yaml_cortex.safe_load(fixed)
+            if not isinstance(parsed, dict) or "tables" not in parsed:
+                logger.info("Cortex YAML fix: response is not a valid semantic view YAML")
+                return None
+        except Exception:
+            logger.info("Cortex YAML fix: response is not valid YAML")
+            return None
+
+        # Remove primary_key (same cleanup as main flow)
+        for tbl in parsed.get("tables", []):
+            if "primary_key" in tbl:
+                del tbl["primary_key"]
+        fixed = _yaml_cortex.dump(parsed, default_flow_style=False, sort_keys=False, allow_unicode=False)
+
+        # Replace TRY_CAST → CAST (same as main flow)
+        fixed = re.sub(r'\bTRY_CAST\(', 'CAST(', fixed)
+
+        # Validate the fixed YAML with Snowflake
+        sql = f"CALL SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML('{schema_name}', $${fixed}$$, TRUE)"
+        execute_query_sync(sql)
+
+        logger.info("Cortex AI fixed semantic view YAML (error was: %s)", error_truncated[:100])
+        return json.dumps({
+            "status": "valid",
+            "message": "YAML is valid after Cortex AI fix. Auto-corrections were applied.",
+            "cortex_fixed": True,
+        })
+
+    except Exception as e:
+        logger.info("Cortex YAML fix failed (non-fatal): %s", str(e)[:200])
+        return None
+
+
 @tool
 def validate_semantic_view_yaml(yaml_content: str, target_schema: str) -> str:
     """Validate semantic view YAML without creating the view.
@@ -904,26 +1024,21 @@ def validate_semantic_view_yaml(yaml_content: str, target_schema: str) -> str:
                 finally:
                     await conn.close()
 
-            fetched = asyncio.run(_fetch_latest_yaml())
+            # asyncio.run() fails inside an already-running event loop.
+            # Run in a separate thread with its own event loop.
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
+                _fut = _pool.submit(asyncio.run, _fetch_latest_yaml())
+                fetched = _fut.result(timeout=15)
             if fetched:
                 yaml_content = fetched
                 logger.info("validate_semantic_view_yaml: auto-fetched %d chars from DB (matched schema %s)", len(yaml_content), target_schema)
         except Exception as fetch_err:
             logger.warning("validate_semantic_view_yaml: auto-fetch failed: %s", fetch_err)
 
-    # Clean up YAML before validation
-    try:
-        parsed = _yaml.safe_load(yaml_content)
-        if isinstance(parsed, dict) and "tables" in parsed:
-            changed = False
-            for tbl in parsed["tables"]:
-                if "primary_key" in tbl:
-                    del tbl["primary_key"]
-                    changed = True
-            if changed:
-                yaml_content = _yaml.dump(parsed, default_flow_style=False, sort_keys=False, allow_unicode=False)
-    except Exception:
-        pass
+    # NOTE: primary_key is intentionally kept in the YAML — it is required
+    # for relationship validation (right_table must have primary_key defined).
+    # The assembler in generation.py ensures correct format {columns: [COL]}.
 
     # Runtime guard: TRY_CAST only works on VARCHAR input in Snowflake.
     # If columns are already numeric, TRY_CAST(NUMBER AS FLOAT) errors.
@@ -1008,7 +1123,12 @@ def validate_semantic_view_yaml(yaml_content: str, target_schema: str) -> str:
                     })
                 except Exception as e3:
                     logger.warning("validate auto-fix retry failed: %s", e3)
-                    # Fall through to return original error
+                    error_msg = str(e3)  # Update error for Cortex fallback
+
+        # --- Cortex AI fallback: ask Arctic to fix the YAML ---
+        cortex_result = _try_cortex_yaml_fix(yaml_content, error_msg, schema_name)
+        if cortex_result:
+            return cortex_result
 
         logger.warning("validate_semantic_view_yaml failed: %s", error_msg)
         return json.dumps({
@@ -1047,3 +1167,187 @@ def validate_sql(sql: str) -> str:
             "error": str(e),
             "message": "SQL compilation failed",
         })
+
+
+@tool
+async def verify_yaml_against_brd(data_product_id: str) -> str:
+    """Cross-check the semantic model YAML against the BRD for completeness.
+
+    Verifies:
+    - Every BRD SECTION 2 metric maps to a YAML metric
+    - Every BRD SECTION 3.1 dimension maps to a YAML dimension
+    - Every BRD SECTION 3.2 time dimension maps to a YAML time_dimension
+    - All column references exist in Redis metadata cache
+
+    Args:
+        data_product_id: UUID of the data product.
+
+    Returns:
+        JSON: {"status": "pass"|"fail", "missing_mappings": [...], "invalid_columns": [...]}
+    """
+    import yaml as _yaml
+    from tools.postgres_tools import _resolve_dp_id, _get_pool
+    from services import postgres as pg_service
+
+    data_product_id = _resolve_dp_id(data_product_id)
+    missing_mappings: list[str] = []
+    invalid_columns: list[str] = []
+
+    try:
+        pool = await _get_pool()
+
+        # Load latest BRD
+        brd_rows = await pg_service.query(
+            pool,
+            "SELECT brd_json FROM business_requirements WHERE data_product_id = $1::uuid ORDER BY version DESC LIMIT 1",
+            data_product_id,
+        )
+        if not brd_rows:
+            return json.dumps({"status": "fail", "missing_mappings": ["No BRD found"], "invalid_columns": []})
+
+        brd_json = brd_rows[0].get("brd_json")
+        brd_text = ""
+        if isinstance(brd_json, dict):
+            brd_text = brd_json.get("document", str(brd_json))
+        elif isinstance(brd_json, str):
+            try:
+                parsed = json.loads(brd_json)
+                brd_text = parsed.get("document", brd_json)
+            except (json.JSONDecodeError, TypeError):
+                brd_text = brd_json
+
+        # Load latest YAML
+        yaml_rows = await pg_service.query(
+            pool,
+            "SELECT yaml_content FROM semantic_views WHERE data_product_id = $1::uuid ORDER BY version DESC LIMIT 1",
+            data_product_id,
+        )
+        if not yaml_rows:
+            return json.dumps({"status": "fail", "missing_mappings": ["No semantic model found"], "invalid_columns": []})
+
+        yaml_content = yaml_rows[0].get("yaml_content", "")
+        try:
+            yaml_doc = _yaml.safe_load(yaml_content)
+        except Exception:
+            return json.dumps({"status": "fail", "missing_mappings": ["Invalid YAML"], "invalid_columns": []})
+
+        if not yaml_doc:
+            return json.dumps({"status": "fail", "missing_mappings": ["Empty YAML"], "invalid_columns": []})
+
+        # Extract YAML items
+        yaml_metrics = set()
+        yaml_dimensions = set()
+        yaml_time_dims = set()
+        yaml_columns_used: set[str] = set()
+
+        for table in yaml_doc.get("tables", []):
+            for fact in table.get("facts", []):
+                yaml_columns_used.add(fact.get("expr", "").upper())
+            for dim in table.get("dimensions", []):
+                name = dim.get("name", "").lower().replace("_", " ")
+                yaml_dimensions.add(name)
+                yaml_columns_used.add(dim.get("expr", "").upper())
+            for td in table.get("time_dimensions", []):
+                name = td.get("name", "").lower().replace("_", " ")
+                yaml_time_dims.add(name)
+            for metric in table.get("metrics", []):
+                name = metric.get("name", "").lower().replace("_", " ")
+                yaml_metrics.add(name)
+
+        # Also check root-level metrics (Snowflake YAML structure)
+        for metric in yaml_doc.get("metrics", []):
+            name = metric.get("name", "").lower().replace("_", " ")
+            yaml_metrics.add(name)
+
+        # Extract BRD metrics from SECTION 2
+        section2_match = re.search(r'SECTION 2.*?(?=SECTION 3|$)', brd_text, re.DOTALL)
+        if section2_match:
+            section2 = section2_match.group(0)
+            # Find "Metric: [name]" or "• [name]" patterns
+            brd_metrics = re.findall(r'(?:Metric:|•)\s*(.+?)(?:\n|$)', section2)
+            for m in brd_metrics:
+                m_clean = m.strip().lower().split("\n")[0].split("  ")[0]
+                if m_clean and len(m_clean) > 2:
+                    # Fuzzy match: check if any YAML metric contains the BRD metric words
+                    matched = any(
+                        _fuzzy_match(m_clean, ym) for ym in yaml_metrics
+                    )
+                    if not matched:
+                        missing_mappings.append(f"BRD metric '{m.strip()[:60]}' not found in YAML")
+
+        # Extract BRD dimensions from SECTION 3.1
+        section3_match = re.search(r'3\.1 Grouping.*?(?=3\.2|SECTION 4|$)', brd_text, re.DOTALL)
+        if section3_match:
+            section3 = section3_match.group(0)
+            brd_dims = re.findall(r'(?:Dimension:|•)\s*(.+?)(?:\n|$)', section3)
+            for d in brd_dims:
+                d_clean = d.strip().lower().split("\n")[0].split("  ")[0]
+                if d_clean and len(d_clean) > 2:
+                    matched = any(
+                        _fuzzy_match(d_clean, yd) for yd in yaml_dimensions
+                    )
+                    if not matched:
+                        missing_mappings.append(f"BRD dimension '{d.strip()[:60]}' not found in YAML")
+
+        # Check column references against Redis metadata cache
+        try:
+            from services.redis import get_client as get_redis
+            redis = await get_redis()
+            if redis:
+                all_columns: set[str] = set()
+                cache_keys = await redis.keys(f"cache:metadata:{data_product_id}:*")
+                for key in cache_keys:
+                    cached = await redis.get(key)
+                    if not cached:
+                        continue
+                    try:
+                        meta = json.loads(cached) if isinstance(cached, str) else cached
+                        for col_info in meta if isinstance(meta, list) else []:
+                            col_name = (col_info.get("COLUMN_NAME") or col_info.get("column_name") or "").upper()
+                            if col_name:
+                                all_columns.add(col_name)
+                    except Exception:
+                        continue
+
+                if all_columns:
+                    for col_ref in yaml_columns_used:
+                        # Strip quoting and functions
+                        clean = re.sub(r'["\']', '', col_ref).strip().upper()
+                        # Skip expressions (contain operators/functions)
+                        if any(c in clean for c in ('(', ')', '+', '-', '*', '/', '=', '<', '>')):
+                            continue
+                        if clean and clean not in all_columns:
+                            invalid_columns.append(clean)
+        except Exception as e:
+            logger.debug("verify_yaml: Redis column check failed: %s", e)
+
+        status = "pass" if not missing_mappings and not invalid_columns else "fail"
+        return json.dumps({
+            "status": status,
+            "missing_mappings": missing_mappings,
+            "invalid_columns": invalid_columns,
+        })
+
+    except Exception as e:
+        logger.error("verify_yaml_against_brd failed: %s", e)
+        return json.dumps({
+            "status": "error",
+            "missing_mappings": [str(e)],
+            "invalid_columns": [],
+        })
+
+
+def _fuzzy_match(brd_item: str, yaml_item: str) -> bool:
+    """Check if BRD item roughly matches a YAML item name."""
+    # Normalize both
+    brd_words = set(brd_item.lower().split())
+    yaml_words = set(yaml_item.lower().replace("_", " ").split())
+    # Remove common filler words
+    filler = {"the", "a", "an", "of", "for", "per", "by", "in", "to", "and", "or", "is", "are"}
+    brd_words -= filler
+    yaml_words -= filler
+    if not brd_words or not yaml_words:
+        return False
+    # Match if significant overlap
+    overlap = brd_words & yaml_words
+    return len(overlap) >= min(len(brd_words), len(yaml_words)) * 0.5

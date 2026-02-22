@@ -30,6 +30,7 @@ from typing import Any
 from langchain_core.language_models.chat_models import BaseChatModel
 
 from config import get_effective_settings
+from services.model_names import normalize_vertex_model_name
 
 logger = logging.getLogger(__name__)
 
@@ -127,8 +128,18 @@ def _build_model_for_provider(
                 "or restore config from PostgreSQL."
             )
 
-        model_name = settings.vertex_model
+        model_name = normalize_vertex_model_name(settings.vertex_model)
         is_claude = model_name.startswith("claude-")
+        effective_temperature = settings.llm_temperature
+
+        # LiteLLM and Vertex both warn that Gemini 3.x can hang/degrade below 1.0.
+        if model_name.startswith("gemini-3") and effective_temperature < 1.0:
+            logger.warning(
+                "Overriding temperature %.2f -> 1.0 for %s to avoid Gemini 3.x stalling",
+                effective_temperature,
+                model_name,
+            )
+            effective_temperature = 1.0
 
         if is_claude:
             from langchain_google_vertexai.model_garden import ChatAnthropicVertex
@@ -143,7 +154,7 @@ def _build_model_for_provider(
                 model=model_name,
                 project=settings.vertex_project,
                 location=settings.vertex_location,
-                temperature=settings.llm_temperature,
+                temperature=effective_temperature,
                 max_tokens=settings.llm_max_tokens,
                 callbacks=callbacks,
             )
@@ -160,8 +171,10 @@ def _build_model_for_provider(
                 model=model_name,
                 project=settings.vertex_project,
                 location=settings.vertex_location,
-                temperature=settings.llm_temperature,
+                temperature=effective_temperature,
                 max_tokens=settings.llm_max_tokens,
+                include_thoughts=True,
+                thinking_budget=1024,
                 callbacks=callbacks,
             )
 
@@ -299,12 +312,26 @@ def get_chat_model() -> BaseChatModel | Any:
             has_fallback = bool(
                 fallback and isinstance(fallback, dict) and fallback.get("provider")
             )
+            router_temperature = settings.llm_temperature
+            primary_model = normalize_vertex_model_name(settings.vertex_model)
+            if (
+                settings.llm_provider == "vertex-ai"
+                and primary_model.startswith("gemini-3")
+                and router_temperature < 1.0
+            ):
+                logger.warning(
+                    "Overriding temperature %.2f -> 1.0 for %s (LiteLLM Router)",
+                    router_temperature,
+                    primary_model,
+                )
+                router_temperature = 1.0
 
             model = create_langchain_compatible_router(
                 router=router,
                 primary_provider=settings.llm_provider,
-                temperature=settings.llm_temperature,
+                temperature=router_temperature,
                 max_tokens=settings.llm_max_tokens,
+                reasoning_effort="low",
                 callbacks=callbacks,
                 fallback_model_group=FALLBACK_MODEL_GROUP if has_fallback else None,
             )

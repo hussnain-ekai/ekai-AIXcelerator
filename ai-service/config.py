@@ -122,13 +122,14 @@ class Settings(BaseSettings):
     snowflake_network_timeout: int = 60
 
     # --- Agent Configuration ---
-    agent_recursion_limit: int = 150
+    agent_recursion_limit: int = 1000
     agent_stream_timeout: float = 15.0
     discovery_max_columns_per_table: int = 15
 
     # --- Transformation Agent ---
     transformation_target_lag: str = "1 hour"
-    transformation_target_schema_suffix: str = "SILVER_EKAIX"
+    ekaix_database: str = "EKAIX"
+    cortex_ddl_model: str = "snowflake-arctic"  # Model for DDL generation via Cortex
 
     # --- LLM Configuration ---
     llm_temperature: float = 0.1

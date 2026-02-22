@@ -29,6 +29,7 @@ CONTENT_TYPES: dict[str, str] = {
     "brd": "application/json",
     "quality_report": "application/json",
     "data_description": "application/json",
+    "lineage": "application/json",
 }
 
 

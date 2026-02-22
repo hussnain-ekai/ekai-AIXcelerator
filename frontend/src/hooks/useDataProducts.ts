@@ -70,6 +70,16 @@ function useDataProduct(id: string) {
     queryKey: ['data-products', id],
     queryFn: () => api.get<DataProduct>(`/data-products/${id}`),
     enabled: id.length > 0,
+    // Keep phase/status fresh during active agent workflows even if SSE is missed.
+    refetchInterval: (query) => {
+      const data = query.state.data;
+      if (!data) return 5000;
+      if (data.status === 'published' || data.status === 'archived') return false;
+      const phase = data.state?.current_phase;
+      if (phase === 'explorer') return false;
+      return 5000;
+    },
+    refetchIntervalInBackground: true,
   });
 }
 

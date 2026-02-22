@@ -26,6 +26,18 @@ interface UseSessionRecoveryReturn {
   isHydrated: boolean;
 }
 
+const VALID_AGENT_PHASES: ReadonlySet<AgentPhase> = new Set([
+  'idle',
+  'discovery',
+  'prepare',
+  'requirements',
+  'modeling',
+  'generation',
+  'validation',
+  'publishing',
+  'explorer',
+]);
+
 /**
  * Hook to recover chat session from backend when navigating to a data product page.
  *
@@ -103,6 +115,7 @@ function useSessionRecovery(dataProduct: DataProduct | undefined): UseSessionRec
           const baseTime = Date.now() - 86_400_000; // 24 hours ago
           const chatMessages: ChatMessage[] = historyMessages
             .filter((msg) => !msg.content.includes('[INTERNAL CONTEXT'))
+            .filter((msg) => !msg.content.includes('[SUPERVISOR CONTEXT CONTRACT'))
             .map((msg, idx) => ({
               id: msg.id ?? `recovered-${idx}-${Date.now()}`,
               role: msg.role,
@@ -115,8 +128,11 @@ function useSessionRecovery(dataProduct: DataProduct | undefined): UseSessionRec
               })),
             }));
 
-          // Determine phase from response or data product
-          const phase = (response.phase ?? dataProduct?.state?.current_phase ?? 'idle') as AgentPhase;
+          // Determine phase from response or data product, but guard against unexpected values
+          const persistedPhase = response.phase ?? dataProduct?.state?.current_phase;
+          const phase = (persistedPhase && VALID_AGENT_PHASES.has(persistedPhase as AgentPhase))
+            ? (persistedPhase as AgentPhase)
+            : 'idle';
           const dataTier = (dataProduct?.state?.data_tier ?? null) as DataTier;
 
           hydrateFromHistory(chatMessages, storedSessionId, phase, dataTier);
@@ -135,6 +151,20 @@ function useSessionRecovery(dataProduct: DataProduct | undefined): UseSessionRec
 
     void fetchHistory();
   }, [dataProductId, storedSessionId, sessionId, messages.length, hydrateFromHistory, setHydrated, storeApi, dataProduct?.state?.current_phase]);
+
+  // Keep chatStore phase in sync with persisted phase if backend advanced after initial hydration.
+  useEffect(() => {
+    if (!dataProductId || !isHydrated) return;
+    const persistedPhase = dataProduct?.state?.current_phase;
+    if (!persistedPhase || !VALID_AGENT_PHASES.has(persistedPhase as AgentPhase)) return;
+
+    const state = storeApi.getState();
+    if (state.isStreaming) return;
+
+    if (state.currentPhase !== persistedPhase) {
+      state.setPhase(persistedPhase as AgentPhase);
+    }
+  }, [dataProductId, isHydrated, dataProduct?.state?.current_phase, storeApi]);
 
   return { isHydrated };
 }

@@ -38,6 +38,28 @@ interface ShareRow {
   created_at: string;
 }
 
+const PHASE_TO_STATUS: Record<string, string> = {
+  idle: 'discovery',
+  discovery: 'discovery',
+  prepare: 'discovery',
+  transformation: 'discovery',
+  requirements: 'requirements',
+  modeling: 'generation',
+  generation: 'generation',
+  validation: 'validation',
+  publishing: 'validation',
+  explorer: 'published',
+};
+
+function resolveWorkflowStatus(
+  status: string,
+  state: Record<string, unknown> | null | undefined,
+): string {
+  const phase = state?.current_phase;
+  if (typeof phase !== 'string') return status;
+  return PHASE_TO_STATUS[phase] ?? status;
+}
+
 /** Allowed sort columns. Only whitelisted column names are used in ORDER BY. */
 const SORT_COLUMN_MAP: Record<string, string> = {
   name: 'dp.name',
@@ -152,6 +174,7 @@ export async function dataProductRoutes(app: FastifyInstance): Promise<void> {
       const rows = dataResult.rows as Array<DataProductRow & { owner?: string; share_count?: number }>;
       const transformedRows = rows.map((row) => ({
         ...row,
+        status: resolveWorkflowStatus(row.status, row.state),
         owner: row.owner ?? null,
         shareCount: Number(row.share_count ?? 0),
       }));
@@ -242,6 +265,7 @@ export async function dataProductRoutes(app: FastifyInstance): Promise<void> {
 
         return reply.status(201).send({
           ...product,
+          status: resolveWorkflowStatus(product.status, product.state),
           session_id: sessionId,
         });
       } catch (err: unknown) {
@@ -291,7 +315,10 @@ export async function dataProductRoutes(app: FastifyInstance): Promise<void> {
         });
       }
 
-      return reply.send(product);
+      return reply.send({
+        ...product,
+        status: resolveWorkflowStatus(product.status, product.state),
+      });
     },
   );
 
@@ -393,7 +420,10 @@ export async function dataProductRoutes(app: FastifyInstance): Promise<void> {
         });
       }
 
-      return reply.send(product);
+      return reply.send({
+        ...product,
+        status: resolveWorkflowStatus(product.status, product.state),
+      });
     },
   );
 

@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import time
+from itertools import combinations
 from typing import Any
 from uuid import uuid4
 
@@ -461,30 +462,36 @@ async def _step_profiling(
                     logger.warning("Profiling column %s.%s failed: %s", table_fqn, col_name, col_err)
 
             # Composite PK detection: if no single-column PK was found, test
-            # candidate combinations of NOT-NULL columns ending in _id/_key
-            # plus timestamp columns.
+            # candidate combinations of NOT-NULL columns with moderate
+            # cardinality.  Pure data-driven — no column-name heuristics.
             has_single_pk = any(pc.get("is_likely_pk") for pc in profile_cols)
             if not has_single_pk and total_rows and total_rows > 0:
-                id_cols = [
+                _EXCLUDE_TYPES = {
+                    "BOOLEAN", "VARIANT", "OBJECT", "ARRAY",
+                    "CLOB", "NCLOB",
+                }
+                pk_pool = [
                     pc["column"] for pc in profile_cols
                     if pc["null_pct"] == 0
-                    and (pc["column"].lower().endswith("_id")
-                         or pc["column"].lower().endswith("_key"))
+                    and pc["data_type"].upper() not in _EXCLUDE_TYPES
+                    and pc.get("distinct_count", 0) > 1
+                    and pc.get("uniqueness_pct", 0) < 90
                 ]
-                ts_cols = [
-                    pc["column"] for pc in profile_cols
-                    if pc["null_pct"] == 0
-                    and pc["data_type"].upper() in (
-                        "TIMESTAMP_NTZ", "TIMESTAMP_LTZ", "TIMESTAMP_TZ",
-                        "TIMESTAMP", "DATE", "DATETIME",
-                    )
-                ]
-                # Try: all id_cols + first timestamp (common pattern)
+                # Sort by selectivity (highest distinct count first) and cap
+                # at 6 columns to keep the combinatorial search manageable.
+                col_distinct = {
+                    pc["column"]: pc.get("distinct_count", 0)
+                    for pc in profile_cols
+                }
+                pk_pool.sort(key=lambda c: col_distinct.get(c, 0), reverse=True)
+                pk_pool = pk_pool[:6]
+
+                # Generate all 2..min(5, len) sized combinations, smallest first.
                 candidates: list[list[str]] = []
-                if id_cols and ts_cols:
-                    candidates.append(id_cols + [ts_cols[0]])
-                if len(id_cols) >= 2:
-                    candidates.append(id_cols)
+                max_r = min(len(pk_pool), 5)
+                for r in range(2, max_r + 1):
+                    for subset in combinations(pk_pool, r):
+                        candidates.append(list(subset))
 
                 for combo in candidates:
                     if len(combo) < 2 or len(combo) > 5:

@@ -24,6 +24,7 @@ from typing import Any
 from litellm import Router
 
 from config import get_effective_settings
+from services.model_names import normalize_vertex_model_name
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +114,7 @@ def _get_model_for_provider(settings: Any, provider: str) -> str:
     elif provider == "openai":
         return settings.openai_model
     elif provider == "vertex-ai":
-        return settings.vertex_model
+        return normalize_vertex_model_name(settings.vertex_model)
     elif provider == "azure-openai":
         return settings.azure_openai_deployment
     elif provider == "snowflake-cortex":
@@ -130,7 +131,9 @@ def _get_model_from_fallback_config(fallback: dict[str, Any], provider: str) -> 
     if provider == "azure-openai":
         return fallback.get("azure_openai_deployment", fallback.get("model", ""))
     elif provider == "vertex-ai":
-        return fallback.get("vertex_model", fallback.get("model", ""))
+        return normalize_vertex_model_name(
+            fallback.get("vertex_model", fallback.get("model", ""))
+        )
     elif provider == "anthropic":
         return fallback.get("anthropic_model", fallback.get("model", ""))
     elif provider == "openai":

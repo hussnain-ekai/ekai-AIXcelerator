@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from agents.prompts import VALIDATION_PROMPT
+from agents.prompts import MODEL_BUILDER_PROMPT as VALIDATION_PROMPT  # merged into model-builder
 
 logger = logging.getLogger(__name__)
 

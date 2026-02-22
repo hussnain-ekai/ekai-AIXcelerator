@@ -43,6 +43,7 @@ class AgentMessage(BaseModel):
 
 StreamEventType = Literal[
     "token",
+    "reasoning_update",
     "message_done",
     "tool_call",
     "tool_result",

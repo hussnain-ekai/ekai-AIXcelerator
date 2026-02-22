@@ -51,6 +51,12 @@ interface PipelineProgress {
   overallPct: number;
 }
 
+interface ReasoningUpdate {
+  message: string;
+  timestamp: string;
+  source: 'llm' | 'fallback';
+}
+
 interface ChatState {
   messages: ChatMessage[];
   isStreaming: boolean;
@@ -64,6 +70,10 @@ interface ChatState {
   pipelineRunning: boolean;
   /** Data maturity tier from discovery pipeline — controls phase stepper display. */
   dataTier: DataTier;
+  /** Short user-safe progress snippet streamed from assistant output. */
+  reasoningUpdate: ReasoningUpdate | null;
+  /** Rolling list of recent reasoning updates for live details panel. */
+  reasoningLog: ReasoningUpdate[];
   addMessage: (message: ChatMessage) => void;
   updateLastAssistantMessage: (content: string) => void;
   finalizeLastMessage: () => void;
@@ -76,6 +86,8 @@ interface ChatState {
   setPipelineProgress: (progress: PipelineProgress | null) => void;
   setPipelineRunning: (running: boolean) => void;
   setDataTier: (tier: DataTier) => void;
+  setReasoningUpdate: (message: string | null, source?: 'llm' | 'fallback') => void;
+  clearReasoningLog: () => void;
   attachArtifactToLastAssistant: (artifactType: ArtifactType) => void;
   truncateAfter: (messageId: string) => void;
   editMessage: (messageId: string, newContent: string) => void;
@@ -96,6 +108,8 @@ const INITIAL_STATE = {
   pipelineProgress: null as PipelineProgress | null,
   pipelineRunning: false,
   dataTier: null as DataTier,
+  reasoningUpdate: null as ReasoningUpdate | null,
+  reasoningLog: [] as ReasoningUpdate[],
 };
 
 export type ChatStore = ReturnType<typeof createChatStore>;
@@ -204,6 +218,37 @@ export function createChatStore() {
     setDataTier: (tier: DataTier) =>
       set({ dataTier: tier }),
 
+    setReasoningUpdate: (message: string | null, source: 'llm' | 'fallback' = 'fallback') =>
+      set((state) => {
+        if (!message) {
+          return { reasoningUpdate: null };
+        }
+        const update: ReasoningUpdate = {
+          message,
+          timestamp: new Date().toISOString(),
+          source,
+        };
+        const last = state.reasoningLog[state.reasoningLog.length - 1];
+        const isDuplicate =
+          !!last &&
+          last?.message === update.message &&
+          last?.source === update.source;
+        const nextLog = isDuplicate
+          ? state.reasoningLog
+          : [...state.reasoningLog, update].slice(-8);
+
+        return {
+          reasoningUpdate: update,
+          reasoningLog: nextLog,
+        };
+      }),
+
+    clearReasoningLog: () =>
+      set({
+        reasoningUpdate: null,
+        reasoningLog: [],
+      }),
+
     attachArtifactToLastAssistant: (artifactType: ArtifactType) =>
       set((state) => {
         const messages = [...state.messages];
@@ -242,9 +287,14 @@ export function createChatStore() {
         artifacts: [],
         currentPhase: 'idle',
         sessionId: null,
+        isStreaming: false,
         isHydrated: false,
         pipelineProgress: null,
+        pipelineRunning: false,
+        activePanel: null,
         dataTier: null,
+        reasoningUpdate: null,
+        reasoningLog: [],
       }),
 
     reset: () => set(INITIAL_STATE),
@@ -254,7 +304,12 @@ export function createChatStore() {
         messages,
         sessionId,
         currentPhase: phase,
+        isStreaming: false,
         isHydrated: true,
+        pipelineProgress: null,
+        pipelineRunning: false,
+        reasoningUpdate: null,
+        reasoningLog: [],
         ...(dataTier !== undefined ? { dataTier } : {}),
       }),
 
@@ -274,4 +329,5 @@ export type {
   ArtifactType,
   DataTier,
   PipelineProgress,
+  ReasoningUpdate,
 };

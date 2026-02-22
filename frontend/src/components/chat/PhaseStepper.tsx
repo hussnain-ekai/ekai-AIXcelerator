@@ -2,11 +2,10 @@
 
 import { Box, Typography } from '@mui/material';
 import CheckIcon from '@mui/icons-material/Check';
-import type { AgentPhase, DataTier } from '@/stores/chatStore';
+import type { AgentPhase } from '@/stores/chatStore';
 
 interface PhaseStepperProps {
   currentPhase: AgentPhase;
-  dataTier: DataTier;
 }
 
 interface PhaseStep {
@@ -14,19 +13,8 @@ interface PhaseStep {
   label: string;
 }
 
-/** All 7 phases — shown for bronze/silver data that needs preparation + modeling. */
-const ALL_PHASES: PhaseStep[] = [
-  { key: 'discovery', label: 'Discovery' },
-  { key: 'prepare', label: 'Prepare' },
-  { key: 'requirements', label: 'Requirements' },
-  { key: 'modeling', label: 'Modeling' },
-  { key: 'generation', label: 'Generation' },
-  { key: 'validation', label: 'Validation' },
-  { key: 'publishing', label: 'Publishing' },
-];
-
-/** Gold-layer shortcut — 5 phases (transformation + modeling skipped). */
-const GOLD_PHASES: PhaseStep[] = [
+/** Always 5 phases per PRD — internal steps (transformation, modeling) are invisible. */
+const PHASES: PhaseStep[] = [
   { key: 'discovery', label: 'Discovery' },
   { key: 'requirements', label: 'Requirements' },
   { key: 'generation', label: 'Generation' },
@@ -40,11 +28,16 @@ const GRAY_TEXT = '#9E9E9E';
 
 type StepStatus = 'completed' | 'active' | 'future';
 
-function getPhaseIndex(phase: AgentPhase, phases: PhaseStep[]): number {
+function getPhaseIndex(phase: AgentPhase): number {
   // 'explorer' comes after publishing — all phases are complete
-  if (phase === 'explorer') return phases.length;
-  const index = phases.findIndex((p) => p.key === phase);
-  return index >= 0 ? index : -1;
+  if (phase === 'explorer') return PHASES.length;
+  const index = PHASES.findIndex((p) => p.key === phase);
+  if (index >= 0) return index;
+  // Internal phases never shown to user but may arrive from backend:
+  // 'prepare' (transformation) stays at discovery, 'modeling' maps to generation
+  if (phase === 'prepare') return 0.5;  // between discovery (done) and requirements (future)
+  if (phase === 'modeling') return PHASES.findIndex((p) => p.key === 'generation');
+  return 0;
 }
 
 function getStepStatus(stepIndex: number, activeIndex: number): StepStatus {
@@ -120,17 +113,14 @@ function ConnectorLine({ status }: { status: StepStatus }): React.ReactNode {
   );
 }
 
-export function PhaseStepper({ currentPhase, dataTier }: PhaseStepperProps): React.ReactNode {
-  // Gold data skips transformation + modeling → show 5 phases.
-  // Default (null = before classification) shows all 7.
-  const phases = dataTier === 'gold' ? GOLD_PHASES : ALL_PHASES;
-  const activeIndex = getPhaseIndex(currentPhase, phases);
+export function PhaseStepper({ currentPhase }: PhaseStepperProps): React.ReactNode {
+  const activeIndex = getPhaseIndex(currentPhase);
 
   return (
     <Box sx={{ display: 'flex', alignItems: 'center', px: 3, py: 2 }}>
-      {phases.map((phase, index) => {
+      {PHASES.map((phase, index) => {
         const status = getStepStatus(index, activeIndex);
-        const isLast = index === phases.length - 1;
+        const isLast = index === PHASES.length - 1;
         const textColor = status === 'future' ? GRAY_TEXT : GOLD;
 
         return (

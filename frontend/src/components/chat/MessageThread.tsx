@@ -4,7 +4,9 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Box,
   Chip,
+  Collapse,
   CircularProgress,
+  Button,
   IconButton,
   Paper,
   TextField,
@@ -15,12 +17,18 @@ import CheckOutlined from '@mui/icons-material/CheckOutlined';
 import CloseOutlined from '@mui/icons-material/CloseOutlined';
 import ContentCopyOutlined from '@mui/icons-material/ContentCopyOutlined';
 import EditOutlined from '@mui/icons-material/EditOutlined';
+import ExpandLessOutlined from '@mui/icons-material/ExpandLessOutlined';
+import ExpandMoreOutlined from '@mui/icons-material/ExpandMoreOutlined';
 import InsertDriveFileOutlined from '@mui/icons-material/InsertDriveFileOutlined';
 import RefreshOutlined from '@mui/icons-material/RefreshOutlined';
-import type { ChatMessage, ArtifactType } from '@/stores/chatStore';
+import type {
+  ChatMessage,
+  ArtifactType,
+  PipelineProgress,
+  ReasoningUpdate,
+} from '@/stores/chatStore';
 import { useChatStore } from '@/stores/chatStoreProvider';
 import { ArtifactCard } from './ArtifactCard';
-import { DiscoveryProgress } from './DiscoveryProgress';
 
 interface MessageThreadProps {
   messages: ChatMessage[];
@@ -41,6 +49,19 @@ function isHiddenMessage(message: ChatMessage): boolean {
   const text = typeof message.content === 'string' ? message.content : '';
   // Internal discovery context injected for the LLM — never for user display
   if (text.includes('[INTERNAL CONTEXT')) return true;
+  if (text.includes('[SUPERVISOR CONTEXT CONTRACT')) return true;
+  // Orchestrator internal monologue that leaked through (mentions tool names, task(), etc.)
+  if (message.role === 'assistant') {
+    if (text.includes('`task`') || text.includes('task()')) return true;
+    if (text.includes('subagent') || text.includes('sub-agent')) return true;
+    if (text.includes('tool usage') || text.includes('tool_call')) return true;
+    // Repeated "Wait" pattern from Gemini auto-chain failures
+    if ((text.match(/\*\*Wait\*\*/g) ?? []).length >= 2) return true;
+    if ((text.match(/Wait,/g) ?? []).length >= 2) return true;
+    // Tool cancellation messages (Deep Agents internal noise)
+    if (text.includes('was cancelled') && text.includes('tool call')) return true;
+    if (text.includes('Tool call task with id')) return true;
+  }
   return false;
 }
 
@@ -52,6 +73,18 @@ function isHiddenMessage(message: ChatMessage): boolean {
 function condenseContent(content: string): { text: string; hasCodeBlock: boolean } {
   let text = content;
   let condensed = false;
+
+  // Strip any leaked supervisor/internal contract payloads.
+  if (text.includes('[SUPERVISOR CONTEXT CONTRACT')) {
+    const userMarker = '[USER MESSAGE]';
+    const markerIdx = text.indexOf(userMarker);
+    if (markerIdx !== -1) {
+      text = text.slice(markerIdx + userMarker.length).trim();
+    } else {
+      text = '';
+    }
+    condensed = true;
+  }
 
   // Strip BRD inline text — show only the summary before it
   const brdStart = text.indexOf('---BEGIN BRD---');
@@ -84,6 +117,12 @@ function condenseContent(content: string): { text: string; hasCodeBlock: boolean
     text = summary || 'Artifact generated.';
     condensed = true;
   }
+
+  // Always strip markdown formatting — agents should output plain text only,
+  // but LLMs sometimes emit **bold**, *italic*, and # headers regardless.
+  text = text.replace(/\*\*(.*?)\*\*/g, '$1');   // **bold** → bold
+  text = text.replace(/\*(.*?)\*/g, '$1');        // *italic* → italic
+  text = text.replace(/^#{1,6}\s+/gm, '');        // # headers → plain text
 
   return { text, hasCodeBlock: condensed };
 }
@@ -120,8 +159,48 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   register_transformed_layer: 'Registering data layer',
 };
 
+const PHASE_STATUS_LABELS: Record<string, string> = {
+  idle: 'Waiting for your input',
+  discovery: 'Profiling your source data',
+  prepare: 'Preparing context from source data',
+  requirements: 'Capturing business requirements',
+  modeling: 'Designing transformation logic',
+  generation: 'Generating semantic model',
+  validation: 'Validating model outputs',
+  publishing: 'Publishing the data product',
+  explorer: 'Ready in explorer mode',
+};
+
+function getPhaseStatusLabel(currentPhase: string, recentToolNames: string[]): string {
+  if (currentPhase === 'requirements') {
+    if (recentToolNames.includes('save_brd')) {
+      return 'Drafting business requirements document (BRD)';
+    }
+    return 'Capturing business requirements';
+  }
+  return PHASE_STATUS_LABELS[currentPhase] ?? 'Processing your request';
+}
+
+function getStallHint(currentPhase: string): string {
+  if (currentPhase === 'discovery' || currentPhase === 'prepare') {
+    return 'Large datasets can take longer during profiling and preparation. ekaiX is still working.';
+  }
+  if (currentPhase === 'requirements') {
+    return 'Requirement capture or BRD drafting may pause while the model composes output. ekaiX is still working.';
+  }
+  return 'This step is taking longer than usual, but ekaiX is still working.';
+}
+
 function getToolDisplayName(toolName: string): string {
   return TOOL_DISPLAY_NAMES[toolName] ?? 'Working';
+}
+
+function formatElapsed(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}m ${seconds}s`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -499,6 +578,216 @@ function SystemMessage({ message }: { message: ChatMessage }): React.ReactNode {
   );
 }
 
+function LiveAgentStatus({
+  messages,
+  isStreaming,
+  pipelineProgress,
+  currentPhase,
+  reasoningUpdate,
+  reasoningLog,
+}: {
+  messages: ChatMessage[];
+  isStreaming: boolean;
+  pipelineProgress: PipelineProgress | null;
+  currentPhase: string;
+  reasoningUpdate: ReasoningUpdate | null;
+  reasoningLog: ReasoningUpdate[];
+}): React.ReactNode {
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const [startedAt, setStartedAt] = useState<number | null>(null);
+  const [lastUpdateAt, setLastUpdateAt] = useState<number>(Date.now());
+  const [now, setNow] = useState<number>(Date.now());
+
+  const lastMessage = messages[messages.length - 1];
+  const lastContentLength =
+    typeof lastMessage?.content === 'string'
+      ? lastMessage.content.length
+      : JSON.stringify(lastMessage?.content ?? '').length;
+  const activityFingerprint = [
+    messages.length,
+    lastMessage?.id ?? 'none',
+    lastContentLength,
+    lastMessage?.toolCalls?.length ?? 0,
+    pipelineProgress?.step ?? 'none',
+    pipelineProgress?.detail ?? '',
+    pipelineProgress?.status ?? 'none',
+    reasoningUpdate?.message ?? '',
+    reasoningUpdate?.timestamp ?? '',
+    reasoningLog.length,
+    reasoningLog[reasoningLog.length - 1]?.timestamp ?? '',
+  ].join('|');
+
+  useEffect(() => {
+    if (isStreaming) {
+      setStartedAt((prev) => prev ?? Date.now());
+      return;
+    }
+    setStartedAt(null);
+    setDetailsOpen(false);
+  }, [isStreaming]);
+
+  useEffect(() => {
+    if (isStreaming || pipelineProgress) {
+      setLastUpdateAt(Date.now());
+    }
+  }, [activityFingerprint, isStreaming, pipelineProgress]);
+
+  useEffect(() => {
+    if (!isStreaming) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [isStreaming]);
+
+  useEffect(() => {
+    if (isStreaming && reasoningLog.length > 0) {
+      setDetailsOpen(true);
+    }
+  }, [isStreaming, reasoningLog.length]);
+
+  const elapsedText = startedAt ? formatElapsed(now - startedAt) : '0s';
+  const staleSeconds = Math.max(0, Math.floor((now - lastUpdateAt) / 1000));
+  const looksStalled = isStreaming && staleSeconds >= 45;
+  const isPipelineComplete =
+    pipelineProgress?.step === 'artifacts' && pipelineProgress?.status === 'completed';
+
+  const recentToolNames = messages
+    .slice()
+    .reverse()
+    .flatMap((msg) => (msg.toolCalls ?? []).map((call) => call.name))
+    .filter((name, idx, arr) => arr.indexOf(name) === idx)
+    .slice(0, 8);
+
+  const recentToolActions = messages
+    .slice()
+    .reverse()
+    .flatMap((msg) => (msg.toolCalls ?? []).map((call) => getToolDisplayName(call.name)))
+    .filter((name, idx, arr) => arr.indexOf(name) === idx)
+    .slice(0, 5);
+
+  const phaseLabel = getPhaseStatusLabel(currentPhase, recentToolNames);
+  const latestReasoning = reasoningLog[reasoningLog.length - 1] ?? reasoningUpdate;
+  const assistantReasoning = latestReasoning?.message?.trim() ?? '';
+  const reasoningLabel = latestReasoning?.source === 'llm' ? 'LLM thinking' : 'ekaiX update';
+  const recentReasoning = reasoningLog.slice(-3);
+  const summaryText = isPipelineComplete
+    ? 'Analysis complete'
+    : assistantReasoning || (
+      pipelineProgress
+      ? pipelineProgress.label
+      : phaseLabel
+    );
+
+  if (!isStreaming && !pipelineProgress) {
+    return null;
+  }
+
+  return (
+    <Box sx={{ display: 'flex', alignItems: 'flex-start', maxWidth: '75%' }}>
+      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, width: '100%', maxWidth: 620 }}>
+        <Typography variant="caption" sx={{ fontWeight: 700, color: GOLD }}>
+          ekaiX
+        </Typography>
+        <Paper
+          elevation={0}
+          sx={{
+            p: 1.5,
+            bgcolor: 'background.paper',
+            borderRadius: 2,
+            border: 1,
+            borderColor: looksStalled ? 'warning.main' : 'divider',
+          }}
+        >
+          <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 1 }}>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+              {isPipelineComplete ? (
+                <CheckOutlined sx={{ fontSize: 16, color: 'success.main' }} />
+              ) : (
+                <CircularProgress size={16} sx={{ color: GOLD }} />
+              )}
+              <Box>
+                <Typography variant="body2" sx={{ lineHeight: 1.4 }}>
+                  {summaryText}
+                  {!assistantReasoning &&
+                    pipelineProgress?.detail &&
+                    pipelineProgress.detail !== 'Done'
+                    ? ` • ${pipelineProgress.detail}`
+                    : ''}
+                </Typography>
+                <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                  {isStreaming ? `Running ${elapsedText}` : 'Completed'}
+                  {pipelineProgress
+                    ? ` • Step ${pipelineProgress.stepIndex + 1}/${pipelineProgress.totalSteps}`
+                    : ''}
+                  {looksStalled ? ` • no updates for ${staleSeconds}s` : ''}
+                </Typography>
+              </Box>
+            </Box>
+            <Button
+              size="small"
+              variant="text"
+              onClick={() => setDetailsOpen((prev) => !prev)}
+              endIcon={detailsOpen ? <ExpandLessOutlined /> : <ExpandMoreOutlined />}
+              sx={{
+                minWidth: 0,
+                px: 0.75,
+                textTransform: 'none',
+                color: 'text.secondary',
+                fontSize: '0.75rem',
+              }}
+            >
+              {detailsOpen ? 'Hide details' : 'Show details'}
+            </Button>
+          </Box>
+
+          <Collapse in={detailsOpen}>
+            <Box
+              sx={{
+                mt: 1.25,
+                pt: 1,
+                borderTop: 1,
+                borderColor: 'divider',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 0.5,
+              }}
+            >
+              <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                Current step: {phaseLabel}
+              </Typography>
+              {assistantReasoning && (
+                <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                  {reasoningLabel}: {assistantReasoning}
+                </Typography>
+              )}
+              {recentReasoning.length > 0 && (
+                <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                  Thinking log: {recentReasoning.map((entry) => entry.message).join(' | ')}
+                </Typography>
+              )}
+              {pipelineProgress && (
+                <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                  Progress: {pipelineProgress.label}
+                </Typography>
+              )}
+              <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                Recent progress:{' '}
+                {recentToolActions.length > 0
+                  ? recentToolActions.join(' -> ')
+                  : 'Working on the next step...'}
+              </Typography>
+              {looksStalled && (
+                <Typography variant="caption" sx={{ color: 'warning.main' }}>
+                  {getStallHint(currentPhase)}
+                </Typography>
+              )}
+            </Box>
+          </Collapse>
+        </Paper>
+      </Box>
+    </Box>
+  );
+}
+
 function MessageBubble({
   message,
   onOpenArtifact,
@@ -547,10 +836,14 @@ export function MessageThread({
 }: MessageThreadProps): React.ReactNode {
   const bottomRef = useRef<HTMLDivElement>(null);
   const pipelineProgress = useChatStore((state) => state.pipelineProgress);
+  const currentPhase = useChatStore((state) => state.currentPhase);
+  const reasoningUpdate = useChatStore((state) => state.reasoningUpdate);
+  const reasoningLog = useChatStore((state) => state.reasoningLog);
+  const visibleMessages = messages.filter((m) => !isHiddenMessage(m));
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, isStreaming, pipelineProgress]);
+  }, [messages, isStreaming, pipelineProgress, reasoningUpdate?.timestamp, reasoningLog.length]);
 
   return (
     <Box
@@ -564,7 +857,7 @@ export function MessageThread({
         gap: 2,
       }}
     >
-      {messages.length === 0 && !pipelineProgress && (
+      {visibleMessages.length === 0 && !pipelineProgress && (
         <Box
           sx={{
             flex: 1,
@@ -584,7 +877,7 @@ export function MessageThread({
         </Box>
       )}
 
-      {messages.filter((m) => !isHiddenMessage(m)).map((message) => (
+      {visibleMessages.map((message) => (
         <MessageBubble
           key={message.id}
           message={message}
@@ -595,18 +888,14 @@ export function MessageThread({
         />
       ))}
 
-      {/* Live pipeline progress — only while steps are running */}
-      {pipelineProgress && <DiscoveryProgress progress={pipelineProgress} />}
-
-      {/* Thinking spinner — shown when streaming and pipeline is not actively running */}
-      {isStreaming && !pipelineProgress && (
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, pl: 1 }}>
-          <CircularProgress size={16} sx={{ color: GOLD }} />
-          <Typography variant="caption" color="text.secondary">
-            ekaiX is thinking...
-          </Typography>
-        </Box>
-      )}
+      <LiveAgentStatus
+        messages={visibleMessages}
+        isStreaming={isStreaming}
+        pipelineProgress={pipelineProgress}
+        currentPhase={currentPhase}
+        reasoningUpdate={reasoningUpdate}
+        reasoningLog={reasoningLog}
+      />
 
       <div ref={bottomRef} />
     </Box>

@@ -16,6 +16,7 @@ from config import (
     get_effective_settings,
     get_settings,
 )
+from services.model_names import normalize_vertex_model_name
 from services.llm import _is_reasoning_model
 from models.schemas import (
     LLMConfigRequest,
@@ -55,7 +56,7 @@ def _request_to_overrides(req: LLMConfigRequest | LLMTestRequest) -> dict[str, A
         if req.provider == "snowflake-cortex":
             overrides["cortex_model"] = req.model
         elif req.provider == "vertex-ai":
-            overrides["vertex_model"] = req.model
+            overrides["vertex_model"] = normalize_vertex_model_name(req.model)
         elif req.provider == "azure-openai":
             overrides["azure_openai_deployment"] = req.model
         elif req.provider == "anthropic":
@@ -89,6 +90,11 @@ def _request_to_overrides(req: LLMConfigRequest | LLMTestRequest) -> dict[str, A
         if value is not None:
             overrides[settings_field] = value
 
+    if overrides.get("vertex_model") is not None:
+        overrides["vertex_model"] = normalize_vertex_model_name(
+            str(overrides["vertex_model"])
+        )
+
     return overrides
 
 
@@ -117,7 +123,9 @@ def _build_test_model(overrides: dict[str, Any]) -> BaseChatModel:
         creds_json = overrides.get("vertex_credentials_json", base.vertex_credentials_json)
         project = overrides.get("vertex_project", base.vertex_project)
         location = overrides.get("vertex_location", base.vertex_location)
-        model_name = overrides.get("vertex_model", base.vertex_model)
+        model_name = normalize_vertex_model_name(
+            overrides.get("vertex_model", base.vertex_model)
+        )
 
         if not creds_json:
             raise ValueError("Vertex AI credentials JSON is required")

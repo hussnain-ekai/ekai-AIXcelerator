@@ -86,6 +86,20 @@
 
 ---
 
+## 7. Dynamic LLM Model Catalog (Deferred / Risk-Managed)
+
+**Problem:** Provider model IDs change frequently. Hardcoded model lists in UI/code create drift and require redeploys for every new model.
+
+**Solution (deferred):**
+- Create a backend-managed model catalog endpoint (e.g. `/settings/llm/catalog`).
+- Sync provider model lists on a schedule (with manual refresh), cache in DB/Redis, and serve to frontend.
+- Keep a "custom model ID" escape hatch and validate selected model IDs on save/test.
+- Preserve the current hardcoded list as fallback if catalog fetch fails.
+
+**Why deferred now:** Higher integration/testing risk across providers; implement after current workflow stabilization and bug-fix cycle.
+
+---
+
 ## Priority Order
 
 | # | Feature | Effort | Impact |
@@ -96,3 +110,4 @@
 | 5 | Data maturity + transformation agent | High | Very High — unlocks bronze/silver data |
 | 4 | ML Functions as tools | High | Medium — wow factor for demos |
 | 6 | Multi-platform (Databricks, Fabric) | Very High | Very High — market expansion |
+| 7 | Dynamic LLM model catalog | Medium | High — keeps model options current without redeploy |

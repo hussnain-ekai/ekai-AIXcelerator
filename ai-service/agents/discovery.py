@@ -261,6 +261,41 @@ def _find_pk_column(table: dict[str, Any]) -> str:
     return ""
 
 
+def _table_name_only(fqn: str) -> str:
+    """Extract the bare table name from a potentially fully-qualified name."""
+    return fqn.split(".")[-1].lower()
+
+
+def _singular_matches_table(entity: str, table_name: str) -> bool:
+    """Check if a singular entity name matches a table name (singular/plural).
+
+    Handles common patterns:
+      - PATIENT → PATIENTS, PAYER → PAYERS  (+ 's')
+      - ADDRESS → ADDRESSES                 (+ 'es')
+      - ENTITY → ENTITIES                   ('y' → 'ies')
+      - ENCOUNTER → ENCOUNTERS              (+ 's')
+      - Exact match                          (entity == table)
+    """
+    tbl = table_name.lower()
+    ent = entity.lower()
+    if ent == tbl:
+        return True
+    if f"{ent}s" == tbl:
+        return True
+    if f"{ent}es" == tbl:
+        return True
+    if ent.endswith("y") and f"{ent[:-1]}ies" == tbl:
+        return True
+    # Reverse: table name de-pluralised matches entity
+    if tbl.endswith("ies") and f"{tbl[:-3]}y" == ent:
+        return True
+    if tbl.endswith("es") and tbl[:-2] == ent:
+        return True
+    if tbl.endswith("s") and tbl[:-1] == ent:
+        return True
+    return False
+
+
 def infer_foreign_keys(
     tables: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -268,6 +303,12 @@ def infer_foreign_keys(
 
     Biases toward false positives — better to suggest too many relationships
     than to miss real ones.
+
+    Supported patterns:
+      - *_id suffix:  sensor_id  → sensors / dim_sensor  (classic FK naming)
+      - *_code suffix: payer_code → payers               (code-style FK naming)
+      - *_key suffix:  org_key   → organizations          (key-style FK naming)
+      - Bare entity:   PATIENT   → PATIENTS               (singular→plural)
 
     Args:
         tables: List of table metadata dicts with 'name', 'columns' keys.
@@ -279,61 +320,113 @@ def infer_foreign_keys(
     relationships: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str, str]] = set()  # Deduplicate
 
+    # Pre-build a set of table names (bare, lowered) for fast lookup
+    table_bare_names: dict[str, list[dict[str, Any]]] = {}
+    for t in tables:
+        bare = _table_name_only(t["name"])
+        table_bare_names.setdefault(bare, []).append(t)
+
     for table in tables:
         for col in table.get("columns", []):
             col_name = col.get("name", "").lower()
             if not col_name:
                 continue
 
-            # Look for _id pattern: sensor_id in fact -> SENSOR_ID in dim_sensor
+            # Skip columns that are PKs in their own table
+            if col.get("is_pk"):
+                continue
+
+            # Determine the entity name and confidence tier based on suffix
+            entity_name: str | None = None
+            is_explicit_fk = False
+
             if col_name.endswith("_id"):
-                entity_name = col_name[:-3]  # Remove _id suffix
+                entity_name = col_name[:-3]
+                is_explicit_fk = True
+            elif col_name.endswith("_code"):
+                entity_name = col_name[:-5]
+                is_explicit_fk = True
+            elif col_name.endswith("_key"):
+                entity_name = col_name[:-4]
+                is_explicit_fk = True
+            else:
+                # Bare entity name candidate (e.g., PATIENT, ENCOUNTER)
+                # Skip very short names and common non-FK columns
+                skip_names = {
+                    "id", "name", "type", "status", "date", "start", "stop",
+                    "code", "value", "description", "source", "address", "city",
+                    "state", "zip", "county", "lat", "lon", "gender", "race",
+                    "ethnicity", "birthdate", "deathdate", "prefix", "suffix",
+                    "first", "last", "maiden", "phone", "revenue", "utilization",
+                }
+                if col_name in skip_names or len(col_name) < 3:
+                    continue
+                entity_name = col_name
+                is_explicit_fk = False
 
-                for other_table in tables:
-                    if other_table["name"] == table["name"]:
-                        continue
-                    other_name_lower = other_table["name"].lower()
+            if not entity_name:
+                continue
 
-                    if entity_name in other_name_lower:
-                        other_cols = {c["name"].lower(): c["name"] for c in other_table.get("columns", [])}
+            for other_table in tables:
+                if other_table["name"] == table["name"]:
+                    continue
+                other_bare = _table_name_only(other_table["name"])
 
-                        # Resolve target column: prefer exact same name, then
-                        # PK column, then entity_id, then "id" — never hardcode
-                        target_col = ""
-                        confidence = 0.7
-                        if col_name in other_cols:
-                            # Exact column name match (e.g., SENSOR_ID → SENSOR_ID)
-                            target_col = other_cols[col_name]
-                            confidence = 0.95
-                        elif f"{entity_name}_id" in other_cols:
-                            target_col = other_cols[f"{entity_name}_id"]
-                            confidence = 0.95
-                        elif "id" in other_cols:
-                            target_col = other_cols["id"]
-                            confidence = 0.9
-                        else:
-                            # Fall back to the table's PK column
-                            pk_col = _find_pk_column(other_table)
-                            if pk_col:
-                                target_col = pk_col
-                                confidence = 0.85
+                # Match: entity name against table name
+                is_match = False
+                if is_explicit_fk:
+                    # For _id/_code/_key: substring match (original behavior)
+                    is_match = entity_name in other_table["name"].lower()
+                else:
+                    # For bare entity: singular→plural match only (stricter)
+                    is_match = _singular_matches_table(entity_name, other_bare)
 
-                        if not target_col:
-                            continue
+                if not is_match:
+                    continue
 
-                        key = (table["name"], col["name"], other_table["name"], target_col)
-                        if key in seen:
-                            continue
-                        seen.add(key)
+                other_cols = {
+                    c["name"].lower(): c["name"]
+                    for c in other_table.get("columns", [])
+                }
 
-                        relationships.append({
-                            "from_table": table["name"],
-                            "from_column": col["name"],
-                            "to_table": other_table["name"],
-                            "to_column": target_col,
-                            "confidence": confidence,
-                            "cardinality": "many_to_one",
-                        })
+                # Resolve target column
+                target_col = ""
+                confidence = 0.7
+                if col_name in other_cols:
+                    target_col = other_cols[col_name]
+                    confidence = 0.95
+                elif f"{entity_name}_id" in other_cols:
+                    target_col = other_cols[f"{entity_name}_id"]
+                    confidence = 0.95
+                elif "id" in other_cols:
+                    target_col = other_cols["id"]
+                    confidence = 0.9
+                else:
+                    pk_col = _find_pk_column(other_table)
+                    if pk_col:
+                        target_col = pk_col
+                        confidence = 0.85
+
+                if not target_col:
+                    continue
+
+                # Reduce confidence for bare entity names (more speculative)
+                if not is_explicit_fk:
+                    confidence *= 0.85
+
+                key = (table["name"], col["name"], other_table["name"], target_col)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                relationships.append({
+                    "from_table": table["name"],
+                    "from_column": col["name"],
+                    "to_table": other_table["name"],
+                    "to_column": target_col,
+                    "confidence": confidence,
+                    "cardinality": "many_to_one",
+                })
 
     return relationships
 

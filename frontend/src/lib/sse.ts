@@ -19,7 +19,8 @@ interface PipelineProgressData {
 
 interface SSEHandlers {
   onToken: (text: string) => void;
-  onMessageDone: () => void;
+  onReasoningUpdate?: (message: string, source?: string) => void;
+  onMessageDone: (content?: string) => void;
   onToolCall: (toolName: string, toolInput: Record<string, unknown>) => void;
   onToolResult: (toolName: string, result: string) => void;
   onPhaseChange: (fromPhase: string, toPhase: string) => void;
@@ -61,8 +62,14 @@ function dispatchEvent(event: SSEEvent, handlers: SSEHandlers): void {
     case 'token':
       handlers.onToken((event.data.content as string) ?? (event.data.text as string) ?? '');
       break;
+    case 'reasoning_update':
+      handlers.onReasoningUpdate?.(
+        (event.data.message as string) ?? (event.data.text as string) ?? '',
+        (event.data.source as string) ?? undefined,
+      );
+      break;
     case 'message_done':
-      handlers.onMessageDone();
+      handlers.onMessageDone((event.data.content as string) ?? undefined);
       break;
     case 'tool_call':
       handlers.onToolCall(
@@ -152,66 +159,81 @@ function connectSSE(
   let retries = 0;
   let abortController = new AbortController();
   let isCleanedUp = false;
+  let isConnecting = false;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   async function connect(): Promise<void> {
-    if (isCleanedUp) return;
+    if (isCleanedUp || isConnecting) return;
+    isConnecting = true;
 
-    const user = useAuthStore.getState().user;
-    const effectiveUser =
-      user ?? (process.env.NODE_ENV === 'development' ? 'dev@localhost' : null);
-    const headers: Record<string, string> = {
-      Accept: 'text/event-stream',
-    };
-    if (effectiveUser) {
-      headers['Sf-Context-Current-User'] = effectiveUser;
-    }
+    try {
+      const user = useAuthStore.getState().user;
+      const effectiveUser =
+        user ?? (process.env.NODE_ENV === 'development' ? 'dev@localhost' : null);
+      const headers: Record<string, string> = {
+        Accept: 'text/event-stream',
+      };
+      if (effectiveUser) {
+        headers['Sf-Context-Current-User'] = effectiveUser;
+      }
 
-    abortController = new AbortController();
+      abortController = new AbortController();
 
-    const response = await fetch(
-      `${API_BASE_URL}/agent/stream/${sessionId}`,
-      {
-        method: 'GET',
-        headers,
-        signal: abortController.signal,
-      },
-    );
+      const response = await fetch(
+        `${API_BASE_URL}/agent/stream/${sessionId}`,
+        {
+          method: 'GET',
+          headers,
+          signal: abortController.signal,
+        },
+      );
 
-    if (!response.ok) {
-      throw new Error(`SSE connection failed: ${response.status}`);
-    }
+      if (!response.ok) {
+        throw new Error(`SSE connection failed: ${response.status}`);
+      }
 
-    const reader = response.body?.getReader();
-    if (!reader) {
-      throw new Error('Response body is not readable');
-    }
+      const reader = response.body?.getReader();
+      if (!reader) {
+        throw new Error('Response body is not readable');
+      }
 
-    const decoder = new TextDecoder();
-    let buffer = '';
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let doneEventReceived = false;
 
-    retries = 0;
+      retries = 0;
 
-    while (!isCleanedUp) {
-      const { done, value } = await reader.read();
-      if (done) break;
+      while (!isCleanedUp) {
+        const { done, value } = await reader.read();
+        if (done) break;
 
-      buffer += decoder.decode(value, { stream: true });
+        buffer += decoder.decode(value, { stream: true });
 
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
 
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed === '') continue;
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed === '') continue;
 
-        const event = parseSSELine(trimmed);
-        if (event) {
-          dispatchEvent(event, handlers);
-          if (event.type === 'done') {
-            return;
+          const event = parseSSELine(trimmed);
+          if (event) {
+            dispatchEvent(event, handlers);
+            if (event.type === 'done') {
+              doneEventReceived = true;
+              return;
+            }
           }
         }
       }
+
+      // Some server/proxy paths close the stream without emitting "done".
+      // Treat a clean close as completion so UI state does not remain stuck.
+      if (!isCleanedUp && !doneEventReceived) {
+        handlers.onDone();
+      }
+    } finally {
+      isConnecting = false;
     }
   }
 
@@ -230,7 +252,8 @@ function connectSSE(
 
     retries += 1;
     const delay = retryDelay(retries);
-    setTimeout(() => {
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
       connect().catch((err: unknown) => attemptReconnect(err));
     }, delay);
   }
@@ -249,6 +272,10 @@ function connectSSE(
   return function cleanup(): void {
     isCleanedUp = true;
     abortController.abort();
+    if (reconnectTimer !== null) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
     document.removeEventListener('visibilitychange', handleVisibilityChange);
   };
 }

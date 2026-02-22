@@ -87,7 +87,7 @@ const SEVERITY_COLORS: Record<string, { bg: string; fg: string; border: string }
 };
 
 function getSeverityStyle(severity: string): { bg: string; fg: string; border: string } {
-  return SEVERITY_COLORS[severity.toUpperCase()] ?? SEVERITY_COLORS.INFO;
+  return SEVERITY_COLORS[severity.toUpperCase()] ?? SEVERITY_COLORS['INFO']!;
 }
 
 /* ------------------------------------------------------------------ */

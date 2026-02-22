@@ -1,8 +1,8 @@
 'use client';
 
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Box, IconButton, Tooltip, Typography } from '@mui/material';
-import AddOutlined from '@mui/icons-material/AddOutlined';
+import AttachFileRounded from '@mui/icons-material/AttachFileRounded';
 import ArrowUpwardRounded from '@mui/icons-material/ArrowUpwardRounded';
 import CloseOutlined from '@mui/icons-material/CloseOutlined';
 import InsertDriveFileOutlined from '@mui/icons-material/InsertDriveFileOutlined';
@@ -38,24 +38,85 @@ export function ChatInput({
   const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const [focused, setFocused] = useState(false);
+  const [fileWarning, setFileWarning] = useState<string>('');
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const addFiles = useCallback((files: FileList | File[]) => {
-    const newFiles = Array.from(files).filter((f) => f.size <= MAX_FILE_SIZE);
-    setAttachedFiles((prev) => [...prev, ...newFiles].slice(0, MAX_FILES));
+    const incoming = Array.from(files);
+    const oversized = incoming.filter((f) => f.size > MAX_FILE_SIZE);
+    const valid = incoming.filter((f) => f.size <= MAX_FILE_SIZE);
+
+    setAttachedFiles((prev) => {
+      const remainingSlots = Math.max(0, MAX_FILES - prev.length);
+      const accepted = valid.slice(0, remainingSlots);
+      const droppedForLimit = Math.max(0, valid.length - accepted.length);
+
+      if (oversized.length > 0 || droppedForLimit > 0) {
+        const reasons: string[] = [];
+        if (oversized.length > 0) {
+          reasons.push(`${oversized.length} file${oversized.length > 1 ? 's' : ''} too large`);
+        }
+        if (droppedForLimit > 0) {
+          reasons.push(`${droppedForLimit} ignored (max ${MAX_FILES} files)`);
+        }
+        setFileWarning(reasons.join(' • '));
+      } else {
+        setFileWarning('');
+      }
+
+      return [...prev, ...accepted];
+    });
   }, []);
 
   const removeFile = useCallback((index: number) => {
-    setAttachedFiles((prev) => prev.filter((_, i) => i !== index));
+    setAttachedFiles((prev) => {
+      const next = prev.filter((_, i) => i !== index);
+      if (next.length === 0) setFileWarning('');
+      return next;
+    });
   }, []);
+
+  const resizeTextarea = useCallback(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = '0px';
+    const next = Math.min(el.scrollHeight, 220);
+    el.style.height = `${Math.max(next, 44)}px`;
+    el.style.overflowY = el.scrollHeight > 220 ? 'auto' : 'hidden';
+  }, []);
+
+  useEffect(() => {
+    resizeTextarea();
+  }, [value, resizeTextarea, attachedFiles.length]);
+
+  const imagePreviews = useMemo(
+    () =>
+      attachedFiles.map((file) =>
+        file.type.startsWith('image/') ? URL.createObjectURL(file) : null,
+      ),
+    [attachedFiles],
+  );
+
+  useEffect(
+    () => () => {
+      imagePreviews.forEach((url) => {
+        if (url) URL.revokeObjectURL(url);
+      });
+    },
+    [imagePreviews],
+  );
 
   const handleSend = useCallback(() => {
     const trimmed = value.trim();
-    if (trimmed.length === 0 || disabled) return;
-    onSend(trimmed, attachedFiles.length > 0 ? attachedFiles : undefined);
+    const hasMessage = trimmed.length > 0;
+    const hasAttachments = attachedFiles.length > 0;
+    if ((!hasMessage && !hasAttachments) || disabled) return;
+    const outbound = hasMessage ? trimmed : 'Please analyze the attached files.';
+    onSend(outbound, attachedFiles.length > 0 ? attachedFiles : undefined);
     setValue('');
     setAttachedFiles([]);
+    setFileWarning('');
   }, [value, disabled, onSend, attachedFiles]);
 
   const handleKeyDown = useCallback(
@@ -107,71 +168,88 @@ export function ChatInput({
     textareaRef.current?.focus();
   }, []);
 
-  const canSend = value.trim().length > 0 && !disabled;
+  const canSend =
+    (value.trim().length > 0 || attachedFiles.length > 0) && !disabled;
   const hasFiles = attachedFiles.length > 0;
 
   return (
-    <Box sx={{ px: 3, py: 1.5, bgcolor: 'background.default' }}>
+    <Box
+      sx={{
+        px: { xs: 1.5, sm: 3 },
+        py: { xs: 1.25, sm: 1.5 },
+        bgcolor: 'background.default',
+      }}
+    >
       {/* Hidden file input — outside the container to prevent accidental triggers */}
       <input
         ref={fileInputRef}
         type="file"
         multiple
+        accept={ACCEPTED_TYPES}
         style={{ display: 'none' }}
         onChange={handleFileChange}
       />
 
-      {/* Unified input container — Claude AI style */}
+      {/* Unified input container — ChatGPT-like shell */}
       <Box
         onClick={handleContainerClick}
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
         sx={{
+          width: '100%',
+          maxWidth: 980,
+          mx: 'auto',
           display: 'flex',
           flexDirection: 'column',
           border: 1,
-          borderColor: dragOver
-            ? 'primary.main'
-            : focused
-              ? 'primary.main'
-              : 'divider',
-          borderRadius: 3,
+          borderColor: (theme) => {
+            if (dragOver) return theme.palette.primary.main;
+            if (focused) return theme.palette.text.primary;
+            return theme.palette.divider;
+          },
+          borderRadius: 4,
           bgcolor: 'background.paper',
-          transition: 'border-color 200ms',
+          transition: 'border-color 180ms ease, box-shadow 180ms ease',
+          boxShadow: (theme) =>
+            focused || dragOver
+              ? `0 0 0 3px ${theme.palette.action.hover}`
+              : '0 1px 2px rgba(16,24,40,0.04)',
           cursor: 'text',
           overflow: 'hidden',
         }}
       >
-        {/* File previews — inside the container */}
+        {/* File previews/chips */}
         {hasFiles && (
           <Box
             sx={{
               display: 'flex',
               flexWrap: 'wrap',
-              gap: 1,
+              gap: 0.75,
               px: 1.5,
-              pt: 1.5,
+              pt: 1.25,
             }}
           >
-            {attachedFiles.map((file, idx) =>
-              file.type.startsWith('image/') ? (
+            {attachedFiles.map((file, idx) => {
+              const preview = imagePreviews[idx];
+              return file.type.startsWith('image/') ? (
                 <Box
                   key={idx}
                   sx={{
                     position: 'relative',
-                    width: 64,
-                    height: 64,
-                    borderRadius: 1.5,
+                    width: 68,
+                    height: 68,
+                    borderRadius: 2,
                     overflow: 'hidden',
                     border: 1,
                     borderColor: 'divider',
                     flexShrink: 0,
+                    bgcolor: 'action.hover',
                   }}
                 >
                   <Box
                     component="img"
-                    src={URL.createObjectURL(file)}
+                    src={preview ?? undefined}
                     alt={file.name}
                     sx={{
                       width: '100%',
@@ -187,12 +265,12 @@ export function ChatInput({
                     size="small"
                     sx={{
                       position: 'absolute',
-                      top: 2,
-                      right: 2,
+                      top: 3,
+                      right: 3,
                       p: 0.25,
-                      bgcolor: 'rgba(0,0,0,0.6)',
+                      bgcolor: 'rgba(0,0,0,0.66)',
                       color: '#fff',
-                      '&:hover': { bgcolor: 'rgba(0,0,0,0.8)' },
+                      '&:hover': { bgcolor: 'rgba(0,0,0,0.85)' },
                     }}
                   >
                     <CloseOutlined sx={{ fontSize: 12 }} />
@@ -205,13 +283,13 @@ export function ChatInput({
                     display: 'flex',
                     alignItems: 'center',
                     gap: 0.75,
-                    px: 1.25,
-                    py: 0.75,
-                    borderRadius: 1.5,
+                    px: 1.1,
+                    py: 0.65,
+                    borderRadius: 2,
                     border: 1,
                     borderColor: 'divider',
                     bgcolor: 'action.hover',
-                    maxWidth: 200,
+                    maxWidth: 260,
                   }}
                 >
                   <InsertDriveFileOutlined
@@ -221,7 +299,12 @@ export function ChatInput({
                     <Typography
                       variant="caption"
                       noWrap
-                      sx={{ display: 'block', fontWeight: 500, lineHeight: 1.3 }}
+                      sx={{
+                        display: 'block',
+                        fontWeight: 600,
+                        lineHeight: 1.3,
+                        fontSize: '0.7rem',
+                      }}
                     >
                       {file.name}
                     </Typography>
@@ -232,23 +315,23 @@ export function ChatInput({
                       {formatFileSize(file.size)}
                     </Typography>
                   </Box>
-                  <IconButton
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      removeFile(idx);
-                    }}
-                    size="small"
-                    sx={{ p: 0.25, flexShrink: 0 }}
-                  >
-                    <CloseOutlined sx={{ fontSize: 14, color: 'text.secondary' }} />
-                  </IconButton>
-                </Box>
-              ),
-            )}
+                    <IconButton
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        removeFile(idx);
+                      }}
+                      size="small"
+                      sx={{ p: 0.25, flexShrink: 0, color: 'text.secondary' }}
+                    >
+                      <CloseOutlined sx={{ fontSize: 14 }} />
+                    </IconButton>
+                  </Box>
+              );
+            })}
           </Box>
         )}
 
-        {/* Textarea — borderless, inside the container */}
+        {/* Textarea */}
         <Box
           component="textarea"
           ref={textareaRef}
@@ -273,17 +356,17 @@ export function ChatInput({
             bgcolor: 'transparent',
             color: 'text.primary',
             fontFamily: 'inherit',
-            fontSize: '0.875rem',
+            fontSize: { xs: '0.92rem', sm: '0.95rem' },
             lineHeight: 1.5,
             px: 1.5,
-            pt: hasFiles ? 1 : 1.5,
-            pb: 0.5,
-            minHeight: 24,
-            maxHeight: 120,
+            pt: hasFiles ? 0.9 : 1.2,
+            pb: 0.7,
+            minHeight: 44,
+            maxHeight: 220,
             overflow: 'auto',
             '&::placeholder': {
               color: 'text.secondary',
-              opacity: 0.7,
+              opacity: 0.82,
             },
             '&:disabled': {
               color: 'text.disabled',
@@ -298,38 +381,47 @@ export function ChatInput({
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
-            px: 1,
-            pb: 1,
-            pt: 0.25,
+            px: 1.1,
+            pb: 1.05,
+            pt: 0.2,
           }}
         >
-          {/* Left: attachment button */}
-          <Tooltip title="Attach files" placement="top">
-            <span>
-              <IconButton
-                onClick={(e) => {
-                  e.stopPropagation();
-                  fileInputRef.current?.click();
-                }}
-                disabled={disabled || attachedFiles.length >= MAX_FILES}
-                size="small"
-                sx={{
-                  color: 'text.secondary',
-                  border: 1,
-                  borderColor: 'divider',
-                  borderRadius: '50%',
-                  width: 30,
-                  height: 30,
-                  '&:hover': {
-                    bgcolor: 'action.hover',
-                    borderColor: 'text.secondary',
-                  },
-                }}
-              >
-                <AddOutlined sx={{ fontSize: 18 }} />
-              </IconButton>
-            </span>
-          </Tooltip>
+          {/* Left: attachment action + count */}
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+            <Tooltip title="Attach files" placement="top">
+              <span>
+                <IconButton
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    fileInputRef.current?.click();
+                  }}
+                  disabled={disabled || attachedFiles.length >= MAX_FILES}
+                  size="small"
+                  sx={{
+                    color: 'text.secondary',
+                    borderRadius: 1.5,
+                    px: 0.8,
+                    '&:hover': {
+                      bgcolor: 'action.hover',
+                      color: 'text.primary',
+                    },
+                  }}
+                >
+                  <AttachFileRounded sx={{ fontSize: 18 }} />
+                </IconButton>
+              </span>
+            </Tooltip>
+            <Typography
+              variant="caption"
+              sx={{
+                color: 'text.secondary',
+                fontSize: '0.68rem',
+                letterSpacing: 0.1,
+              }}
+            >
+              {attachedFiles.length}/{MAX_FILES}
+            </Typography>
+          </Box>
 
           {/* Right: send or stop button */}
           {isStreaming ? (
@@ -343,8 +435,8 @@ export function ChatInput({
                 sx={{
                   bgcolor: 'text.primary',
                   color: 'background.default',
-                  width: 30,
-                  height: 30,
+                  width: 32,
+                  height: 32,
                   borderRadius: '50%',
                   '&:hover': { bgcolor: 'text.secondary' },
                 }}
@@ -365,8 +457,8 @@ export function ChatInput({
                   sx={{
                     bgcolor: canSend ? 'text.primary' : 'action.disabledBackground',
                     color: canSend ? 'background.default' : 'text.disabled',
-                    width: 30,
-                    height: 30,
+                    width: 32,
+                    height: 32,
                     borderRadius: '50%',
                     '&:hover': { bgcolor: canSend ? 'text.secondary' : undefined },
                     '&.Mui-disabled': {
@@ -383,18 +475,21 @@ export function ChatInput({
         </Box>
       </Box>
 
-      {/* Subtle helper text */}
+      {/* Helper text / warnings */}
       <Typography
         variant="caption"
         sx={{
+          maxWidth: 980,
+          mx: 'auto',
           display: 'block',
           textAlign: 'center',
           mt: 0.75,
-          color: 'text.disabled',
-          fontSize: '0.65rem',
+          color: fileWarning ? 'warning.main' : 'text.disabled',
+          fontSize: '0.66rem',
+          minHeight: 14,
         }}
       >
-        ekaiX can make mistakes. Verify important information.
+        {fileWarning || 'ekaiX can make mistakes. Verify important information.'}
       </Typography>
     </Box>
   );

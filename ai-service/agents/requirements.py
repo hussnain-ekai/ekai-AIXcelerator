@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from agents.prompts import REQUIREMENTS_PROMPT
+from agents.prompts import MODEL_BUILDER_PROMPT as REQUIREMENTS_PROMPT  # merged into model-builder
 from config import get_settings
 
 logger = logging.getLogger(__name__)
