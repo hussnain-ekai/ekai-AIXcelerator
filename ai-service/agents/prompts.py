@@ -32,6 +32,9 @@ Each rule is labeled DELEGATE, AUTO-CHAIN, or PAUSE:
 - AUTO-CHAIN = a subagent just finished AND you must IMMEDIATELY call task() again to chain to the next subagent. No text output. No waiting.
 - PAUSE = stop entirely. Produce no text and no tool calls. Wait for the user's next message.
 
+SUPERVISOR CONTRACT OVERRIDE:
+If [SUPERVISOR CONTEXT CONTRACT] includes forced_subagent=..., you MUST delegate to that subagent first.
+
 DISCOVERY PHASE:
 
 1. Discovery agent just spoke AND asked validation questions AND user answered -> DELEGATE to discovery-agent. Include: (a) the full [INTERNAL CONTEXT], (b) ALL previous Q&A rounds (discovery agent questions + user answers), (c) user's latest answers. Tell it: "ROUND N. Review Q&A history. Generate the Data Description if you have enough context, or ask targeted follow-ups."
@@ -92,7 +95,9 @@ PUBLISHING PHASE:
 
 22. Publishing agent presented summary AND user gave an EXPLICIT publish decision -> DELEGATE to publishing-agent. Include data_product_id, target_schema (EKAIX.{dp_name}_MARTS), and the user's exact response in description. Explicit decisions are: approve (yes/proceed/publish/go ahead) or decline (no/cancel/not yet). If the user reply is ambiguous, ask for a clear yes/no and do NOT delegate yet.
 
-23. Publishing completed (Cortex Agent was created) AND user requests changes to the model or requirements -> DELEGATE to model-builder. Tell it: "YAML REVISION MODE (POST-PUBLISH): Load the existing semantic model, apply changes, save. After validation, the model will be re-published. User request: [paste exact request]."
+23a. Publishing completed AND user requests changes to the published AI agent behavior/instructions/disclaimer (but does NOT request semantic model or requirements changes) -> DELEGATE to publishing-agent. Include data_product_id, target_schema (EKAIX.{dp_name}_MARTS), and the user's exact request. Tell it: "AGENT INSTRUCTIONS REVISION MODE (POST-PUBLISH): Keep the semantic model unchanged. Update the AI agent instructions/description from the user request and replace the existing agent configuration. User request: [paste exact request]."
+
+23. Publishing completed (Cortex Agent was created) AND user requests changes to the semantic model or business requirements -> DELEGATE to model-builder. Tell it: "YAML REVISION MODE (POST-PUBLISH): Load the existing semantic model, apply changes, save. After validation, the model will be re-published. User request: [paste exact request]."
 
 EXPLORER:
 
@@ -985,8 +990,24 @@ PUBLISHING_PROMPT: str = """You are the Publishing Agent for ekaiX AIXcelerator 
 FORMATTING — ABSOLUTE RULE:
 You are writing a CHAT MESSAGE. NEVER use markdown (no headers, bold, backticks, code blocks). Plain text only. Unicode bullets • are OK.
 
-WORKFLOW — STRICT TWO-MESSAGE LIMIT:
-You get EXACTLY TWO messages.
+WORKFLOW MODES:
+
+MODE A — AGENT INSTRUCTIONS REVISION MODE (POST-PUBLISH)
+Activated when the task description contains "AGENT INSTRUCTIONS REVISION MODE (POST-PUBLISH)".
+1. Call get_latest_semantic_view to load the current semantic model (do not modify it).
+2. Update ONLY the AI agent instructions/description using the user's exact request.
+3. Re-create the Cortex Agent with create_cortex_agent to apply the new instructions.
+4. Call grant_agent_access and log_agent_action.
+5. Confirm what behavior changed in 2-3 concise bullets.
+
+Rules for MODE A:
+- Do NOT regenerate or modify the semantic model.
+- Do NOT ask for publish approval again.
+- If task context includes an existing agent full name, reuse its agent name when calling create_cortex_agent.
+- Keep the mandatory data quality disclaimer in the final instructions.
+
+MODE B — STRICT TWO-MESSAGE PUBLISH FLOW
+If MODE A is not active, you get EXACTLY TWO messages.
 
 MESSAGE 1 (first time you speak): Present a publishing summary and ask for approval.
 1. Call get_latest_semantic_view to load the validated YAML
@@ -1079,8 +1100,15 @@ Before answering any data question (NOT model/BRD questions), check if a Cortex 
 2. Run execute_rcr_query with "SHOW AGENTS IN SCHEMA DATABASE.SCHEMA"
 3. If an agent is found, use query_cortex_agent with the agent's fully qualified name (DATABASE.SCHEMA.AGENT_NAME) to answer the question
 4. ONLY if no agent exists, fall back to direct SQL queries
+5. If query_cortex_agent fails with authentication/session/permission errors (token expired, 401, 403, authorization, insufficient privileges), DO NOT fall back to SQL. Tell the user the published agent could not be reached due access/session issues and ask them to retry. Keep the path on Cortex Agent.
+6. If query_cortex_agent fails because the agent does not exist (not found / 404), then fall back to direct SQL.
 If the task description explicitly mentions a Cortex Agent FQN, skip step 1-2 and go straight to query_cortex_agent.
 Present the agent's answer in plain business language. Never show SQL or tool names to the user.
+
+DIRECT SQL FALLBACK RULES:
+- Before writing SQL, call query_erd_graph to confirm actual table and column names.
+- Use only columns confirmed by metadata/tools. Do not guess column names.
+- If required fields are still unclear after metadata lookup, ask one focused clarification question.
 
 CONSTRAINTS:
 - All queries execute via Restricted Caller's Rights

@@ -297,6 +297,41 @@ async def _strip_unnecessary_casts(yaml_str: str, data_product_id: str) -> str:
     return result
 
 
+def _repair_yaml_description_scalars(yaml_text: str) -> tuple[str, bool]:
+    """Quote unquoted description values that contain `:` and break YAML parsing."""
+    repaired_lines: list[str] = []
+    changed = False
+
+    for line in yaml_text.splitlines():
+        stripped = line.lstrip()
+        indent = line[: len(line) - len(stripped)]
+
+        if not stripped.lower().startswith("description:"):
+            repaired_lines.append(line)
+            continue
+
+        _, raw_value = stripped.split(":", 1)
+        value = raw_value.strip()
+        if not value:
+            repaired_lines.append(line)
+            continue
+        if value.startswith(("'", '"', "|", ">", "{", "[")):
+            repaired_lines.append(line)
+            continue
+
+        # YAML plain scalars often fail when they contain `: `.
+        # Quote these values to keep save_semantic_view resilient.
+        if ": " in value:
+            escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+            repaired_lines.append(f'{indent}description: "{escaped}"')
+            changed = True
+            continue
+
+        repaired_lines.append(line)
+
+    return "\n".join(repaired_lines), changed
+
+
 @tool
 async def save_semantic_view(
     data_product_id: str,
@@ -394,49 +429,62 @@ async def save_semantic_view(
 
     # ── YAML structure validation before saving ──
     try:
-        parsed = _yaml.safe_load(content)
-        if not isinstance(parsed, dict):
-            return json.dumps({"status": "error", "error": "YAML content is not a valid mapping"})
-        if "name" not in parsed:
-            return json.dumps({"status": "error", "error": "YAML missing required 'name' field"})
-        if "tables" not in parsed or not parsed["tables"]:
-            return json.dumps({"status": "error", "error": "YAML missing required 'tables' list"})
-        for i, tbl in enumerate(parsed["tables"]):
-            if not tbl.get("base_table"):
-                return json.dumps({"status": "error", "error": f"Table #{i} missing 'base_table'"})
-            bt = tbl["base_table"]
-            for key in ("database", "schema", "table"):
-                if not bt.get(key):
-                    return json.dumps({"status": "error", "error": f"Table #{i} base_table missing '{key}'"})
-
-        # Data isolation guard: semantic model can only use selected source tables
-        # plus internal EKAIX-managed curated/marts objects.
-        try:
-            from tools.snowflake_tools import _allowed_tables
-
-            allowed_tables = {t.upper() for t in (_allowed_tables.get() or [])}
-            if allowed_tables:
-                for i, tbl in enumerate(parsed["tables"]):
-                    bt = tbl.get("base_table", {})
-                    db = str(bt.get("database", "")).strip('"').upper()
-                    schema = str(bt.get("schema", "")).strip('"').upper()
-                    table = str(bt.get("table", "")).strip('"').upper()
-                    base_fqn = f"{db}.{schema}.{table}"
-                    if db != "EKAIX" and base_fqn not in allowed_tables:
-                        return json.dumps({
-                            "status": "error",
-                            "error": (
-                                f"Table #{i} base_table '{base_fqn}' is outside the selected "
-                                "data product scope."
-                            ),
-                        })
-        except Exception as scope_err:
-            logger.warning("save_semantic_view: scope validation skipped due to internal error: %s", scope_err)
-
-        logger.info("save_semantic_view: YAML structure validation passed (%d tables)", len(parsed["tables"]))
+        parsed_obj = _yaml.safe_load(content)
     except _yaml.YAMLError as e:
-        logger.error("save_semantic_view: YAML parse error: %s", e)
-        return json.dumps({"status": "error", "error": f"Invalid YAML syntax: {e}"})
+        repaired_content, repaired = _repair_yaml_description_scalars(content)
+        if not repaired:
+            logger.error("save_semantic_view: YAML parse error: %s", e)
+            return json.dumps({"status": "error", "error": f"Invalid YAML syntax: {e}"})
+        try:
+            parsed_obj = _yaml.safe_load(repaired_content)
+            content = repaired_content
+            logger.info("save_semantic_view: auto-repaired YAML description quoting issue")
+        except _yaml.YAMLError as repaired_err:
+            logger.error(
+                "save_semantic_view: YAML parse error after auto-repair attempt: %s",
+                repaired_err,
+            )
+            return json.dumps({"status": "error", "error": f"Invalid YAML syntax: {repaired_err}"})
+
+    if not isinstance(parsed_obj, dict):
+        return json.dumps({"status": "error", "error": "YAML content is not a valid mapping"})
+    if "name" not in parsed_obj:
+        return json.dumps({"status": "error", "error": "YAML missing required 'name' field"})
+    if "tables" not in parsed_obj or not parsed_obj["tables"]:
+        return json.dumps({"status": "error", "error": "YAML missing required 'tables' list"})
+    for i, tbl in enumerate(parsed_obj["tables"]):
+        if not tbl.get("base_table"):
+            return json.dumps({"status": "error", "error": f"Table #{i} missing 'base_table'"})
+        bt = tbl["base_table"]
+        for key in ("database", "schema", "table"):
+            if not bt.get(key):
+                return json.dumps({"status": "error", "error": f"Table #{i} base_table missing '{key}'"})
+
+    # Data isolation guard: semantic model can only use selected source tables
+    # plus internal EKAIX-managed curated/marts objects.
+    try:
+        from tools.snowflake_tools import _allowed_tables
+
+        allowed_tables = {t.upper() for t in (_allowed_tables.get() or [])}
+        if allowed_tables:
+            for i, tbl in enumerate(parsed_obj["tables"]):
+                bt = tbl.get("base_table", {})
+                db = str(bt.get("database", "")).strip('"').upper()
+                schema = str(bt.get("schema", "")).strip('"').upper()
+                table = str(bt.get("table", "")).strip('"').upper()
+                base_fqn = f"{db}.{schema}.{table}"
+                if db != "EKAIX" and base_fqn not in allowed_tables:
+                    return json.dumps({
+                        "status": "error",
+                        "error": (
+                            f"Table #{i} base_table '{base_fqn}' is outside the selected "
+                            "data product scope."
+                        ),
+                    })
+    except Exception as scope_err:
+        logger.warning("save_semantic_view: scope validation skipped due to internal error: %s", scope_err)
+
+    logger.info("save_semantic_view: YAML structure validation passed (%d tables)", len(parsed_obj["tables"]))
 
     sv_id = str(uuid4())
 

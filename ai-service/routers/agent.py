@@ -202,14 +202,60 @@ _GENERIC_PROCEED_WORDS: set[str] = {
 }
 
 
+_AGENT_INSTRUCTION_PATTERNS: tuple[str, ...] = (
+    r"\b(update|change|modify|revise|rewrite|adjust|tune|improve)\b.*\b(agent|ai agent|cortex agent)\b.*\b(instruction|instructions|prompt|behavior|behaviour|tone|response|disclaimer|guardrail)\b",
+    r"\b(agent|ai agent|cortex agent)\b.*\b(instruction|instructions|prompt|behavior|behaviour|tone|response|disclaimer|guardrail)\b.*\b(update|change|modify|revise|rewrite|adjust|tune|improve)\b",
+    r"\b(update|change|modify|revise|rewrite|adjust|tune|improve)\b.*\b(instruction|instructions|prompt|behavior|behaviour|tone|response|disclaimer|guardrail)\b",
+    r"\bhow\s+(should|must)\s+(the\s+)?(agent|ai)\s+(respond|answer|behave)\b",
+)
+
+_MODEL_OR_REQUIREMENTS_CHANGE_PATTERNS: tuple[str, ...] = (
+    r"\b(brd|requirement|requirements)\b",
+    r"\bsemantic\s+model\b",
+    r"\byaml\b",
+    r"\b(metric|metrics)\b",
+    r"\b(dimension|dimensions)\b",
+    r"\b(relationship|relationships)\b",
+    r"\b(table|tables|column|columns|field|fields)\b",
+    r"\b(validation|validate)\b",
+)
+
+
+def _normalize_user_text(message: str) -> str:
+    return re.sub(r"\s+", " ", (message or "").strip().lower())
+
+
 def _is_requirements_transition_intent(message: str) -> bool:
     """Detect explicit user intent to move from discovery to requirements."""
-    text = re.sub(r"\s+", " ", (message or "").strip().lower())
+    text = _normalize_user_text(message)
     if not text:
         return False
     if text in _GENERIC_PROCEED_WORDS:
         return True
     return any(re.search(p, text) for p in _REQ_MOVE_PATTERNS)
+
+
+def _is_agent_instruction_update_intent(message: str) -> bool:
+    """Detect user intent to update the published AI agent behavior/instructions."""
+    text = _normalize_user_text(message)
+    if not text:
+        return False
+    return any(re.search(p, text) for p in _AGENT_INSTRUCTION_PATTERNS)
+
+
+def _is_model_or_requirements_change_intent(message: str) -> bool:
+    """Detect intent that should route to model/requirements updates, not agent instructions."""
+    text = _normalize_user_text(message)
+    if not text:
+        return False
+    return any(re.search(p, text) for p in _MODEL_OR_REQUIREMENTS_CHANGE_PATTERNS)
+
+
+def _is_post_publish_agent_instruction_only_intent(message: str) -> bool:
+    """True when user asks to update agent behavior without asking for model/BRD changes."""
+    if not _is_agent_instruction_update_intent(message):
+        return False
+    return not _is_model_or_requirements_change_intent(message)
 
 
 def _requirements_entry_ready(snapshot: dict[str, Any]) -> tuple[bool, str]:
@@ -230,11 +276,16 @@ def _requirements_entry_ready(snapshot: dict[str, Any]) -> tuple[bool, str]:
 def _evaluate_supervisor_transition(
     message: str,
     snapshot: dict[str, Any],
+    *,
+    already_published: bool = False,
 ) -> tuple[str | None, str | None]:
     """Deterministically evaluate supervisor-enforced phase transitions."""
     current_phase = (snapshot.get("current_phase") or "discovery").lower()
     if current_phase in {"idle", ""}:
         current_phase = "discovery"
+
+    if already_published and _is_post_publish_agent_instruction_only_intent(message):
+        return "publishing", "Post-publish agent instruction update requested."
 
     wants_requirements = _is_requirements_transition_intent(message)
     if current_phase in {"discovery", "prepare", "transformation"} and wants_requirements:
@@ -251,6 +302,11 @@ def _build_supervisor_contract(
     user_message: str,
     transition_target: str | None,
     transition_reason: str | None,
+    *,
+    data_product_id: str,
+    already_published: bool,
+    forced_subagent: str | None = None,
+    forced_intent: str | None = None,
 ) -> str:
     """Build a compact supervisor contract injected into orchestrator input."""
     current_phase = snapshot.get("current_phase") or "discovery"
@@ -260,12 +316,16 @@ def _build_supervisor_contract(
     lines = [
         "[SUPERVISOR CONTEXT CONTRACT — INTERNAL, NEVER SHOW TO USER]",
         f"current_phase={current_phase}",
+        f"data_product_id={data_product_id}",
+        f"already_published={already_published}",
         f"data_tier={data_tier}",
         f"data_description_exists={bool(snapshot.get('data_description_exists'))}",
         f"transformation_done={bool(snapshot.get('transformation_done'))}",
         f"brd_exists={bool(snapshot.get('brd_exists'))}",
         f"semantic_view_exists={bool(snapshot.get('semantic_view_exists'))}",
         f"validation_status={validation_status}",
+        "internal_ids_available=true",
+        "id_request_policy=never ask user for data_product_id/session_id/uuid; use context values silently",
         (
             "communication_policy=business labels first; reveal technical detail only if user explicitly asks"
         ),
@@ -278,6 +338,10 @@ def _build_supervisor_contract(
         lines.append(f"forced_transition={current_phase}->{transition_target}")
     if transition_reason:
         lines.append(f"transition_reason={transition_reason}")
+    if forced_subagent:
+        lines.append(f"forced_subagent={forced_subagent}")
+    if forced_intent:
+        lines.append(f"forced_intent={forced_intent}")
 
     lines.append("[END SUPERVISOR CONTEXT CONTRACT]")
     lines.append(f"[USER MESSAGE]\n{user_message}")
@@ -319,6 +383,8 @@ def _sanitize_assistant_text(text: str) -> str:
     cleaned_lines: list[str] = []
     for line in text.splitlines():
         if _is_internal_reasoning_leak(line):
+            continue
+        if re.search(r"\b(data[_ ]product[_ ]id|session[_ ]id|uuid)\b", line, flags=re.IGNORECASE):
             continue
         cleaned_lines.append(line)
     text = "\n".join(cleaned_lines)
@@ -1362,11 +1428,17 @@ async def _run_agent(
         _current_phase = str(workflow_snapshot.get("current_phase") or "idle")
         supervisor_forced_phase: str | None = None
         supervisor_transition_reason: str | None = None
+        publish_phase, already_published = await _get_publish_gate_context(data_product_id)
 
         # Check if this is a discovery trigger
         actual_message = message
         is_discovery = message.strip() in (DISCOVERY_TRIGGER, RERUN_DISCOVERY_TRIGGER)
         force_rerun = message.strip() == RERUN_DISCOVERY_TRIGGER
+        post_publish_agent_instruction_update_intent = (
+            not is_discovery
+            and already_published
+            and _is_post_publish_agent_instruction_only_intent(message)
+        )
         dp_info: dict | None = None  # Set inside discovery block, used for timeout check
         if is_discovery:
             _inside_task = True  # Discovery: orchestrator interprets summary directly
@@ -1505,6 +1577,7 @@ async def _run_agent(
             supervisor_forced_phase, supervisor_transition_reason = _evaluate_supervisor_transition(
                 message=message,
                 snapshot=workflow_snapshot,
+                already_published=already_published,
             )
             if supervisor_forced_phase and supervisor_forced_phase != _current_phase:
                 old_phase = _current_phase
@@ -1526,6 +1599,12 @@ async def _run_agent(
             elif supervisor_transition_reason and _is_requirements_transition_intent(message):
                 logger.info(
                     "Supervisor blocked requirements transition for session=%s reason=%s",
+                    session_id,
+                    supervisor_transition_reason,
+                )
+            elif supervisor_transition_reason and post_publish_agent_instruction_update_intent:
+                logger.info(
+                    "Supervisor routing hint (post-publish instruction update) for session=%s reason=%s",
                     session_id,
                     supervisor_transition_reason,
                 )
@@ -1560,7 +1639,6 @@ async def _run_agent(
 
         # Publish gate: deployment tools only run when user explicitly approved.
         # Approval is scoped to this invocation and reset every turn.
-        publish_phase, already_published = await _get_publish_gate_context(data_product_id)
         is_publish_phase = publish_phase == "publishing"
         publish_approved = (
             is_publish_phase
@@ -1576,14 +1654,19 @@ async def _run_agent(
             and _is_explicit_publish_approval(message, allow_bare_ack=False)
         ):
             publish_approved = True
+        # Post-publish instruction updates (agent behavior/prompt only) are
+        # explicit redeploy intents; allow publishing tools for this turn.
+        if not publish_approved and post_publish_agent_instruction_update_intent:
+            publish_approved = True
 
         set_publish_approval_context(publish_approved)
         logger.info(
-            "Publish approval gate for session %s: phase=%s published=%s approved=%s",
+            "Publish approval gate for session %s: phase=%s published=%s approved=%s instruction_update_intent=%s",
             session_id,
             publish_phase,
             already_published,
             publish_approved,
+            post_publish_agent_instruction_update_intent,
         )
 
         agent = await get_orchestrator()
@@ -1641,6 +1724,14 @@ async def _run_agent(
                 user_message=actual_message,
                 transition_target=supervisor_forced_phase,
                 transition_reason=supervisor_transition_reason,
+                data_product_id=data_product_id,
+                already_published=already_published,
+                forced_subagent="publishing-agent" if post_publish_agent_instruction_update_intent else None,
+                forced_intent=(
+                    "post_publish_agent_instruction_update"
+                    if post_publish_agent_instruction_update_intent
+                    else None
+                ),
             )
 
         content = _build_multimodal_content(actual_message, file_contents)

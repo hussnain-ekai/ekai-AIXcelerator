@@ -67,6 +67,9 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
 
       const handlers: SSEHandlers = {
         onToken: (text: string) => {
+          if (!storeApi.getState().isStreaming) {
+            setStreaming(true);
+          }
           const lastMessage = storeApi.getState().messages.at(-1);
           if (lastMessage?.role === 'assistant' && lastMessage.isStreaming) {
             updateLastAssistantMessage(lastMessage.content + text);
@@ -83,6 +86,9 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
         onReasoningUpdate: (message: string, source?: string) => {
           const trimmed = message.trim();
           if (!trimmed) return;
+          if (!storeApi.getState().isStreaming) {
+            setStreaming(true);
+          }
           setReasoningUpdate(trimmed, source === 'llm' ? 'llm' : 'fallback');
         },
         onMessageDone: (content?: string) => {
@@ -91,8 +97,12 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
             updateLastAssistantMessage(finalized);
           }
           finalizeLastMessage();
+          setStreaming(false);
         },
         onToolCall: (toolName: string) => {
+          if (!storeApi.getState().isStreaming) {
+            setStreaming(true);
+          }
           addToolCallToLastMessage({ name: toolName, input: {} });
         },
         onToolResult: (_toolName: string, _result: string) => {
@@ -159,6 +169,9 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
           }
         },
         onPipelineProgress: (data) => {
+          if (!storeApi.getState().isStreaming) {
+            setStreaming(true);
+          }
           const isComplete = data.step === 'artifacts' && data.status === 'completed';
 
           if (isComplete) {

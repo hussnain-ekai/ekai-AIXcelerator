@@ -797,7 +797,12 @@ def query_cortex_agent(agent_fqn: str, question: str) -> str:
         token = conn.rest.token
     except Exception as e:
         logger.error("query_cortex_agent: cannot get session token: %s", e)
-        return _tool_error("query_cortex_agent", f"Authentication failed: {e}")
+        return _tool_error(
+            "query_cortex_agent",
+            f"Authentication failed: {e}",
+            error_type="auth",
+            retryable=True,
+        )
 
     settings = get_settings()
     account = settings.snowflake_account
@@ -819,8 +824,46 @@ def query_cortex_agent(agent_fqn: str, question: str) -> str:
         resp = requests.post(url, headers=headers, json=body, stream=True, timeout=120)
 
         if resp.status_code != 200:
-            return _tool_error("query_cortex_agent",
-                               f"HTTP {resp.status_code}: {resp.text[:300]}")
+            status = resp.status_code
+            if status in (401, 403):
+                return _tool_error(
+                    "query_cortex_agent",
+                    f"HTTP {status}: Cortex Agent access/authentication failed.",
+                    error_type="auth",
+                    http_status=status,
+                    retryable=True,
+                )
+            if status == 404:
+                return _tool_error(
+                    "query_cortex_agent",
+                    "HTTP 404: Cortex Agent not found.",
+                    error_type="not_found",
+                    http_status=status,
+                    retryable=False,
+                )
+            if status == 429:
+                return _tool_error(
+                    "query_cortex_agent",
+                    "HTTP 429: Cortex Agent rate limit reached.",
+                    error_type="rate_limit",
+                    http_status=status,
+                    retryable=True,
+                )
+            if status >= 500:
+                return _tool_error(
+                    "query_cortex_agent",
+                    f"HTTP {status}: Cortex Agent service is temporarily unavailable.",
+                    error_type="transient",
+                    http_status=status,
+                    retryable=True,
+                )
+            return _tool_error(
+                "query_cortex_agent",
+                f"HTTP {status}: {resp.text[:300]}",
+                error_type="request",
+                http_status=status,
+                retryable=False,
+            )
 
         # Parse SSE events
         full_answer = ""
@@ -879,10 +922,29 @@ def query_cortex_agent(agent_fqn: str, question: str) -> str:
         return json.dumps(result)
 
     except requests.exceptions.Timeout:
-        return _tool_error("query_cortex_agent", "Request timed out (120s)")
+        return _tool_error(
+            "query_cortex_agent",
+            "Request timed out (120s)",
+            error_type="timeout",
+            retryable=True,
+        )
     except Exception as e:
         logger.error("query_cortex_agent failed: %s", e)
-        return _tool_error("query_cortex_agent", str(e))
+        msg = str(e)
+        lowered = msg.lower()
+        if any(token in lowered for token in ("auth", "token", "permission", "forbidden", "unauthorized")):
+            return _tool_error(
+                "query_cortex_agent",
+                msg,
+                error_type="auth",
+                retryable=True,
+            )
+        return _tool_error(
+            "query_cortex_agent",
+            msg,
+            error_type="unknown",
+            retryable=False,
+        )
 
 
 def _try_cortex_yaml_fix(yaml_content: str, error_msg: str, schema_name: str) -> str | None:
