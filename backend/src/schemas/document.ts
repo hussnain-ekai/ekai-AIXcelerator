@@ -94,6 +94,49 @@ export const applyContextSchema = z.object({
 });
 export type ApplyContextInput = z.infer<typeof applyContextSchema>;
 
+// --- Document semantic layer contracts ---
+
+export const semanticRegistryParamSchema = z.object({
+  dataProductId: z.string().uuid(),
+});
+export type SemanticRegistryParam = z.infer<typeof semanticRegistryParamSchema>;
+
+export const semanticRegistryQuerySchema = z.object({
+  include_deleted: z.coerce.boolean().optional().default(false),
+});
+export type SemanticRegistryQuery = z.infer<typeof semanticRegistryQuerySchema>;
+
+export const semanticFactsParamSchema = semanticRegistryParamSchema;
+export type SemanticFactsParam = z.infer<typeof semanticFactsParamSchema>;
+
+export const semanticFactsQuerySchema = z.object({
+  fact_type: z.string().trim().min(1).max(64).optional(),
+  document_id: z.string().uuid().optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional().default(100),
+  offset: z.coerce.number().int().min(0).optional().default(0),
+});
+export type SemanticFactsQuery = z.infer<typeof semanticFactsQuerySchema>;
+
+export const semanticChunksParamSchema = semanticRegistryParamSchema;
+export type SemanticChunksParam = z.infer<typeof semanticChunksParamSchema>;
+
+export const semanticChunksQuerySchema = z.object({
+  document_id: z.string().uuid().optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional().default(100),
+  offset: z.coerce.number().int().min(0).optional().default(0),
+});
+export type SemanticChunksQuery = z.infer<typeof semanticChunksQuerySchema>;
+
+export const semanticEvidenceParamSchema = semanticRegistryParamSchema;
+export type SemanticEvidenceParam = z.infer<typeof semanticEvidenceParamSchema>;
+
+export const semanticEvidenceQuerySchema = z.object({
+  query_id: z.string().trim().min(1).max(128).optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional().default(100),
+  offset: z.coerce.number().int().min(0).optional().default(0),
+});
+export type SemanticEvidenceQuery = z.infer<typeof semanticEvidenceQuerySchema>;
+
 // --- Allowed MIME types ---
 
 export const ALLOWED_MIME_TYPES = [

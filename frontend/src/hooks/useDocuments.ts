@@ -115,6 +115,119 @@ interface ReextractDocumentResponse {
   warnings?: string[];
 }
 
+interface SemanticRegistryRow {
+  registry_id: string | null;
+  document_id: string;
+  source_system: string;
+  source_uri: string | null;
+  title: string;
+  mime_type: string | null;
+  checksum_sha256: string | null;
+  version_id: number;
+  uploaded_by: string;
+  uploaded_at: string;
+  deleted_at: string | null;
+  extraction_status: string;
+  extraction_method: string | null;
+  parse_quality_score: number | null;
+  extraction_diagnostics: Record<string, unknown>;
+  metadata: Record<string, unknown>;
+  updated_at: string;
+  filename?: string;
+  source_channel?: string | null;
+  doc_kind?: string | null;
+  summary?: string | null;
+  context_version_id?: string | null;
+}
+
+interface SemanticRegistryResponse {
+  data_product_id: string;
+  data: SemanticRegistryRow[];
+  fallback?: boolean;
+  note?: string;
+}
+
+interface SemanticChunkRow {
+  id: string;
+  document_id: string;
+  chunk_seq: number;
+  section_path: string | null;
+  page_no: number | null;
+  chunk_text: string;
+  parser_version: string | null;
+  extraction_confidence: number | null;
+  created_at: string;
+  filename?: string | null;
+}
+
+interface SemanticChunksResponse {
+  data_product_id: string;
+  limit: number;
+  offset: number;
+  data: SemanticChunkRow[];
+  note?: string;
+}
+
+interface SemanticFactLink {
+  target_domain: string;
+  target_key: string;
+  link_reason: string | null;
+  link_confidence: number | null;
+}
+
+interface SemanticFactRow {
+  id: string;
+  document_id: string;
+  fact_type: string;
+  subject_key: string | null;
+  predicate: string | null;
+  object_value: string | null;
+  object_unit: string | null;
+  numeric_value: number | null;
+  event_time: string | null;
+  currency: string | null;
+  confidence: number | null;
+  source_page: number | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  filename?: string | null;
+  links: SemanticFactLink[];
+}
+
+interface SemanticFactsResponse {
+  data_product_id: string;
+  limit: number;
+  offset: number;
+  data: SemanticFactRow[];
+  note?: string;
+}
+
+interface SemanticEvidenceRow {
+  id: string;
+  query_id: string;
+  answer_id: string | null;
+  source_mode: string;
+  confidence: string;
+  exactness_state: string;
+  tool_calls: unknown[];
+  sql_refs: unknown[];
+  fact_refs: unknown[];
+  chunk_refs: unknown[];
+  conflicts: unknown[];
+  recovery_plan: Record<string, unknown>;
+  final_decision: string;
+  created_by: string;
+  created_at: string;
+}
+
+interface SemanticEvidenceResponse {
+  data_product_id: string;
+  limit: number;
+  offset: number;
+  data: SemanticEvidenceRow[];
+  note?: string;
+}
+
 function useDocuments(dataProductId: string | null) {
   return useQuery<DocumentsResponse>({
     queryKey: ['documents', dataProductId],
@@ -153,6 +266,97 @@ function useDocumentContext(
           ? `/documents/context/${dataProductId}/current?step=${step}`
           : `/documents/context/${dataProductId}/current`,
       ),
+    enabled: !!dataProductId,
+  });
+}
+
+function useSemanticRegistry(dataProductId: string | null, includeDeleted = false) {
+  return useQuery<SemanticRegistryResponse>({
+    queryKey: ['documents-semantic-registry', dataProductId, includeDeleted],
+    queryFn: () =>
+      api.get<SemanticRegistryResponse>(
+        `/documents/semantic/${dataProductId}/registry?include_deleted=${includeDeleted ? 'true' : 'false'}`,
+      ),
+    enabled: !!dataProductId,
+  });
+}
+
+function useSemanticChunks(
+  dataProductId: string | null,
+  options?: { documentId?: string; limit?: number; offset?: number },
+) {
+  return useQuery<SemanticChunksResponse>({
+    queryKey: [
+      'documents-semantic-chunks',
+      dataProductId,
+      options?.documentId ?? null,
+      options?.limit ?? 100,
+      options?.offset ?? 0,
+    ],
+    queryFn: () => {
+      const query = new URLSearchParams();
+      if (options?.documentId) query.set('document_id', options.documentId);
+      if (options?.limit !== undefined) query.set('limit', String(options.limit));
+      if (options?.offset !== undefined) query.set('offset', String(options.offset));
+      const qs = query.toString();
+      return api.get<SemanticChunksResponse>(
+        `/documents/semantic/${dataProductId}/chunks${qs ? `?${qs}` : ''}`,
+      );
+    },
+    enabled: !!dataProductId,
+  });
+}
+
+function useSemanticFacts(
+  dataProductId: string | null,
+  options?: { factType?: string; documentId?: string; limit?: number; offset?: number },
+) {
+  return useQuery<SemanticFactsResponse>({
+    queryKey: [
+      'documents-semantic-facts',
+      dataProductId,
+      options?.factType ?? null,
+      options?.documentId ?? null,
+      options?.limit ?? 100,
+      options?.offset ?? 0,
+    ],
+    queryFn: () => {
+      const query = new URLSearchParams();
+      if (options?.factType) query.set('fact_type', options.factType);
+      if (options?.documentId) query.set('document_id', options.documentId);
+      if (options?.limit !== undefined) query.set('limit', String(options.limit));
+      if (options?.offset !== undefined) query.set('offset', String(options.offset));
+      const qs = query.toString();
+      return api.get<SemanticFactsResponse>(
+        `/documents/semantic/${dataProductId}/facts${qs ? `?${qs}` : ''}`,
+      );
+    },
+    enabled: !!dataProductId,
+  });
+}
+
+function useSemanticEvidence(
+  dataProductId: string | null,
+  options?: { queryId?: string; limit?: number; offset?: number },
+) {
+  return useQuery<SemanticEvidenceResponse>({
+    queryKey: [
+      'documents-semantic-evidence',
+      dataProductId,
+      options?.queryId ?? null,
+      options?.limit ?? 100,
+      options?.offset ?? 0,
+    ],
+    queryFn: () => {
+      const query = new URLSearchParams();
+      if (options?.queryId) query.set('query_id', options.queryId);
+      if (options?.limit !== undefined) query.set('limit', String(options.limit));
+      if (options?.offset !== undefined) query.set('offset', String(options.offset));
+      const qs = query.toString();
+      return api.get<SemanticEvidenceResponse>(
+        `/documents/semantic/${dataProductId}/evidence${qs ? `?${qs}` : ''}`,
+      );
+    },
     enabled: !!dataProductId,
   });
 }
@@ -213,6 +417,10 @@ export {
   useApplyDocumentContext,
   useDeleteDocument,
   useReextractDocument,
+  useSemanticRegistry,
+  useSemanticChunks,
+  useSemanticFacts,
+  useSemanticEvidence,
 };
 export type {
   UploadedDocument,
@@ -224,4 +432,12 @@ export type {
   StepContextState,
   DocumentContextItem,
   ReextractDocumentResponse,
+  SemanticRegistryResponse,
+  SemanticRegistryRow,
+  SemanticChunksResponse,
+  SemanticChunkRow,
+  SemanticFactsResponse,
+  SemanticFactRow,
+  SemanticEvidenceResponse,
+  SemanticEvidenceRow,
 };

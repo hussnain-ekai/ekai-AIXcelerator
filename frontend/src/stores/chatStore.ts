@@ -1,4 +1,5 @@
 import { createStore } from 'zustand/vanilla';
+import type { AnswerContract, AnswerTrustState } from '@/lib/answerContract';
 
 type MessageRole = 'user' | 'assistant' | 'system';
 type AgentPhase = 'discovery' | 'prepare' | 'requirements' | 'modeling' | 'generation' | 'validation' | 'publishing' | 'explorer' | 'idle';
@@ -74,6 +75,10 @@ interface ChatState {
   reasoningUpdate: ReasoningUpdate | null;
   /** Rolling list of recent reasoning updates for live details panel. */
   reasoningLog: ReasoningUpdate[];
+  /** Latest normalized answer contract for trust/exactness UX rendering. */
+  latestAnswerContract: AnswerContract | null;
+  /** Fast access trust state for top-level UI status badges. */
+  answerTrustState: AnswerTrustState | null;
   addMessage: (message: ChatMessage) => void;
   updateLastAssistantMessage: (content: string) => void;
   finalizeLastMessage: () => void;
@@ -88,6 +93,8 @@ interface ChatState {
   setDataTier: (tier: DataTier) => void;
   setReasoningUpdate: (message: string | null, source?: 'llm' | 'fallback') => void;
   clearReasoningLog: () => void;
+  setAnswerContract: (contract: AnswerContract | null) => void;
+  clearAnswerContract: () => void;
   attachArtifactToLastAssistant: (artifactType: ArtifactType) => void;
   truncateAfter: (messageId: string) => void;
   editMessage: (messageId: string, newContent: string) => void;
@@ -110,6 +117,8 @@ const INITIAL_STATE = {
   dataTier: null as DataTier,
   reasoningUpdate: null as ReasoningUpdate | null,
   reasoningLog: [] as ReasoningUpdate[],
+  latestAnswerContract: null as AnswerContract | null,
+  answerTrustState: null as AnswerTrustState | null,
 };
 
 export type ChatStore = ReturnType<typeof createChatStore>;
@@ -249,6 +258,18 @@ export function createChatStore() {
         reasoningLog: [],
       }),
 
+    setAnswerContract: (contract: AnswerContract | null) =>
+      set({
+        latestAnswerContract: contract,
+        answerTrustState: contract?.trust_state ?? null,
+      }),
+
+    clearAnswerContract: () =>
+      set({
+        latestAnswerContract: null,
+        answerTrustState: null,
+      }),
+
     attachArtifactToLastAssistant: (artifactType: ArtifactType) =>
       set((state) => {
         const messages = [...state.messages];
@@ -295,6 +316,8 @@ export function createChatStore() {
         dataTier: null,
         reasoningUpdate: null,
         reasoningLog: [],
+        latestAnswerContract: null,
+        answerTrustState: null,
       }),
 
     reset: () => set(INITIAL_STATE),
@@ -310,6 +333,8 @@ export function createChatStore() {
         pipelineRunning: false,
         reasoningUpdate: null,
         reasoningLog: [],
+        latestAnswerContract: null,
+        answerTrustState: null,
         ...(dataTier !== undefined ? { dataTier } : {}),
       }),
 

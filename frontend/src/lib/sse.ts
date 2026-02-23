@@ -28,7 +28,7 @@ interface SSEHandlers {
   onApprovalRequest: (action: string, description: string, options: string[]) => void;
   onPipelineProgress: (data: PipelineProgressData) => void;
   onDataMaturity?: (tier: string) => void;
-  onStatus?: (message: string) => void;
+  onStatus?: (message: string, data?: Record<string, unknown>) => void;
   onError: (error: string, message: string) => void;
   onDone: () => void;
 }
@@ -109,7 +109,7 @@ function dispatchEvent(event: SSEEvent, handlers: SSEHandlers): void {
       handlers.onDataMaturity?.((event.data.tier as string) ?? 'gold');
       break;
     case 'status':
-      handlers.onStatus?.((event.data.message as string) ?? '');
+      handlers.onStatus?.((event.data.message as string) ?? '', event.data);
       break;
     case 'error':
       handlers.onError(

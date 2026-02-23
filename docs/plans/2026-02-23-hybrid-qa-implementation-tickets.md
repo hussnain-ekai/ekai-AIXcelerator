@@ -182,7 +182,7 @@ Use 5 execution tracks in parallel where possible:
 
 ### HYB-QA-001 (M1)
 - Scope: test matrix authoring.
-- Deliverables: scenario matrix for structured, unstructured, hybrid, conflict, permissions, and failure recovery paths.
+- Deliverables: scenario matrix for structured, unstructured, hybrid, conflict, permissions, and failure recovery paths (`docs/plans/2026-02-23-hybrid-qa-test-matrix.md`).
 - Acceptance Criteria: matrix approved and mapped to automated/manual suites.
 - Dependencies: none.
 

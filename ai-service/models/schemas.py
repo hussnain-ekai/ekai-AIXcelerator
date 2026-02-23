@@ -38,6 +38,63 @@ class AgentMessage(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Hybrid answer contract
+# ---------------------------------------------------------------------------
+
+
+SourceMode = Literal["structured", "document", "hybrid", "unknown"]
+ExactnessState = Literal[
+    "validated_exact",
+    "estimated",
+    "insufficient_evidence",
+    "not_applicable",
+]
+ConfidenceDecision = Literal["high", "medium", "abstain"]
+AnswerTrustState = Literal[
+    "answer_ready",
+    "answer_with_warnings",
+    "abstained_missing_evidence",
+    "abstained_conflicting_evidence",
+    "blocked_access",
+    "failed_recoverable",
+    "failed_admin",
+]
+
+
+class CitationReference(BaseModel):
+    """Evidence citation for an answer claim."""
+
+    citation_type: Literal["sql", "document_chunk", "document_fact"]
+    reference_id: str
+    label: str | None = None
+    page: int | None = None
+    score: float | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class RecoveryAction(BaseModel):
+    """Single concrete recovery action for abstained/blocked responses."""
+
+    action: str
+    description: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class HybridAnswerContract(BaseModel):
+    """Normalized response contract shared across structured/document/hybrid answers."""
+
+    source_mode: SourceMode = "unknown"
+    exactness_state: ExactnessState = "not_applicable"
+    confidence_decision: ConfidenceDecision = "medium"
+    trust_state: AnswerTrustState = "answer_ready"
+    evidence_summary: str | None = None
+    conflict_notes: list[str] = Field(default_factory=list)
+    citations: list[CitationReference] = Field(default_factory=list)
+    recovery_actions: list[RecoveryAction] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
 # SSE streaming
 # ---------------------------------------------------------------------------
 

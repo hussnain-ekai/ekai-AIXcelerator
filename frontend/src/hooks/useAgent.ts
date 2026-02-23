@@ -5,6 +5,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { connectSSE } from '@/lib/sse';
 import type { SSEHandlers } from '@/lib/sse';
 import { api } from '@/lib/api';
+import { normalizeAnswerContract } from '@/lib/answerContract';
 import { useChatStore, useChatStoreApi } from '@/stores/chatStoreProvider';
 import type { AgentPhase, ArtifactType, ChatMessageAttachment, DataTier } from '@/stores/chatStore';
 
@@ -85,6 +86,8 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
   const setDataTier = useChatStore((s) => s.setDataTier);
   const setReasoningUpdate = useChatStore((s) => s.setReasoningUpdate);
   const clearReasoningLog = useChatStore((s) => s.clearReasoningLog);
+  const setAnswerContract = useChatStore((s) => s.setAnswerContract);
+  const clearAnswerContract = useChatStore((s) => s.clearAnswerContract);
   const sessionId = useChatStore((s) => s.sessionId);
 
   const persistAttachmentsInDocumentLibrary = useCallback(
@@ -228,7 +231,18 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
         onDataMaturity: (tier: string) => {
           setDataTier(tier as DataTier);
         },
-        onStatus: (message: string) => {
+        onStatus: (message: string, data?: Record<string, unknown>) => {
+          const rawContract =
+            data?.answer_contract ??
+            data?.contract ??
+            (typeof data?.source_mode === 'string' ? data : null);
+          if (rawContract) {
+            const normalized = normalizeAnswerContract(rawContract);
+            if (normalized) {
+              setAnswerContract(normalized);
+            }
+          }
+
           if (message) {
             addMessage({
               id: crypto.randomUUID(),
@@ -296,6 +310,23 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
         },
         onError: (_code: string, message: string) => {
           const reason = message.trim().length > 0 ? message : 'Request failed. Please try again.';
+          setAnswerContract({
+            source_mode: 'unknown',
+            exactness_state: 'not_applicable',
+            confidence_decision: 'abstain',
+            trust_state: 'failed_recoverable',
+            evidence_summary: null,
+            conflict_notes: [],
+            citations: [],
+            recovery_actions: [
+              {
+                action: 'retry_last_step',
+                description: 'Retry the last step or review context evidence before rerun.',
+                metadata: {},
+              },
+            ],
+            metadata: { reason },
+          });
           setStreaming(false);
           setIsConnected(false);
           setPipelineProgress(null);
@@ -339,7 +370,7 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
       setPipelineRunning,
       setDataTier,
       setReasoningUpdate,
-      clearReasoningLog,
+      setAnswerContract,
     ],
   );
 
@@ -347,6 +378,7 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
     async (content: string, files?: File[]) => {
       dispatchInFlightRef.current = true;
       clearReasoningLog();
+      clearAnswerContract();
       setStreaming(true);
 
       // Use existing session ID from store (may have been recovered from history)
@@ -408,6 +440,7 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
       dataProductId,
       storeApi,
       clearReasoningLog,
+      clearAnswerContract,
       setStreaming,
       setSessionId,
       addMessage,
@@ -491,6 +524,7 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
       if (!sid) return;
 
       clearReasoningLog();
+      clearAnswerContract();
       setStreaming(true);
 
       try {
@@ -521,7 +555,15 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
         });
       }
     },
-    [dataProductId, storeApi, addMessage, setStreaming, connectToStream, clearReasoningLog],
+    [
+      dataProductId,
+      storeApi,
+      addMessage,
+      setStreaming,
+      connectToStream,
+      clearReasoningLog,
+      clearAnswerContract,
+    ],
   );
 
   const interrupt = useCallback(async () => {
