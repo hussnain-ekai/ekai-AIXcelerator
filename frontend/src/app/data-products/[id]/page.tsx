@@ -7,6 +7,7 @@ import {
   Box,
   Breadcrumbs,
   Button,
+  Chip,
   Dialog,
   DialogActions,
   DialogContent,
@@ -55,6 +56,7 @@ import {
   useDocumentContext,
   useDocuments,
   useReextractDocument,
+  useSemanticRegistry,
   useUploadDocument,
   type ContextSelectionState,
   type MissionStep,
@@ -107,6 +109,28 @@ function missionStepLabel(step: MissionStep): string {
   return `${step.charAt(0).toUpperCase()}${step.slice(1)}`;
 }
 
+function trustStateLabel(state: string | null): string | null {
+  if (!state) return null;
+  switch (state) {
+    case 'answer_ready':
+      return 'Answer ready';
+    case 'answer_with_warnings':
+      return 'Answer with warnings';
+    case 'abstained_missing_evidence':
+      return 'Abstained: missing evidence';
+    case 'abstained_conflicting_evidence':
+      return 'Abstained: conflicting evidence';
+    case 'blocked_access':
+      return 'Blocked by access';
+    case 'failed_recoverable':
+      return 'Recoverable failure';
+    case 'failed_admin':
+      return 'Needs admin action';
+    default:
+      return state;
+  }
+}
+
 /**
  * Outer wrapper: mounts a fresh ChatStoreProvider per data product.
  * When React unmounts this (navigating away), the store is destroyed.
@@ -141,6 +165,7 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
   const messages = useChatStore((state) => state.messages);
   const isStreaming = useChatStore((state) => state.isStreaming);
   const currentPhase = useChatStore((state) => state.currentPhase);
+  const answerTrustState = useChatStore((state) => state.answerTrustState);
   const clearMessages = useChatStore((state) => state.clearMessages);
   const setHydrated = useChatStore((state) => state.setHydrated);
   const artifacts = useChatStore((state) => state.artifacts);
@@ -157,6 +182,7 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
   // Load persisted artifacts from PostgreSQL on mount
   const { data: persistedArtifacts } = useArtifacts(id);
   const { data: documentsResponse } = useDocuments(id);
+  const { data: semanticRegistryResponse } = useSemanticRegistry(id);
   const uploadDocument = useUploadDocument(id);
   const currentMissionStep = phaseToMissionStep(currentPhase);
   const { data: documentContextResponse } = useDocumentContext(id, currentMissionStep);
@@ -412,6 +438,7 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
   const tableCount = dataProduct?.tables?.length ?? 0;
   const documentCount = documentsResponse?.data.length ?? 0;
   const artifactCount = artifacts.length;
+  const trustLabel = trustStateLabel(answerTrustState);
 
   const handleUploadDocuments = useCallback(
     (files: File[]) => {
@@ -485,6 +512,31 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
 
     return lookup;
   }, [documentContextResponse, currentMissionStep]);
+
+  const registryByDocumentId = useMemo(() => {
+    const lookup: Record<
+      string,
+      {
+        versionId: number;
+        parseQualityScore: number | null;
+        extractionMethod: string | null;
+        updatedAt: string;
+        diagnostics: Record<string, unknown>;
+      }
+    > = {};
+
+    for (const row of semanticRegistryResponse?.data ?? []) {
+      lookup[row.document_id] = {
+        versionId: row.version_id,
+        parseQualityScore: row.parse_quality_score,
+        extractionMethod: row.extraction_method,
+        updatedAt: row.updated_at,
+        diagnostics: row.extraction_diagnostics ?? {},
+      };
+    }
+
+    return lookup;
+  }, [semanticRegistryResponse]);
 
   const handleSetDocumentState = useCallback(
     (documentId: string, state: ContextSelectionState) => {
@@ -645,6 +697,21 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
               {dataProduct.description}
             </Typography>
           )}
+          {trustLabel && (
+            <Chip
+              size="small"
+              label={trustLabel}
+              sx={{
+                ml: 1,
+                borderColor: answerTrustState?.startsWith('failed') || answerTrustState?.startsWith('abstained')
+                  ? 'warning.main'
+                  : 'success.main',
+                borderWidth: 1,
+                borderStyle: 'solid',
+                bgcolor: 'background.paper',
+              }}
+            />
+          )}
         </Box>
         <Box sx={{ display: 'flex', gap: 1 }}>
           <Button
@@ -743,6 +810,7 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
         uploadNoticeSeverity={documentsUploadNoticeSeverity}
         currentStep={missionStepLabel(currentMissionStep)}
         contextByDocumentId={contextByDocumentId}
+        registryByDocumentId={registryByDocumentId}
         onSetDocumentState={handleSetDocumentState}
         onDeleteDocument={handleDeleteDocument}
         onReextractDocument={handleReextractDocument}

@@ -144,6 +144,32 @@ function splitIntoChunks(text: string, chunkSize = 1800): string[] {
   return chunks;
 }
 
+function extractMonetaryFacts(text: string | null): Array<{ value: number; currency: string | null }> {
+  if (!text) return [];
+  const facts: Array<{ value: number; currency: string | null }> = [];
+  const seen = new Set<string>();
+  const regex = /\b([$€£])?\s*(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)\b/g;
+
+  for (const match of text.matchAll(regex)) {
+    const symbol = match[1] ?? null;
+    const raw = match[2] ?? '';
+    const normalized = raw.replace(/,/g, '');
+    const value = Number(normalized);
+    if (!Number.isFinite(value)) continue;
+    if (value < 0) continue;
+    const key = `${symbol ?? ''}:${value}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    facts.push({
+      value,
+      currency: symbol === '$' ? 'USD' : symbol === '€' ? 'EUR' : symbol === '£' ? 'GBP' : null,
+    });
+    if (facts.length >= 30) break;
+  }
+
+  return facts;
+}
+
 function readFieldValue(field: unknown): string | undefined {
   if (!field || typeof field !== 'object') return undefined;
   const value = (field as { value?: unknown }).value;
@@ -582,6 +608,125 @@ export async function documentRoutes(app: FastifyInstance): Promise<void> {
     }
   }
 
+  async function refreshDocumentEntitiesAndFacts(
+    dataProductId: string,
+    documentId: string,
+    extraction: DocumentExtractionResult,
+    evidenceSummary: EvidenceSummary,
+    snowflakeUser: string,
+  ): Promise<{ entities: number; facts: number }> {
+    try {
+      await postgresService.query(
+        `DELETE FROM doc_entities
+         WHERE data_product_id = $1::uuid
+           AND document_id = $2::uuid`,
+        [dataProductId, documentId],
+        snowflakeUser,
+      );
+      await postgresService.query(
+        `DELETE FROM doc_facts
+         WHERE data_product_id = $1::uuid
+           AND document_id = $2::uuid`,
+        [dataProductId, documentId],
+        snowflakeUser,
+      );
+
+      if (extraction.extractionStatus !== 'completed') {
+        return { entities: 0, facts: 0 };
+      }
+
+      const confidence = Math.max(0, Math.min(1, deriveParseQualityScore(extraction) / 100));
+      const metadataJson = JSON.stringify({
+        extraction_method: extraction.extractionMethod,
+        extraction_warnings: extraction.extractionWarnings,
+      });
+
+      let entityCount = 0;
+      let factCount = 0;
+
+      const addEntity = async (entityType: string, canonicalValue: string): Promise<void> => {
+        await postgresService.query(
+          `INSERT INTO doc_entities
+             (id, data_product_id, document_id, entity_type, canonical_value, raw_value, confidence, metadata)
+           VALUES
+             ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8::jsonb)`,
+          [
+            crypto.randomUUID(),
+            dataProductId,
+            documentId,
+            entityType,
+            canonicalValue,
+            canonicalValue,
+            confidence,
+            metadataJson,
+          ],
+          snowflakeUser,
+        );
+        entityCount += 1;
+      };
+
+      for (const tableName of evidenceSummary.table_names.slice(0, 30)) {
+        await addEntity('table_reference', tableName);
+      }
+      for (const relationshipHint of evidenceSummary.relationship_hints.slice(0, 30)) {
+        await addEntity('relationship_reference', relationshipHint);
+      }
+      for (const metricHint of evidenceSummary.metric_hints.slice(0, 30)) {
+        await addEntity('metric_hint', metricHint);
+      }
+
+      for (const metricHint of evidenceSummary.metric_hints.slice(0, 30)) {
+        await postgresService.query(
+          `INSERT INTO doc_facts
+             (id, data_product_id, document_id, fact_type, subject_key, predicate,
+              object_value, confidence, metadata)
+           VALUES
+             ($1::uuid, $2::uuid, $3::uuid, 'metric_hint', $4, 'describes_metric', $5, $6, $7::jsonb)`,
+          [
+            crypto.randomUUID(),
+            dataProductId,
+            documentId,
+            metricHint.slice(0, 120),
+            metricHint,
+            confidence,
+            metadataJson,
+          ],
+          snowflakeUser,
+        );
+        factCount += 1;
+      }
+
+      const monetaryFacts = extractMonetaryFacts(extraction.extractedText);
+      for (const fact of monetaryFacts) {
+        await postgresService.query(
+          `INSERT INTO doc_facts
+             (id, data_product_id, document_id, fact_type, subject_key, predicate, object_value,
+              numeric_value, currency, confidence, metadata)
+           VALUES
+             ($1::uuid, $2::uuid, $3::uuid, 'monetary_amount', 'document_amount', 'reported_amount',
+              $4, $5, $6, $7, $8::jsonb)`,
+          [
+            crypto.randomUUID(),
+            dataProductId,
+            documentId,
+            String(fact.value),
+            fact.value,
+            fact.currency,
+            confidence,
+            metadataJson,
+          ],
+          snowflakeUser,
+        );
+        factCount += 1;
+      }
+
+      return { entities: entityCount, facts: factCount };
+    } catch (err) {
+      if (isRecoverableContextSchemaError(err)) return { entities: 0, facts: 0 };
+      throw err;
+    }
+  }
+
   async function markRegistryDeleted(
     dataProductId: string,
     documentId: string,
@@ -797,6 +942,14 @@ export async function documentRoutes(app: FastifyInstance): Promise<void> {
       );
     }
 
+    await refreshDocumentEntitiesAndFacts(
+      dataProductId,
+      documentId,
+      extraction,
+      evidenceSummary,
+      snowflakeUser,
+    );
+
     let evidenceId: string | null = null;
 
     try {
@@ -1008,6 +1161,14 @@ export async function documentRoutes(app: FastifyInstance): Promise<void> {
             snowflakeUser,
           );
         }
+
+        await refreshDocumentEntitiesAndFacts(
+          doc.data_product_id,
+          doc.id,
+          extraction,
+          evidenceSummary,
+          snowflakeUser,
+        );
 
         try {
           await postgresService.query(
@@ -1702,8 +1863,9 @@ export async function documentRoutes(app: FastifyInstance): Promise<void> {
              c.created_at,
              ud.filename
            FROM doc_chunks c
-           LEFT JOIN uploaded_documents ud
+           JOIN uploaded_documents ud
              ON ud.id = c.document_id
+            AND ud.is_deleted = false
            WHERE ${where.join(' AND ')}
            ORDER BY c.document_id, c.chunk_seq
            LIMIT $${limitPos}
@@ -1816,8 +1978,9 @@ export async function documentRoutes(app: FastifyInstance): Promise<void> {
            FROM doc_facts f
            LEFT JOIN doc_fact_links l
              ON l.fact_id = f.id
-           LEFT JOIN uploaded_documents ud
+           JOIN uploaded_documents ud
              ON ud.id = f.document_id
+            AND ud.is_deleted = false
            WHERE ${where.join(' AND ')}
            GROUP BY f.id, ud.filename
            ORDER BY f.created_at DESC

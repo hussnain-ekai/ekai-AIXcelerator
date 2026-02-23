@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  Alert,
   Box,
   Chip,
   Collapse,
@@ -27,6 +28,7 @@ import type {
   PipelineProgress,
   ReasoningUpdate,
 } from '@/stores/chatStore';
+import type { AnswerContract } from '@/lib/answerContract';
 import { useChatStore } from '@/stores/chatStoreProvider';
 import { ArtifactCard } from './ArtifactCard';
 
@@ -39,6 +41,30 @@ interface MessageThreadProps {
 }
 
 const GOLD = '#D4A843';
+
+const TRUST_LABELS: Record<string, string> = {
+  answer_ready: 'Answer ready',
+  answer_with_warnings: 'Answer with warnings',
+  abstained_missing_evidence: 'Abstained: missing evidence',
+  abstained_conflicting_evidence: 'Abstained: conflicting evidence',
+  blocked_access: 'Blocked by access policy',
+  failed_recoverable: 'Failed, recoverable',
+  failed_admin: 'Failed, needs admin',
+};
+
+const EXACTNESS_LABELS: Record<string, string> = {
+  validated_exact: 'Validated exact value',
+  estimated: 'Estimated value',
+  insufficient_evidence: 'Insufficient evidence',
+  not_applicable: 'Not an exact-value question',
+};
+
+const SOURCE_LABELS: Record<string, string> = {
+  structured: 'Structured',
+  document: 'Document',
+  hybrid: 'Hybrid',
+  unknown: 'Unknown source',
+};
 
 /* ------------------------------------------------------------------ */
 /*  Message content filters                                            */
@@ -590,6 +616,106 @@ function SystemMessage({ message }: { message: ChatMessage }): React.ReactNode {
   );
 }
 
+function AnswerTrustCard({
+  contract,
+  isStreaming,
+}: {
+  contract: AnswerContract | null;
+  isStreaming: boolean;
+}): React.ReactNode {
+  if (!contract) return null;
+
+  const trustLabel = TRUST_LABELS[contract.trust_state] ?? 'Answer status';
+  const sourceLabel = SOURCE_LABELS[contract.source_mode] ?? 'Unknown source';
+  const exactnessLabel = EXACTNESS_LABELS[contract.exactness_state] ?? 'Not specified';
+  const confidenceLabel = contract.confidence_decision === 'abstain'
+    ? 'Abstain'
+    : contract.confidence_decision === 'high'
+      ? 'High confidence'
+      : 'Medium confidence';
+
+  const isNegativeState =
+    contract.trust_state.startsWith('abstained') ||
+    contract.trust_state.startsWith('failed') ||
+    contract.trust_state === 'blocked_access';
+
+  const trustColor = isNegativeState ? 'warning.main' : 'success.main';
+  const citationCount = contract.citations.length;
+
+  return (
+    <Box sx={{ display: 'flex', alignItems: 'flex-start', maxWidth: '75%' }}>
+      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, width: '100%', maxWidth: 620 }}>
+        <Typography variant="caption" sx={{ fontWeight: 700, color: GOLD }}>
+          ekaiX
+        </Typography>
+        <Paper
+          elevation={0}
+          sx={{
+            p: 1.5,
+            bgcolor: 'background.paper',
+            borderRadius: 2,
+            border: 1,
+            borderColor: trustColor,
+          }}
+        >
+          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.75, mb: 1 }}>
+            <Chip size="small" label={trustLabel} sx={{ borderColor: trustColor, borderWidth: 1, borderStyle: 'solid' }} />
+            <Chip size="small" variant="outlined" label={sourceLabel} />
+            <Chip size="small" variant="outlined" label={exactnessLabel} />
+            <Chip size="small" variant="outlined" label={confidenceLabel} />
+          </Box>
+
+          {contract.evidence_summary && (
+            <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block' }}>
+              Evidence summary: {contract.evidence_summary}
+            </Typography>
+          )}
+
+          <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block', mt: 0.5 }}>
+            Citations available: {citationCount}
+            {isStreaming ? ' • updating while agent runs' : ''}
+          </Typography>
+
+          {contract.citations.length > 0 && (
+            <Box sx={{ mt: 1 }}>
+              {contract.citations.slice(0, 4).map((citation) => (
+                <Typography
+                  key={`${citation.citation_type}-${citation.reference_id}`}
+                  variant="caption"
+                  sx={{ display: 'block', color: 'text.secondary' }}
+                >
+                  • {citation.label ?? citation.reference_id} ({citation.citation_type})
+                </Typography>
+              ))}
+            </Box>
+          )}
+
+          {contract.conflict_notes.length > 0 && (
+            <Alert severity="warning" sx={{ mt: 1, py: 0.25 }}>
+              <Typography variant="caption">
+                {contract.conflict_notes.join(' | ')}
+              </Typography>
+            </Alert>
+          )}
+
+          {contract.recovery_actions.length > 0 && (
+            <Box sx={{ mt: 1 }}>
+              <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block', mb: 0.5 }}>
+                Recovery actions:
+              </Typography>
+              {contract.recovery_actions.slice(0, 3).map((action, idx) => (
+                <Typography key={`${action.action}-${idx}`} variant="caption" sx={{ display: 'block', color: 'text.secondary' }}>
+                  {idx + 1}. {action.description}
+                </Typography>
+              ))}
+            </Box>
+          )}
+        </Paper>
+      </Box>
+    </Box>
+  );
+}
+
 function LiveAgentStatus({
   messages,
   isStreaming,
@@ -853,6 +979,7 @@ export function MessageThread({
   const currentPhase = useChatStore((state) => state.currentPhase);
   const reasoningUpdate = useChatStore((state) => state.reasoningUpdate);
   const reasoningLog = useChatStore((state) => state.reasoningLog);
+  const latestAnswerContract = useChatStore((state) => state.latestAnswerContract);
   const visibleMessages = messages.filter((m) => !isHiddenMessage(m));
 
   useEffect(() => {
@@ -910,6 +1037,8 @@ export function MessageThread({
         reasoningUpdate={reasoningUpdate}
         reasoningLog={reasoningLog}
       />
+
+      <AnswerTrustCard contract={latestAnswerContract} isStreaming={isStreaming} />
 
       <div ref={bottomRef} />
     </Box>

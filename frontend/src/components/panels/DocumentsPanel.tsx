@@ -24,6 +24,14 @@ interface DocumentContextLookup {
   state: ContextSelectionState;
 }
 
+interface DocumentRegistryLookup {
+  versionId: number;
+  parseQualityScore: number | null;
+  extractionMethod: string | null;
+  updatedAt: string;
+  diagnostics: Record<string, unknown>;
+}
+
 interface DocumentsPanelProps {
   open: boolean;
   onClose: () => void;
@@ -34,6 +42,7 @@ interface DocumentsPanelProps {
   uploadNoticeSeverity?: 'info' | 'error';
   currentStep?: string;
   contextByDocumentId?: Record<string, DocumentContextLookup>;
+  registryByDocumentId?: Record<string, DocumentRegistryLookup>;
   onSetDocumentState?: (documentId: string, state: ContextSelectionState) => void;
   onDeleteDocument?: (document: UploadedDocument) => void;
   onReextractDocument?: (document: UploadedDocument) => void;
@@ -94,6 +103,7 @@ export function DocumentsPanel({
   uploadNoticeSeverity = 'info',
   currentStep,
   contextByDocumentId = {},
+  registryByDocumentId = {},
   onSetDocumentState,
   onDeleteDocument,
   onReextractDocument,
@@ -193,6 +203,7 @@ export function DocumentsPanel({
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
               {documents.map((doc) => {
                 const contextState = contextByDocumentId[doc.id]?.state;
+                const registry = registryByDocumentId[doc.id];
                 const extractionStatus = (doc.extraction_status || '').toLowerCase();
                 const canRetryExtraction =
                   extractionStatus === 'pending' || extractionStatus === 'failed';
@@ -266,6 +277,33 @@ export function DocumentsPanel({
                             label={`Step: ${humanizeContextState(contextState)}`}
                             color={contextStateColor(contextState)}
                             variant="outlined"
+                          />
+                        )}
+
+                        {registry && (
+                          <Chip
+                            size="small"
+                            label={`v${registry.versionId}`}
+                            variant="outlined"
+                            color="default"
+                          />
+                        )}
+
+                        {registry && registry.parseQualityScore !== null && (
+                          <Chip
+                            size="small"
+                            label={`Quality ${Math.round(registry.parseQualityScore)}%`}
+                            variant="outlined"
+                            color={registry.parseQualityScore >= 80 ? 'success' : registry.parseQualityScore >= 60 ? 'warning' : 'error'}
+                          />
+                        )}
+
+                        {registry?.extractionMethod && (
+                          <Chip
+                            size="small"
+                            label={registry.extractionMethod}
+                            variant="outlined"
+                            color="info"
                           />
                         )}
 

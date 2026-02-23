@@ -20,8 +20,11 @@ from config import get_settings
 from models.schemas import (
     AgentStreamEvent,
     ApproveRequest,
+    CitationReference,
+    HybridAnswerContract,
     InvokeRequest,
     InvokeResponse,
+    RecoveryAction,
     RetryRequest,
 )
 from services.supervisor_guardrails import (
@@ -74,6 +77,126 @@ def _compose_failure_recovery_plan(
         reason=safe_reason,
         last_tool=last_tool,
     )
+
+
+def _infer_source_mode_from_text(text: str, phase: str) -> str:
+    """Best-effort source lane inference for the answer contract."""
+    lower = text.lower()
+    has_document_signals = any(
+        token in lower for token in ("document", "invoice", "pdf", "policy", "citation", "page ")
+    )
+    has_structured_signals = any(
+        token in lower
+        for token in ("table", "column", "metric", "kpi", "sql", "semantic view", "warehouse")
+    )
+
+    if has_document_signals and has_structured_signals:
+        return "hybrid"
+    if has_document_signals:
+        return "document"
+    if has_structured_signals:
+        return "structured"
+
+    # Default by mission phase when lexical signals are weak.
+    if phase in {"discovery", "prepare", "transformation", "modeling", "generation", "validation"}:
+        return "structured"
+    return "unknown"
+
+
+def _infer_exactness_state(text: str) -> str:
+    lower = text.lower()
+    if "insufficient evidence" in lower:
+        return "insufficient_evidence"
+    if any(token in lower for token in ("approximately", "approx", "estimate", "estimated")):
+        return "estimated"
+    # Heuristic: direct numeric result language usually indicates deterministic output.
+    if re.search(r"[$€£]?\s?\d[\d,]*(\.\d+)?", text):
+        return "validated_exact"
+    return "not_applicable"
+
+
+def _infer_confidence_and_state(text: str) -> tuple[str, str]:
+    lower = text.lower()
+    if "insufficient evidence" in lower or "cannot determine" in lower:
+        return "abstain", "abstained_missing_evidence"
+    if any(token in lower for token in ("conflict", "inconsistent", "disagree", "contradict")):
+        return "abstain", "abstained_conflicting_evidence"
+    if any(token in lower for token in ("warning", "caution", "partial")):
+        return "medium", "answer_with_warnings"
+    return "high", "answer_ready"
+
+
+def _extract_citations_from_text(text: str) -> list[CitationReference]:
+    """Extract lightweight citation hints from answer text."""
+    citations: list[CitationReference] = []
+    for page_match in re.findall(r"\bpage\s+(\d+)\b", text, flags=re.IGNORECASE):
+        citations.append(
+            CitationReference(
+                citation_type="document_chunk",
+                reference_id=f"page-{page_match}",
+                label=f"Page {page_match}",
+                page=int(page_match),
+            )
+        )
+        if len(citations) >= 5:
+            break
+    return citations
+
+
+def _build_answer_contract_payload(
+    *,
+    phase: str,
+    assistant_text: str,
+    failure_message: str | None,
+    last_tool: str | None,
+) -> dict[str, Any]:
+    """Create a normalized answer contract payload for UI trust rendering."""
+    text = (assistant_text or "").strip()
+
+    if failure_message:
+        contract = HybridAnswerContract(
+            source_mode="unknown",
+            exactness_state="not_applicable",
+            confidence_decision="abstain",
+            trust_state="failed_recoverable",
+            evidence_summary=failure_message,
+            recovery_actions=[
+                RecoveryAction(
+                    action="retry_last_step",
+                    description="Retry the last stable step or rerun the affected phase.",
+                    metadata={"phase": phase, "last_tool": last_tool},
+                )
+            ],
+            metadata={"phase": phase, "last_tool": last_tool},
+        )
+        return contract.model_dump(mode="json")
+
+    source_mode = _infer_source_mode_from_text(text, phase)
+    exactness_state = _infer_exactness_state(text)
+    confidence, trust_state = _infer_confidence_and_state(text)
+    citations = _extract_citations_from_text(text)
+
+    recovery_actions: list[RecoveryAction] = []
+    if confidence == "abstain":
+        recovery_actions.append(
+            RecoveryAction(
+                action="provide_more_evidence",
+                description="Upload or activate additional evidence relevant to this question.",
+                metadata={"phase": phase},
+            )
+        )
+
+    contract = HybridAnswerContract(
+        source_mode=source_mode,  # type: ignore[arg-type]
+        exactness_state=exactness_state,  # type: ignore[arg-type]
+        confidence_decision=confidence,  # type: ignore[arg-type]
+        trust_state=trust_state,  # type: ignore[arg-type]
+        evidence_summary=text[:320] if text else None,
+        citations=citations,
+        recovery_actions=recovery_actions,
+        metadata={"phase": phase, "last_tool": last_tool},
+    )
+    return contract.model_dump(mode="json")
 
 
 def _extract_yaml_from_text(text: str) -> str | None:
@@ -2625,10 +2748,20 @@ async def _run_agent(
                 "data": {"content": _sanitize_assistant_text(fallback_msg)},
             })
 
+        status_contract_payload = _build_answer_contract_payload(
+            phase=_current_phase,
+            assistant_text=current_assistant_content or (_assistant_texts[-1] if _assistant_texts else ""),
+            failure_message=_failure_plan_message,
+            last_tool=_last_tool_name,
+        )
+
         if _failure_plan_message:
             await queue.put({
                 "type": "status",
-                "data": {"message": _failure_plan_message},
+                "data": {
+                    "message": _failure_plan_message,
+                    "answer_contract": status_contract_payload,
+                },
             })
 
         # Non-discovery fallback when supervisor firewall blocked leaked internals.
@@ -2658,6 +2791,16 @@ async def _run_agent(
             safe_final = _sanitize_assistant_text(current_assistant_content)
             if safe_final:
                 _assistant_texts.append(safe_final)
+
+        # Emit a final trust contract for the UI even when no explicit failure occurred.
+        if not _failure_plan_message:
+            await queue.put({
+                "type": "status",
+                "data": {
+                    "message": "",
+                    "answer_contract": status_contract_payload,
+                },
+            })
 
         # --- Safety net: save Data Description if discovery agent produced text but didn't call save_data_description ---
         if _discovery_conversation_ran and not _dd_tool_called:
@@ -2772,6 +2915,56 @@ async def _run_agent(
             })
             logger.info("Phase change: %s → explorer (session %s, stream end)", _current_phase, session_id)
             await _persist_phase(data_product_id, "explorer")
+
+        # Persist answer evidence packet for auditability and trust UX playback.
+        try:
+            from services.postgres import execute as _pg_execute
+            from services.postgres import get_pool as _pg_get_pool
+
+            _pool = await _pg_get_pool(_settings.database_url)
+            _citations = status_contract_payload.get("citations", [])
+            _sql_refs = [
+                c for c in _citations
+                if isinstance(c, dict) and c.get("citation_type") == "sql"
+            ]
+            _fact_refs = [
+                c for c in _citations
+                if isinstance(c, dict) and c.get("citation_type") == "document_fact"
+            ]
+            _chunk_refs = [
+                c for c in _citations
+                if isinstance(c, dict) and c.get("citation_type") == "document_chunk"
+            ]
+            _recovery_actions = status_contract_payload.get("recovery_actions", [])
+            _trust_state = str(status_contract_payload.get("trust_state") or "answer_ready")
+
+            await _pg_execute(
+                _pool,
+                """INSERT INTO qa_evidence
+                   (id, data_product_id, query_id, source_mode, confidence, exactness_state,
+                    tool_calls, sql_refs, fact_refs, chunk_refs, conflicts, recovery_plan,
+                    final_decision, created_by)
+                   VALUES
+                   ($1::uuid, $2::uuid, $3, $4, $5, $6,
+                    $7::jsonb, $8::jsonb, $9::jsonb, $10::jsonb, $11::jsonb, $12::jsonb,
+                    $13, $14)""",
+                str(uuid4()),
+                data_product_id,
+                f"{session_id}:{uuid4()}",
+                str(status_contract_payload.get("source_mode") or "unknown"),
+                str(status_contract_payload.get("confidence_decision") or "medium"),
+                str(status_contract_payload.get("exactness_state") or "not_applicable"),
+                json.dumps([]),
+                json.dumps(_sql_refs),
+                json.dumps(_fact_refs),
+                json.dumps(_chunk_refs),
+                json.dumps(status_contract_payload.get("conflict_notes", [])),
+                json.dumps({"actions": _recovery_actions}),
+                _trust_state[:32],
+                "ekaix-agent",
+            )
+        except Exception as e:
+            logger.warning("Failed to persist qa_evidence for session %s: %s", session_id, e)
 
         # Signal stream end
         await queue.put({
