@@ -46,6 +46,12 @@ function getStepStatus(stepIndex: number, activeIndex: number): StepStatus {
   return 'future';
 }
 
+function getSubphaseLabel(phase: AgentPhase): string | null {
+  if (phase === 'prepare') return 'Preparation in progress';
+  if (phase === 'modeling') return 'Analytical modeling in progress';
+  return null;
+}
+
 function StepCircle({ status }: { status: StepStatus }): React.ReactNode {
   const size = 28;
   const transition = 'all 0.4s ease';
@@ -115,43 +121,51 @@ function ConnectorLine({ status }: { status: StepStatus }): React.ReactNode {
 
 export function PhaseStepper({ currentPhase }: PhaseStepperProps): React.ReactNode {
   const activeIndex = getPhaseIndex(currentPhase);
+  const subphaseLabel = getSubphaseLabel(currentPhase);
 
   return (
-    <Box sx={{ display: 'flex', alignItems: 'center', px: 3, py: 2 }}>
-      {PHASES.map((phase, index) => {
-        const status = getStepStatus(index, activeIndex);
-        const isLast = index === PHASES.length - 1;
-        const textColor = status === 'future' ? GRAY_TEXT : GOLD;
+    <Box sx={{ px: 3, py: 2 }}>
+      <Box sx={{ display: 'flex', alignItems: 'center' }}>
+        {PHASES.map((phase, index) => {
+          const status = getStepStatus(index, activeIndex);
+          const isLast = index === PHASES.length - 1;
+          const textColor = status === 'future' ? GRAY_TEXT : GOLD;
 
-        return (
-          <Box
-            key={phase.key}
-            sx={{
-              display: 'flex',
-              alignItems: 'center',
-              flex: isLast ? 'none' : 1,
-            }}
-          >
+          return (
             <Box
+              key={phase.key}
               sx={{
                 display: 'flex',
-                flexDirection: 'column',
                 alignItems: 'center',
-                minWidth: 80,
+                flex: isLast ? 'none' : 1,
               }}
             >
-              <StepCircle status={status} />
-              <Typography
-                variant="caption"
-                sx={{ mt: 0.5, fontWeight: 600, color: textColor, transition: 'color 0.4s ease' }}
+              <Box
+                sx={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  minWidth: 80,
+                }}
               >
-                {phase.label}
-              </Typography>
+                <StepCircle status={status} />
+                <Typography
+                  variant="caption"
+                  sx={{ mt: 0.5, fontWeight: 600, color: textColor, transition: 'color 0.4s ease' }}
+                >
+                  {phase.label}
+                </Typography>
+              </Box>
+              {!isLast && <ConnectorLine status={getStepStatus(index, activeIndex)} />}
             </Box>
-            {!isLast && <ConnectorLine status={getStepStatus(index, activeIndex)} />}
-          </Box>
-        );
-      })}
+          );
+        })}
+      </Box>
+      {subphaseLabel && (
+        <Typography variant="caption" sx={{ mt: 0.75, color: 'text.secondary', display: 'block' }}>
+          Active sub-step: {subphaseLabel}
+        </Typography>
+      )}
     </Box>
   );
 }

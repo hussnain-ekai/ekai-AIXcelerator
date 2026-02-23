@@ -159,6 +159,16 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   register_transformed_layer: 'Registering data layer',
 };
 
+const TOOL_ARTIFACT_TYPES: Record<string, ArtifactType> = {
+  save_brd: 'brd',
+  save_semantic_view: 'yaml',
+  create_semantic_view: 'yaml',
+  save_data_description: 'data_description',
+  build_erd_from_description: 'erd',
+  save_quality_report: 'data_quality',
+  register_gold_layer: 'lineage',
+};
+
 const PHASE_STATUS_LABELS: Record<string, string> = {
   idle: 'Waiting for your input',
   discovery: 'Profiling your source data',
@@ -183,12 +193,12 @@ function getPhaseStatusLabel(currentPhase: string, recentToolNames: string[]): s
 
 function getStallHint(currentPhase: string): string {
   if (currentPhase === 'discovery' || currentPhase === 'prepare') {
-    return 'Large datasets can take longer during profiling and preparation. ekaiX is still working.';
+    return 'Large datasets can take longer during profiling and preparation. ekaiX is still processing.';
   }
   if (currentPhase === 'requirements') {
-    return 'Requirement capture or BRD drafting may pause while the model composes output. ekaiX is still working.';
+    return 'Requirement capture or BRD drafting can pause briefly while responses are composed.';
   }
-  return 'This step is taking longer than usual, but ekaiX is still working.';
+  return 'This step is still active. ekaiX will continue and update you when new output is available.';
 }
 
 function getToolDisplayName(toolName: string): string {
@@ -234,7 +244,7 @@ function AgentMessage({
 }): React.ReactNode {
   const [copied, setCopied] = useState(false);
 
-  // Collect artifact cards to show: explicit refs take priority, then timestamp-based
+  // Collect artifact cards to show: explicit refs take priority, then tool-call inference.
   const artifacts = useChatStore((state) => state.artifacts);
   let inlineArtifacts: { type: ArtifactType; title: string }[] = [];
 
@@ -245,14 +255,16 @@ function AgentMessage({
       return { type: refType, title: match?.title ?? refType.toUpperCase() };
     });
   } else {
-    // Fallback: match artifacts created within 60 seconds of this message
-    const messageTime = new Date(message.timestamp).getTime();
-    inlineArtifacts = artifacts
-      .filter((a) => {
-        const t = new Date(a.createdAt).getTime();
-        return t >= messageTime && t <= messageTime + 60_000;
-      })
-      .map((a) => ({ type: a.type, title: a.title }));
+    // Infer artifact cards from tool calls to avoid timestamp-based mis-association.
+    const inferredTypes = (message.toolCalls ?? [])
+      .map((call) => TOOL_ARTIFACT_TYPES[call.name])
+      .filter((type): type is ArtifactType => Boolean(type))
+      .filter((type, idx, arr) => arr.indexOf(type) === idx);
+
+    inlineArtifacts = inferredTypes.map((type) => {
+      const match = artifacts.find((a) => a.type === type);
+      return { type, title: match?.title ?? type.toUpperCase() };
+    });
   }
 
   // Extract text from content (defensive handling for structured content)
@@ -646,7 +658,7 @@ function LiveAgentStatus({
 
   const elapsedText = startedAt ? formatElapsed(now - startedAt) : '0s';
   const staleSeconds = Math.max(0, Math.floor((now - lastUpdateAt) / 1000));
-  const looksStalled = isStreaming && staleSeconds >= 45;
+  const looksStalled = isStreaming && staleSeconds >= 120;
   const isPipelineComplete =
     pipelineProgress?.step === 'artifacts' && pipelineProgress?.status === 'completed';
 
@@ -667,8 +679,13 @@ function LiveAgentStatus({
   const phaseLabel = getPhaseStatusLabel(currentPhase, recentToolNames);
   const latestReasoning = reasoningLog[reasoningLog.length - 1] ?? reasoningUpdate;
   const assistantReasoning = latestReasoning?.message?.trim() ?? '';
-  const reasoningLabel = latestReasoning?.source === 'llm' ? 'LLM thinking' : 'ekaiX update';
+  const reasoningLabel = latestReasoning?.source === 'llm' ? 'Agent thinking' : 'Agent update';
   const recentReasoning = reasoningLog.slice(-3);
+  const systemActivity = pipelineProgress
+    ? pipelineProgress.label
+    : recentToolActions.length > 0
+      ? recentToolActions.join(' -> ')
+      : 'Waiting for next execution update...';
   const summaryText = isPipelineComplete
     ? 'Analysis complete'
     : assistantReasoning || (
@@ -718,7 +735,7 @@ function LiveAgentStatus({
                   {pipelineProgress
                     ? ` • Step ${pipelineProgress.stepIndex + 1}/${pipelineProgress.totalSteps}`
                     : ''}
-                  {looksStalled ? ` • no updates for ${staleSeconds}s` : ''}
+                  {looksStalled ? ` • no visible updates for ${staleSeconds}s` : ''}
                 </Typography>
               </Box>
             </Box>
@@ -770,10 +787,7 @@ function LiveAgentStatus({
                 </Typography>
               )}
               <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-                Recent progress:{' '}
-                {recentToolActions.length > 0
-                  ? recentToolActions.join(' -> ')
-                  : 'Working on the next step...'}
+                System activity: {systemActivity}
               </Typography>
               {looksStalled && (
                 <Typography variant="caption" sx={{ color: 'warning.main' }}>

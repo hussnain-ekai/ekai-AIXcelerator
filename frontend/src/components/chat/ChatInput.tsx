@@ -26,6 +26,7 @@ interface ChatInputProps {
   onStop?: () => void;
   disabled?: boolean;
   isStreaming?: boolean;
+  pendingQueueCount?: number;
 }
 
 export function ChatInput({
@@ -33,6 +34,7 @@ export function ChatInput({
   onStop,
   disabled = false,
   isStreaming = false,
+  pendingQueueCount = 0,
 }: ChatInputProps): React.ReactNode {
   const [value, setValue] = useState('');
   const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
@@ -344,7 +346,11 @@ export function ChatInput({
           onFocus={() => setFocused(true)}
           onBlur={() => setFocused(false)}
           placeholder={
-            dragOver ? 'Drop files here...' : 'Reply to ekaiX...'
+            dragOver
+              ? 'Drop files here...'
+              : isStreaming
+                ? 'Type and press Enter to queue your next instruction...'
+                : 'Reply to ekaiX...'
           }
           disabled={disabled}
           rows={1}
@@ -425,25 +431,52 @@ export function ChatInput({
 
           {/* Right: send or stop button */}
           {isStreaming ? (
-            <Tooltip title="Stop generating" placement="top">
-              <IconButton
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onStop?.();
-                }}
-                size="small"
-                sx={{
-                  bgcolor: 'text.primary',
-                  color: 'background.default',
-                  width: 32,
-                  height: 32,
-                  borderRadius: '50%',
-                  '&:hover': { bgcolor: 'text.secondary' },
-                }}
-              >
-                <StopRounded sx={{ fontSize: 18 }} />
-              </IconButton>
-            </Tooltip>
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+              {canSend && (
+                <Tooltip title="Queue message" placement="top">
+                  <span>
+                    <IconButton
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleSend();
+                      }}
+                      disabled={!canSend}
+                      size="small"
+                      sx={{
+                        border: 1,
+                        borderColor: 'divider',
+                        color: 'text.primary',
+                        width: 32,
+                        height: 32,
+                        borderRadius: '50%',
+                        '&:hover': { bgcolor: 'action.hover' },
+                      }}
+                    >
+                      <ArrowUpwardRounded sx={{ fontSize: 18 }} />
+                    </IconButton>
+                  </span>
+                </Tooltip>
+              )}
+              <Tooltip title="Stop generating" placement="top">
+                <IconButton
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onStop?.();
+                  }}
+                  size="small"
+                  sx={{
+                    bgcolor: 'text.primary',
+                    color: 'background.default',
+                    width: 32,
+                    height: 32,
+                    borderRadius: '50%',
+                    '&:hover': { bgcolor: 'text.secondary' },
+                  }}
+                >
+                  <StopRounded sx={{ fontSize: 18 }} />
+                </IconButton>
+              </Tooltip>
+            </Box>
           ) : (
             <Tooltip title="Send message" placement="top">
               <span>
@@ -484,12 +517,17 @@ export function ChatInput({
           display: 'block',
           textAlign: 'center',
           mt: 0.75,
-          color: fileWarning ? 'warning.main' : 'text.disabled',
+          color: fileWarning ? 'warning.main' : pendingQueueCount > 0 ? 'text.secondary' : 'text.disabled',
           fontSize: '0.66rem',
           minHeight: 14,
         }}
       >
-        {fileWarning || 'ekaiX can make mistakes. Verify important information.'}
+        {fileWarning
+          || (
+            pendingQueueCount > 0
+              ? `${pendingQueueCount} message${pendingQueueCount > 1 ? 's' : ''} queued. ekaiX will send ${pendingQueueCount > 1 ? 'them' : 'it'} automatically after the current run.`
+              : 'ekaiX can make mistakes. Verify important information.'
+          )}
       </Typography>
     </Box>
   );

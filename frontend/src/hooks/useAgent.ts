@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { connectSSE } from '@/lib/sse';
 import type { SSEHandlers } from '@/lib/sse';
 import { api } from '@/lib/api';
@@ -22,6 +23,12 @@ interface UseAgentReturn {
   retryMessage: (opts: { messageId?: string; editedContent?: string; originalContent?: string }) => Promise<void>;
   interrupt: () => Promise<void>;
   isConnected: boolean;
+  pendingQueueCount: number;
+}
+
+interface QueuedOutboundMessage {
+  content: string;
+  files?: File[];
 }
 
 /** Convert a File to base64 string. */
@@ -40,8 +47,13 @@ async function fileToBase64(file: File): Promise<string> {
 }
 
 function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
+  const queryClient = useQueryClient();
   const [isConnected, setIsConnected] = useState(false);
+  const [pendingQueueCount, setPendingQueueCount] = useState(0);
   const cleanupRef = useRef<(() => void) | null>(null);
+  const pendingQueueRef = useRef<QueuedOutboundMessage[]>([]);
+  const dispatchInFlightRef = useRef(false);
+  const flushQueuedMessagesRef = useRef<() => Promise<void>>(async () => undefined);
   const storeApi = useChatStoreApi();
 
   const setSessionId = useChatStore((s) => s.setSessionId);
@@ -58,6 +70,40 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
   const setReasoningUpdate = useChatStore((s) => s.setReasoningUpdate);
   const clearReasoningLog = useChatStore((s) => s.clearReasoningLog);
   const sessionId = useChatStore((s) => s.sessionId);
+
+  const persistAttachmentsInDocumentLibrary = useCallback(
+    async (files?: File[]) => {
+      if (!files || files.length === 0) return;
+
+      let hadUploadFailure = false;
+
+      await Promise.all(
+        files.map(async (file) => {
+          const formData = new FormData();
+          formData.append('file', file);
+          formData.append('data_product_id', dataProductId);
+
+          try {
+            await api.postForm('/documents/upload', formData);
+          } catch {
+            hadUploadFailure = true;
+          }
+        }),
+      );
+
+      void queryClient.invalidateQueries({ queryKey: ['documents', dataProductId] });
+
+      if (hadUploadFailure) {
+        addMessage({
+          id: crypto.randomUUID(),
+          role: 'system',
+          content: 'Some attachments could not be added to Documents. You can retry from the Documents panel.',
+          timestamp: new Date().toISOString(),
+        });
+      }
+    },
+    [dataProductId, queryClient, addMessage],
+  );
 
   const connectToStream = useCallback(
     (sid: string) => {
@@ -115,6 +161,10 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
           setPhase(to as AgentPhase);
 
           if (to === prevPhase) return;
+
+          // Avoid injecting misleading phase chatter for ad-hoc turns.
+          // For non-pipeline requests, the live status card already reflects phase.
+          if (!storeApi.getState().pipelineRunning) return;
 
           const PHASE_LABELS: Record<string, string> = {
             prepare: 'Preparing your data for modeling...',
@@ -225,6 +275,7 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
           }
         },
         onError: (_code: string, message: string) => {
+          const reason = message.trim().length > 0 ? message : 'Request failed. Please try again.';
           setStreaming(false);
           setIsConnected(false);
           setPipelineProgress(null);
@@ -232,8 +283,11 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
           addMessage({
             id: crypto.randomUUID(),
             role: 'system',
-            content: `Error: ${message}`,
+            content: `Error: ${reason}`,
             timestamp: new Date().toISOString(),
+          });
+          queueMicrotask(() => {
+            void flushQueuedMessagesRef.current();
           });
         },
         onDone: () => {
@@ -242,6 +296,9 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
           setIsConnected(false);
           setPipelineProgress(null);
           setPipelineRunning(false);
+          queueMicrotask(() => {
+            void flushQueuedMessagesRef.current();
+          });
         },
       };
 
@@ -266,36 +323,9 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
     ],
   );
 
-  const sendMessage = useCallback(
+  const dispatchMessage = useCallback(
     async (content: string, files?: File[]) => {
-      // Don't show internal trigger messages in the chat
-      const isInternalTrigger = content === '__START_DISCOVERY__' || content === '__RERUN_DISCOVERY__';
-
-      // Build attachment metadata for display in chat
-      const chatAttachments: ChatMessageAttachment[] = [];
-      if (files && files.length > 0) {
-        for (const file of files) {
-          const att: ChatMessageAttachment = {
-            filename: file.name,
-            contentType: file.type,
-          };
-          if (file.type.startsWith('image/')) {
-            att.thumbnailUrl = URL.createObjectURL(file);
-          }
-          chatAttachments.push(att);
-        }
-      }
-
-      if (!isInternalTrigger) {
-        addMessage({
-          id: crypto.randomUUID(),
-          role: 'user',
-          content,
-          timestamp: new Date().toISOString(),
-          attachments: chatAttachments.length > 0 ? chatAttachments : undefined,
-        });
-      }
-
+      dispatchInFlightRef.current = true;
       clearReasoningLog();
       setStreaming(true);
 
@@ -333,26 +363,105 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
           },
         );
 
+        dispatchInFlightRef.current = false;
         connectToStream(response.session_id);
       } catch (error) {
+        const reason =
+          error instanceof Error && error.message.trim().length > 0
+            ? error.message
+            : 'Failed to send message';
+        dispatchInFlightRef.current = false;
         setStreaming(false);
         setIsConnected(false);
         addMessage({
           id: crypto.randomUUID(),
           role: 'system',
-          content: `Error: ${error instanceof Error ? error.message : 'Failed to send message'}`,
+          content: `Error: ${reason}`,
           timestamp: new Date().toISOString(),
+        });
+        queueMicrotask(() => {
+          void flushQueuedMessagesRef.current();
         });
       }
     },
     [
       dataProductId,
       storeApi,
-      addMessage,
+      clearReasoningLog,
       setStreaming,
       setSessionId,
+      addMessage,
       connectToStream,
-      clearReasoningLog,
+    ],
+  );
+
+  const flushQueuedMessages = useCallback(async () => {
+    if (dispatchInFlightRef.current) return;
+    if (storeApi.getState().isStreaming) return;
+
+    const next = pendingQueueRef.current.shift();
+    setPendingQueueCount(pendingQueueRef.current.length);
+    if (!next) return;
+
+    await dispatchMessage(next.content, next.files);
+  }, [storeApi, dispatchMessage]);
+  flushQueuedMessagesRef.current = flushQueuedMessages;
+
+  const sendMessage = useCallback(
+    async (content: string, files?: File[]) => {
+      // Don't show internal trigger messages in the chat
+      const isInternalTrigger = content === '__START_DISCOVERY__' || content === '__RERUN_DISCOVERY__';
+
+      // A new pipeline trigger should discard any queued ad-hoc messages.
+      if (isInternalTrigger) {
+        pendingQueueRef.current = [];
+        setPendingQueueCount(0);
+      }
+
+      // Build attachment metadata for display in chat
+      const chatAttachments: ChatMessageAttachment[] = [];
+      if (files && files.length > 0) {
+        for (const file of files) {
+          const att: ChatMessageAttachment = {
+            filename: file.name,
+            contentType: file.type,
+          };
+          if (file.type.startsWith('image/')) {
+            att.thumbnailUrl = URL.createObjectURL(file);
+          }
+          chatAttachments.push(att);
+        }
+      }
+
+      if (!isInternalTrigger) {
+        addMessage({
+          id: crypto.randomUUID(),
+          role: 'user',
+          content,
+          timestamp: new Date().toISOString(),
+          attachments: chatAttachments.length > 0 ? chatAttachments : undefined,
+        });
+      }
+
+      // Best-effort background persistence to the Documents folder.
+      if (!isInternalTrigger && files && files.length > 0) {
+        void persistAttachmentsInDocumentLibrary(files);
+      }
+
+      // If agent is busy, queue this turn and send automatically afterward.
+      if (storeApi.getState().isStreaming || dispatchInFlightRef.current) {
+        pendingQueueRef.current.push({ content, files });
+        setPendingQueueCount(pendingQueueRef.current.length);
+        return;
+      }
+
+      await dispatchMessage(content, files);
+    },
+    [
+      storeApi,
+      addMessage,
+      persistAttachmentsInDocumentLibrary,
+      dispatchMessage,
     ],
   );
 
@@ -378,12 +487,16 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
 
         connectToStream(response.session_id);
       } catch (error) {
+        const reason =
+          error instanceof Error && error.message.trim().length > 0
+            ? error.message
+            : 'Failed to retry message';
         setStreaming(false);
         setIsConnected(false);
         addMessage({
           id: crypto.randomUUID(),
           role: 'system',
-          content: `Error: ${error instanceof Error ? error.message : 'Failed to retry message'}`,
+          content: `Error: ${reason}`,
           timestamp: new Date().toISOString(),
         });
       }
@@ -395,8 +508,11 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
     if (sessionId) {
       await api.post(`/agent/interrupt/${sessionId}`);
       setStreaming(false);
+      queueMicrotask(() => {
+        void flushQueuedMessages();
+      });
     }
-  }, [sessionId, setStreaming]);
+  }, [sessionId, setStreaming, flushQueuedMessages]);
 
   useEffect(() => {
     return () => {
@@ -406,7 +522,7 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
     };
   }, []);
 
-  return { sendMessage, retryMessage, interrupt, isConnected };
+  return { sendMessage, retryMessage, interrupt, isConnected, pendingQueueCount };
 }
 
 export { useAgent };

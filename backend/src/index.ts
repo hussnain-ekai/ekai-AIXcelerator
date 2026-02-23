@@ -22,6 +22,8 @@ import { redisService } from './services/redisService.js';
 
 async function buildApp(): Promise<ReturnType<typeof Fastify>> {
   const app = Fastify({
+    // Agent requests send file contents as base64 JSON payloads; allow larger bodies.
+    bodyLimit: config.BACKEND_BODY_LIMIT_MB * 1024 * 1024,
     logger: {
       level: config.NODE_ENV === 'production' ? 'info' : 'debug',
       transport:

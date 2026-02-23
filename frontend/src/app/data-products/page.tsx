@@ -52,7 +52,7 @@ export default function DataProductsPage(): React.ReactNode {
           <TextField
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search data products..."
+            placeholder="Search data products on this page..."
             size="small"
             slotProps={{
               input: {

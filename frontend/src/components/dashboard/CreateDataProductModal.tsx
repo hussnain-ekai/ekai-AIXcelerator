@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   Box,
@@ -26,7 +26,7 @@ import {
 } from '@mui/material';
 import type { SelectChangeEvent } from '@mui/material';
 import TableChartOutlinedIcon from '@mui/icons-material/TableChartOutlined';
-import { useDatabases, useSchemas, useTables } from '@/hooks/useDatabases';
+import { useDatabases, useSchemas } from '@/hooks/useDatabases';
 import type { TableSummary } from '@/hooks/useDatabases';
 import { useCreateDataProduct } from '@/hooks/useDataProducts';
 import { useQueries } from '@tanstack/react-query';
@@ -117,30 +117,6 @@ export function CreateDataProductModal({
     return tables;
   }, [tableQueries]);
 
-  // Pre-select non-PUBLIC schemas when schemas load for a new database selection
-  useEffect(() => {
-    if (schemas.length === 0) return;
-    const nonPublic = schemas
-      .filter((s) => s.name !== 'PUBLIC')
-      .map((s) => s.name);
-    if (nonPublic.length > 0) {
-      setSelectedSchemas(nonPublic);
-    }
-  }, [schemas]);
-
-  // Auto-select all tables when they load (moving to step 2)
-  useEffect(() => {
-    if (allTables.length > 0 && step === 2) {
-      setSelectedTables((prev) => {
-        // Only auto-select if user hasn't manually changed anything yet
-        if (prev.length === 0) {
-          return allTables.map((t) => t.fqn);
-        }
-        return prev;
-      });
-    }
-  }, [allTables, step]);
-
   function handleDatabaseChange(event: SelectChangeEvent): void {
     setSelectedDatabase(event.target.value);
     setSelectedSchemas([]);
@@ -193,8 +169,6 @@ export function CreateDataProductModal({
 
   function handleNextToStep2(): void {
     if (selectedDatabase.length > 0 && selectedSchemas.length > 0) {
-      // Auto-select all tables when entering step 2
-      setSelectedTables(allTables.map((t) => t.fqn));
       setStep(2);
     }
   }
@@ -237,6 +211,7 @@ export function CreateDataProductModal({
   };
 
   const allSelected = allTables.length > 0 && selectedTables.length === allTables.length;
+  const isLargeSelection = selectedTables.length > 50;
 
   return (
     <Dialog
@@ -359,6 +334,14 @@ export function CreateDataProductModal({
         {/* Step 2: Select Tables */}
         {step === 2 && (
           <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, pt: 1 }}>
+            <Typography variant="caption" color="text.secondary">
+              Select only the tables needed for this data product. Selected {selectedTables.length} of {allTables.length}.
+            </Typography>
+            {isLargeSelection && (
+              <Typography variant="caption" color="warning.main">
+                Large selections can increase profiling and generation time.
+              </Typography>
+            )}
             {isLoadingTables ? (
               <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}>
                 <CircularProgress sx={{ color: GOLD }} />

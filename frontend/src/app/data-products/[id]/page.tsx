@@ -7,6 +7,10 @@ import {
   Box,
   Breadcrumbs,
   Button,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
   Divider,
   IconButton,
   Link as MuiLink,
@@ -14,6 +18,7 @@ import {
   Typography,
 } from '@mui/material';
 import FolderOpenIcon from '@mui/icons-material/FolderOpen';
+import FolderOutlinedIcon from '@mui/icons-material/FolderOutlined';
 import TableChartOutlinedIcon from '@mui/icons-material/TableChartOutlined';
 import RestartAltIcon from '@mui/icons-material/RestartAlt';
 import EditOutlinedIcon from '@mui/icons-material/EditOutlined';
@@ -28,6 +33,7 @@ import { ChatInput } from '@/components/chat/ChatInput';
 import { DataSourceSettingsPanel } from '@/components/dashboard/DataSourceSettingsPanel';
 import { ArtifactsPanel } from '@/components/panels/ArtifactsPanel';
 import type { Artifact as PanelArtifact } from '@/components/panels/ArtifactsPanel';
+import { DocumentsPanel } from '@/components/panels/DocumentsPanel';
 import { ERDDiagramPanel } from '@/components/panels/ERDDiagramPanel';
 import { DataQualityReport } from '@/components/panels/DataQualityReport';
 import { YAMLViewer } from '@/components/panels/YAMLViewer';
@@ -43,6 +49,7 @@ import { useDataProduct } from '@/hooks/useDataProducts';
 import { useAgent } from '@/hooks/useAgent';
 import { useSessionRecovery } from '@/hooks/useSessionRecovery';
 import { useArtifacts, useERDData, useQualityReport, useYAMLContent, useBRD, useDataDescription, useDataCatalog, useBusinessGlossary, useMetricsDefinitions, useValidationRules, useLineageData } from '@/hooks/useArtifacts';
+import { useDocuments, useUploadDocument } from '@/hooks/useDocuments';
 import { useQueryClient } from '@tanstack/react-query';
 import { ChatStoreProvider, useChatStore, useChatStoreApi } from '@/stores/chatStoreProvider';
 import type { ArtifactType } from '@/stores/chatStore';
@@ -94,10 +101,11 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
   const router = useRouter();
   const { data: dataProduct } = useDataProduct(id);
   const { isHydrated } = useSessionRecovery(dataProduct);
-  const { sendMessage, retryMessage, interrupt } = useAgent({ dataProductId: id });
+  const { sendMessage, retryMessage, interrupt, pendingQueueCount } = useAgent({ dataProductId: id });
   const storeApi = useChatStoreApi();
   const [editOpen, setEditOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [rerunConfirmOpen, setRerunConfirmOpen] = useState(false);
   const truncateAfter = useChatStore((state) => state.truncateAfter);
   const editMessage = useChatStore((state) => state.editMessage);
   const messages = useChatStore((state) => state.messages);
@@ -111,12 +119,15 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
   const addArtifact = useChatStore((state) => state.addArtifact);
   const queryClient = useQueryClient();
   const [tablesOpen, setTablesOpen] = useState(false);
+  const [documentsOpen, setDocumentsOpen] = useState(false);
   const [artifactsPanelOpen, setArtifactsPanelOpen] = useState(false);
   const discoveryTriggeredRef = useRef(false);
   const artifactsHydratedRef = useRef(false);
 
   // Load persisted artifacts from PostgreSQL on mount
   const { data: persistedArtifacts } = useArtifacts(id);
+  const { data: documentsResponse } = useDocuments(id);
+  const uploadDocument = useUploadDocument(id);
   const addMessage = useChatStore((state) => state.addMessage);
 
   const pipelineRunning = useChatStore((state) => state.pipelineRunning);
@@ -308,6 +319,11 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
     void sendMessage('__RERUN_DISCOVERY__');
   }, [clearMessages, sendMessage, setPipelineRunningAction, queryClient, id]);
 
+  const handleConfirmRerunDiscovery = useCallback(() => {
+    setRerunConfirmOpen(false);
+    handleRerunDiscovery();
+  }, [handleRerunDiscovery]);
+
   // Auto-trigger discovery when no messages and data product exists
   // Wait for hydration to complete before deciding - prevents re-triggering on navigation
   useEffect(() => {
@@ -359,7 +375,15 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
 
   const productName = dataProduct?.name ?? 'Data Product';
   const tableCount = dataProduct?.tables?.length ?? 0;
+  const documentCount = documentsResponse?.data.length ?? 0;
   const artifactCount = artifacts.length;
+
+  const handleUploadDocuments = useCallback(
+    (files: File[]) => {
+      void Promise.all(files.map((file) => uploadDocument.mutateAsync(file))).catch(() => undefined);
+    },
+    [uploadDocument],
+  );
 
   return (
     <Box
@@ -424,7 +448,7 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
             variant="outlined"
             size="small"
             startIcon={<RestartAltIcon />}
-            onClick={handleRerunDiscovery}
+            onClick={() => setRerunConfirmOpen(true)}
             disabled={isStreaming}
             sx={{ borderColor: 'divider' }}
           >
@@ -439,6 +463,21 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
           >
             Tables{tableCount > 0 ? ` (${tableCount})` : ''}
           </Button>
+          <Badge
+            badgeContent={documentCount}
+            color="primary"
+            invisible={documentCount === 0}
+          >
+            <Button
+              variant="outlined"
+              size="small"
+              startIcon={<FolderOutlinedIcon />}
+              onClick={() => setDocumentsOpen(true)}
+              sx={{ borderColor: 'divider' }}
+            >
+              Documents
+            </Button>
+          </Badge>
           <Badge
             badgeContent={artifactCount}
             color="primary"
@@ -477,8 +516,9 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
       <ChatInput
         onSend={handleSendMessage}
         onStop={handleStop}
-        disabled={isStreaming}
+        disabled={!dataProduct}
         isStreaming={isStreaming}
+        pendingQueueCount={pendingQueueCount}
       />
 
       {/* Data source settings slide-over */}
@@ -489,6 +529,14 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
           dataProduct={dataProduct}
         />
       )}
+
+      <DocumentsPanel
+        open={documentsOpen}
+        onClose={() => setDocumentsOpen(false)}
+        documents={documentsResponse?.data ?? []}
+        onUploadFiles={handleUploadDocuments}
+        isUploading={uploadDocument.isPending}
+      />
 
       {/* Artifacts list panel */}
       <ArtifactsPanel
@@ -622,6 +670,28 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
           onDeleted={() => router.push('/data-products')}
         />
       )}
+
+      <Dialog
+        open={rerunConfirmOpen}
+        onClose={() => setRerunConfirmOpen(false)}
+        maxWidth="xs"
+        fullWidth
+      >
+        <DialogTitle>Re-run Discovery?</DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" color="text.secondary">
+            This restarts discovery from scratch and clears current chat progress and generated downstream artifacts.
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setRerunConfirmOpen(false)} color="inherit">
+            Cancel
+          </Button>
+          <Button onClick={handleConfirmRerunDiscovery} color="warning" variant="contained">
+            Re-run Discovery
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 }

@@ -1,11 +1,10 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   Box,
   Button,
   Checkbox,
-  Chip,
   CircularProgress,
   Divider,
   Drawer,
@@ -63,11 +62,6 @@ export function DataSourceSettingsPanel({
     dataProduct.tables ?? [],
   );
 
-  // Refs to track initial auto-selection (prevent infinite loops)
-  const initialDatabaseRef = useRef(dataProduct.database_reference);
-  const hasAutoSelectedSchemasRef = useRef(false);
-  const hasAutoSelectedTablesRef = useRef(false);
-
   const updateMutation = useUpdateDataProduct(dataProduct.id);
   const { data: databasesData } = useDatabases();
   const { data: schemasData } = useSchemas(
@@ -106,53 +100,11 @@ export function DataSourceSettingsPanel({
     setSelectedDatabase(dataProduct.database_reference);
     setSelectedSchemas(dataProduct.schemas ?? []);
     setSelectedTables(dataProduct.tables ?? []);
-    // Reset auto-selection flags when data product changes
-    initialDatabaseRef.current = dataProduct.database_reference;
-    hasAutoSelectedSchemasRef.current = false;
-    hasAutoSelectedTablesRef.current = false;
   }, [dataProduct]);
-
-  // Pre-select non-PUBLIC schemas when database changes
-  useEffect(() => {
-    if (schemas.length === 0) return;
-    // Only auto-select once when database changes from the original
-    if (
-      selectedDatabase !== initialDatabaseRef.current &&
-      !hasAutoSelectedSchemasRef.current
-    ) {
-      const nonPublic = schemas
-        .filter((s) => s.name !== 'PUBLIC')
-        .map((s) => s.name);
-      setSelectedSchemas(nonPublic);
-      setSelectedTables([]); // Clear tables when database changes
-      hasAutoSelectedSchemasRef.current = true;
-      hasAutoSelectedTablesRef.current = false; // Reset tables flag
-    }
-  }, [schemas, selectedDatabase]);
-
-  // Auto-select all tables when schemas change (only once per schema change)
-  useEffect(() => {
-    if (
-      allTables.length > 0 &&
-      !isLoadingTables &&
-      !hasAutoSelectedTablesRef.current
-    ) {
-      // Check if schemas have changed from original
-      const currentSchemaSet = new Set(selectedSchemas);
-      const originalSchemaSet = new Set(dataProduct.schemas ?? []);
-      const schemasChanged =
-        currentSchemaSet.size !== originalSchemaSet.size ||
-        [...currentSchemaSet].some((s) => !originalSchemaSet.has(s));
-
-      if (schemasChanged) {
-        setSelectedTables(allTables.map((t) => t.fqn));
-        hasAutoSelectedTablesRef.current = true;
-      }
-    }
-  }, [allTables, isLoadingTables, selectedSchemas, dataProduct.schemas]);
 
   const allTablesSelected =
     allTables.length > 0 && selectedTables.length === allTables.length;
+  const isLargeSelection = selectedTables.length > 50;
 
   const hasChanges =
     selectedDatabase !== dataProduct.database_reference ||
@@ -165,9 +117,6 @@ export function DataSourceSettingsPanel({
     setSelectedDatabase(event.target.value);
     setSelectedSchemas([]);
     setSelectedTables([]);
-    // Reset auto-selection flags when user manually changes database
-    hasAutoSelectedSchemasRef.current = false;
-    hasAutoSelectedTablesRef.current = false;
   }
 
   function handleSchemaToggle(schemaName: string): void {
@@ -181,8 +130,6 @@ export function DataSourceSettingsPanel({
         );
         return newSchemas;
       }
-      // Adding a schema - reset tables flag so new tables will be auto-selected
-      hasAutoSelectedTablesRef.current = false;
       return [...prev, schemaName];
     });
   }
@@ -324,6 +271,14 @@ export function DataSourceSettingsPanel({
             <Typography variant="subtitle2" gutterBottom>
               Tables ({selectedTables.length})
             </Typography>
+            <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1 }}>
+              Table selection is manual to prevent accidental broad scope.
+            </Typography>
+            {isLargeSelection && (
+              <Typography variant="caption" color="warning.main" sx={{ display: 'block', mb: 1 }}>
+                Large selections can increase profiling and generation time.
+              </Typography>
+            )}
 
             {isLoadingTables ? (
               <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}>

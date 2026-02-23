@@ -2,9 +2,11 @@
 
 import asyncio
 import base64
+import io
 import json
 import logging
 import re
+import zipfile
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 from typing import Any
@@ -780,7 +782,9 @@ async def _get_publish_gate_context(data_product_id: str) -> tuple[str | None, b
 
         row = rows[0]
         phase = row.get("current_phase")
-        already_published = bool(row.get("state_published")) or row.get("status") == "published" or bool(row.get("published_at"))
+        # Use explicit publish markers only. `published_at` is historical and may
+        # remain set after a re-run starts a new lifecycle.
+        already_published = bool(row.get("state_published")) or row.get("status") == "published"
         return phase if isinstance(phase, str) else None, already_published
     except Exception as e:
         logger.warning("Publish gate context lookup failed for %s: %s", data_product_id, e)
@@ -1205,32 +1209,110 @@ TABLE DETAILS & FIELD ANALYSIS
     return summary
 
 
+def _looks_like_pbix(filename: str, mime_type: str) -> bool:
+    """Return True when a file is likely a Power BI PBIX package."""
+    lower = (filename or "").lower()
+    return lower.endswith(".pbix") or mime_type == "application/vnd.ms-powerbi"
+
+
+def _extract_pbix_text_summary(filename: str, base64_data: str) -> str | None:
+    """Extract lightweight model clues from PBIX (zip) without binary passthrough."""
+    try:
+        raw = base64.b64decode(base64_data)
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            members = set(zf.namelist())
+            layout_text = ""
+            if "Report/Layout" in members:
+                layout_bytes = zf.read("Report/Layout")
+                # Most PBIX layout files are UTF-16LE JSON.
+                try:
+                    layout_text = layout_bytes.decode("utf-16-le", errors="ignore")
+                except (UnicodeDecodeError, Exception):
+                    layout_text = layout_bytes.decode("utf-8", errors="ignore")
+
+            query_refs = sorted(set(re.findall(r'"queryRef"\s*:\s*"([^"]+)"', layout_text)))
+            visual_types = sorted(set(re.findall(r'"visualType"\s*:\s*"([^"]+)"', layout_text)))
+            table_names = sorted({q.split(".", 1)[0] for q in query_refs if "." in q})
+
+            ref_sample = query_refs[:80]
+            visuals_sample = visual_types[:20]
+            tables_sample = table_names[:40]
+
+            summary_lines = [
+                f"[Attached PBIX file: {filename}]",
+                "This file is binary; extracted metadata from Report/Layout and package contents:",
+                f"- Package members: {len(members)}",
+            ]
+            if tables_sample:
+                summary_lines.append(f"- Referenced tables ({len(table_names)}): {', '.join(tables_sample)}")
+            if ref_sample:
+                summary_lines.append(f"- Referenced fields/measures ({len(query_refs)}): {', '.join(ref_sample)}")
+            if visuals_sample:
+                summary_lines.append(f"- Visual types ({len(visual_types)}): {', '.join(visuals_sample)}")
+            if not query_refs and not visual_types:
+                summary_lines.append(
+                    "- No usable model references were extracted from layout; use this as a weak hint only."
+                )
+
+            return "\n".join(summary_lines)
+    except (ValueError, zipfile.BadZipFile, OSError, Exception):
+        logger.warning("Failed to extract PBIX summary for %s", filename, exc_info=True)
+        return None
+
+
+def _decode_data_uri_base64(value: str) -> tuple[str, str] | None:
+    """Parse ``data:<mime>;base64,<payload>`` strings."""
+    if not isinstance(value, str):
+        return None
+    if not value.startswith("data:") or ";base64," not in value:
+        return None
+    header, payload = value.split(";base64,", 1)
+    mime = header[5:] if len(header) > 5 else "application/octet-stream"
+    return mime or "application/octet-stream", payload
+
+
+def _is_base64_zip_payload(base64_data: str) -> bool:
+    """Return True when a base64 payload decodes to a ZIP header."""
+    if not base64_data:
+        return False
+    try:
+        raw = base64.b64decode(base64_data)
+        return raw.startswith(b"PK\x03\x04")
+    except Exception:
+        return False
+
+
 def _build_multimodal_content(
     text: str,
     file_contents: list | None = None,
 ) -> str | list[dict]:
-    """Build HumanMessage content using standard LangChain content blocks.
+    """Build HumanMessage content using OpenAI-compatible content blocks.
 
-    Uses the native LangChain multimodal format (langchain-google-genai v4+):
-      - Text files (CSV, TXT, JSON): decoded to UTF-8, appended as text.
-      - Images:  ``{"type": "image_url", ...}`` with base64 data URI.
-      - PDFs:    ``{"type": "file", "base64": ..., "mime_type": ...}``.
-      - Audio:   ``{"type": "media", "data": ..., "mime_type": ...}``.
-      - Video:   ``{"type": "media", "data": ..., "mime_type": ...}``.
-      - Other:   ``{"type": "media", "data": ..., "mime_type": ...}``.
+    The LiteLLM router validates user message content against OpenAI chat types.
+    Use only types accepted across providers:
+      - Text files (CSV/TXT/JSON/XML): decode to UTF-8 and append as text.
+      - Images: ``{"type": "image_url", ...}``.
+      - Audio (mp3/wav): ``{"type": "input_audio", ...}``.
+      - PDFs / other binary: ``{"type": "file", "file": {...}}``.
 
-    Returns a plain string when all attachments are text-decodable (no
-    multimodal blocks needed). Returns a list of content block dicts when
-    binary attachments (images, PDFs, audio, video) are present.
-
-    The orchestrator LLM (Gemini) processes binary attachments natively.
-    When delegating to subagents via Deep Agents ``task()``, the orchestrator
-    includes relevant file content in the task description text.
+    Returns a plain string when all attachments are text-decodable (most
+    compatible path for subagent delegation). Returns a list of content blocks
+    when any binary attachment is present.
     """
     if not file_contents:
         return text
 
     from models.schemas import FileContent
+
+    def _as_file_block(filename: str, mime_type: str, base64_data: str) -> dict[str, Any]:
+        safe_name = filename or "attachment"
+        return {
+            "type": "file",
+            "file": {
+                "filename": safe_name,
+                "file_data": f"data:{mime_type};base64,{base64_data}",
+            },
+        }
 
     logger.info("Building multimodal content: %d file(s) attached", len(file_contents))
     for fc in file_contents:
@@ -1248,6 +1330,18 @@ def _build_multimodal_content(
 
         mime = fc.content_type or "application/octet-stream"
 
+        # --- PBIX: extract layout metadata as text (do not send raw binary) ---
+        if _looks_like_pbix(fc.filename, mime):
+            pbix_summary = _extract_pbix_text_summary(fc.filename, fc.base64_data)
+            if pbix_summary:
+                text_parts.append(pbix_summary)
+            else:
+                text_parts.append(
+                    f"[Attached file: {fc.filename}] Binary PBIX file attached. "
+                    "Could not extract structured metadata from this file."
+                )
+            continue
+
         # --- Images: image_url with base64 data URI ---
         if mime.startswith("image/"):
             binary_blocks.append({
@@ -1255,21 +1349,27 @@ def _build_multimodal_content(
                 "image_url": {"url": f"data:{mime};base64,{fc.base64_data}"},
             })
 
-        # --- PDFs / documents: file block with base64 + mime_type ---
-        elif mime == "application/pdf":
-            binary_blocks.append({
-                "type": "file",
-                "base64": fc.base64_data,
-                "mime_type": mime,
-            })
+        # --- Audio: use input_audio only for known supported formats ---
+        elif mime.startswith("audio/"):
+            audio_subtype = mime.split("/", 1)[1].lower() if "/" in mime else ""
+            if audio_subtype in {"wav", "x-wav"}:
+                binary_blocks.append({
+                    "type": "input_audio",
+                    "input_audio": {"data": fc.base64_data, "format": "wav"},
+                })
+            elif audio_subtype in {"mp3", "mpeg"}:
+                binary_blocks.append({
+                    "type": "input_audio",
+                    "input_audio": {"data": fc.base64_data, "format": "mp3"},
+                })
+            else:
+                binary_blocks.append(_as_file_block(fc.filename, mime, fc.base64_data))
 
-        # --- Audio / video: media block ---
-        elif mime.startswith("audio/") or mime.startswith("video/"):
-            binary_blocks.append({
-                "type": "media",
-                "data": fc.base64_data,
-                "mime_type": mime,
-            })
+        # --- PDFs / documents / video: use generic file block ---
+        elif mime == "application/pdf":
+            binary_blocks.append(_as_file_block(fc.filename, mime, fc.base64_data))
+        elif mime.startswith("video/"):
+            binary_blocks.append(_as_file_block(fc.filename, mime, fc.base64_data))
 
         # --- Text-decodable files (CSV, TXT, JSON, XML, etc.) ---
         elif mime.startswith("text/") or mime in (
@@ -1283,17 +1383,19 @@ def _build_multimodal_content(
             except Exception:
                 text_parts.append(f"[Attached file: {fc.filename} — could not decode as text]")
 
-        # --- Unknown binary: try text decode, fall back to media block ---
+        # --- Unknown binary: avoid raw passthrough (provider may reject empty docs) ---
         else:
             try:
                 decoded = base64.b64decode(fc.base64_data).decode("utf-8")
                 text_parts.append(f"[Attached file: {fc.filename}]\n{decoded[:50000]}")
             except Exception:
-                binary_blocks.append({
-                    "type": "media",
-                    "data": fc.base64_data,
-                    "mime_type": mime,
-                })
+                pbix_summary = _extract_pbix_text_summary(fc.filename or "attachment.pbix", fc.base64_data)
+                if pbix_summary:
+                    text_parts.append(pbix_summary)
+                else:
+                    text_parts.append(
+                        f"[Attached file: {fc.filename}] Binary content ({mime}) could not be parsed as text."
+                    )
 
     # If no binary attachments, return a plain string (most compatible,
     # survives Deep Agents task() delegation without losing content)
@@ -1311,6 +1413,92 @@ def _build_multimodal_content(
     logger.info("Multimodal content: %d blocks (%s)",
                 len(blocks), [b["type"] for b in blocks])
     return blocks
+
+
+def _sanitize_checkpoint_user_content_blocks(content: Any) -> tuple[Any, bool]:
+    """Sanitize historical user content blocks for provider compatibility.
+
+    - Legacy ``type=media`` blocks are converted to text placeholders.
+    - PBIX file blocks are converted to extracted text summaries (or placeholders),
+      because raw PBIX bytes can fail provider-side document validation.
+    """
+    if not isinstance(content, list):
+        return content, False
+
+    changed = False
+    normalized: list[Any] = []
+    for item in content:
+        if not isinstance(item, dict):
+            normalized.append(item)
+            continue
+
+        block_type = item.get("type")
+
+        # Legacy Anthropic/LangChain style block
+        if block_type == "media":
+            mime = str(item.get("mime_type") or "application/octet-stream")
+            data = item.get("data")
+            if isinstance(data, str) and data and _looks_like_pbix("attachment.pbix", mime):
+                pbix_summary = _extract_pbix_text_summary("attachment.pbix", data)
+                if pbix_summary:
+                    normalized.append({"type": "text", "text": pbix_summary})
+                else:
+                    normalized.append({
+                        "type": "text",
+                        "text": "[Legacy PBIX attachment omitted due incompatible history format.]",
+                    })
+            else:
+                normalized.append({
+                    "type": "text",
+                    "text": "[Legacy binary attachment omitted due incompatible format.]",
+                })
+            changed = True
+            continue
+
+        # OpenAI style file block from previous turns
+        if block_type == "file":
+            filename = ""
+            mime = "application/octet-stream"
+            base64_data = ""
+
+            if isinstance(item.get("file"), dict):
+                file_obj = item["file"]
+                filename = str(file_obj.get("filename") or "")
+                parsed = _decode_data_uri_base64(str(file_obj.get("file_data") or ""))
+                if parsed:
+                    mime, base64_data = parsed
+            else:
+                # Legacy file shape used by older code paths
+                filename = str(item.get("filename") or "")
+                mime = str(item.get("mime_type") or mime)
+                base64_data = str(item.get("base64") or "")
+
+            if _looks_like_pbix(filename, mime) or (
+                mime == "application/octet-stream" and _is_base64_zip_payload(base64_data)
+            ):
+                pbix_summary = _extract_pbix_text_summary(filename or "attachment.pbix", base64_data)
+                if pbix_summary:
+                    normalized.append({"type": "text", "text": pbix_summary})
+                else:
+                    normalized.append({
+                        "type": "text",
+                        "text": f"[Attached file: {filename or 'attachment.pbix'}] PBIX content unavailable.",
+                    })
+                changed = True
+                continue
+
+            if mime == "application/octet-stream":
+                normalized.append({
+                    "type": "text",
+                    "text": f"[Attached file: {filename or 'attachment'}] Binary attachment omitted "
+                            "from history due unsupported format.",
+                })
+                changed = True
+                continue
+
+        normalized.append(item)
+
+    return normalized, changed
 
 
 async def _run_agent(
@@ -1466,9 +1654,28 @@ async def _run_agent(
                     await pg_execute(_pool, "DELETE FROM business_requirements WHERE data_product_id = $1::uuid", data_product_id)
                     await pg_execute(_pool, "DELETE FROM semantic_views WHERE data_product_id = $1::uuid", data_product_id)
                     await pg_execute(_pool, "DELETE FROM data_descriptions WHERE data_product_id = $1::uuid", data_product_id)
+                    # Reset published markers so the new run behaves like an active in-progress lifecycle.
+                    await pg_execute(
+                        _pool,
+                        """UPDATE data_products
+                           SET status = 'discovery'::data_product_status,
+                               published_at = NULL,
+                               published_agent_fqn = NULL,
+                               state = jsonb_set(
+                                   jsonb_set(COALESCE(state, '{}'::jsonb), '{current_phase}', '"discovery"'::jsonb),
+                                   '{published}',
+                                   'false'::jsonb
+                               ),
+                               updated_at = NOW()
+                           WHERE id = $1::uuid""",
+                        data_product_id,
+                    )
                     logger.info("Invalidated prior-phase artifacts for data product %s", data_product_id)
                 except Exception as e:
                     logger.warning("Failed to invalidate prior artifacts: %s", e)
+
+            # Keep persisted phase aligned for both forced and non-forced discovery starts.
+            await _persist_phase(data_product_id, "discovery")
 
             # 1. Get data product details
             dp_info = await _get_data_product_info(data_product_id)
@@ -1695,10 +1902,20 @@ async def _run_agent(
                                                   tool_calls=_m.tool_calls))
                     else:
                         _patches.append(_RM(id=_m.id))
+            elif _m.type == "human":
+                _normalized_content, _changed = _sanitize_checkpoint_user_content_blocks(_m.content)
+                if _changed:
+                    _patches.append(
+                        HumanMessage(
+                            content=_normalized_content,
+                            id=_m.id,
+                            additional_kwargs=getattr(_m, "additional_kwargs", {}),
+                        )
+                    )
         if _patches:
             try:
                 await agent.aupdate_state(config, {"messages": _patches})
-                logger.info("Patched %d empty AI messages in checkpoint for session %s",
+                logger.info("Patched %d checkpoint messages (empty AI and/or legacy media) for session %s",
                             len(_patches), session_id)
             except (UnboundLocalError, Exception) as patch_err:
                 # LangGraph may fail internally when patching certain checkpoint states
@@ -1706,7 +1923,7 @@ async def _run_agent(
                 # can still function; empty messages may cause Gemini to complain but
                 # the fallback/safety nets will handle it.
                 logger.warning(
-                    "Failed to patch empty AI messages for session %s: %s. Continuing without patch.",
+                    "Failed to patch checkpoint messages for session %s: %s. Continuing without patch.",
                     session_id, patch_err,
                 )
 

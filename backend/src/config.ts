@@ -20,6 +20,7 @@ const envSchema = z.object({
   // Service port (BACKEND_PORT is preferred, PORT is fallback)
   BACKEND_PORT: z.coerce.number().optional(),
   PORT: z.coerce.number().default(8000),
+  BACKEND_BODY_LIMIT_MB: z.coerce.number().default(80),
   NODE_ENV: z
     .enum(['development', 'production', 'test'])
     .default('development'),
