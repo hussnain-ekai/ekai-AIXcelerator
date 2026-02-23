@@ -7,14 +7,22 @@ import {
   Chip,
   Drawer,
   IconButton,
+  Tooltip,
   Typography,
 } from '@mui/material';
 import CloseIcon from '@mui/icons-material/Close';
 import DescriptionOutlinedIcon from '@mui/icons-material/DescriptionOutlined';
 import UploadFileOutlinedIcon from '@mui/icons-material/UploadFileOutlined';
-import type { UploadedDocument } from '@/hooks/useDocuments';
+import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline';
+import AutorenewOutlinedIcon from '@mui/icons-material/AutorenewOutlined';
+import type { ContextSelectionState, UploadedDocument } from '@/hooks/useDocuments';
 
-const DRAWER_WIDTH = 420;
+const DRAWER_WIDTH = 460;
+
+interface DocumentContextLookup {
+  evidenceId: string;
+  state: ContextSelectionState;
+}
 
 interface DocumentsPanelProps {
   open: boolean;
@@ -22,6 +30,16 @@ interface DocumentsPanelProps {
   documents: UploadedDocument[];
   onUploadFiles: (files: File[]) => void;
   isUploading?: boolean;
+  uploadNotice?: string | null;
+  uploadNoticeSeverity?: 'info' | 'error';
+  currentStep?: string;
+  contextByDocumentId?: Record<string, DocumentContextLookup>;
+  onSetDocumentState?: (documentId: string, state: ContextSelectionState) => void;
+  onDeleteDocument?: (document: UploadedDocument) => void;
+  onReextractDocument?: (document: UploadedDocument) => void;
+  isUpdatingContext?: boolean;
+  isDeleting?: boolean;
+  isReextracting?: boolean;
 }
 
 function formatTimestamp(iso: string): string {
@@ -50,12 +68,38 @@ function statusColor(status: string): 'default' | 'success' | 'warning' | 'error
   return 'default';
 }
 
+function contextStateColor(
+  state: ContextSelectionState,
+): 'success' | 'warning' | 'default' | 'error' {
+  if (state === 'active') return 'success';
+  if (state === 'candidate') return 'warning';
+  if (state === 'excluded') return 'error';
+  return 'default';
+}
+
+function humanizeContextState(state: ContextSelectionState): string {
+  if (state === 'active') return 'Active';
+  if (state === 'candidate') return 'Candidate';
+  if (state === 'reference') return 'Reference';
+  return 'Excluded';
+}
+
 export function DocumentsPanel({
   open,
   onClose,
   documents,
   onUploadFiles,
   isUploading = false,
+  uploadNotice,
+  uploadNoticeSeverity = 'info',
+  currentStep,
+  contextByDocumentId = {},
+  onSetDocumentState,
+  onDeleteDocument,
+  onReextractDocument,
+  isUpdatingContext = false,
+  isDeleting = false,
+  isReextracting = false,
 }: DocumentsPanelProps): React.ReactNode {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -94,6 +138,7 @@ export function DocumentsPanel({
             </Typography>
             <Typography variant="caption" color="text.secondary">
               {documents.length} uploaded
+              {currentStep ? ` • Context step: ${currentStep}` : ''}
             </Typography>
           </Box>
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
@@ -124,6 +169,18 @@ export function DocumentsPanel({
         </Box>
 
         <Box sx={{ flex: 1, overflow: 'auto', px: 2.5, py: 2 }}>
+          {uploadNotice && (
+            <Typography
+              variant="caption"
+              sx={{
+                display: 'block',
+                mb: 1.5,
+                color: uploadNoticeSeverity === 'error' ? 'error.main' : 'text.secondary',
+              }}
+            >
+              {uploadNotice}
+            </Typography>
+          )}
           {documents.length === 0 ? (
             <Typography
               variant="body2"
@@ -134,49 +191,157 @@ export function DocumentsPanel({
             </Typography>
           ) : (
             <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
-              {documents.map((doc) => (
-                <Box
-                  key={doc.id}
-                  sx={{
-                    display: 'flex',
-                    gap: 1.25,
-                    p: 1.5,
-                    borderRadius: 1,
-                    bgcolor: 'background.paper',
-                    border: 1,
-                    borderColor: 'divider',
-                  }}
-                >
-                  <DescriptionOutlinedIcon
-                    sx={{ fontSize: 18, color: 'text.secondary', mt: 0.25 }}
-                  />
-                  <Box sx={{ minWidth: 0, flex: 1 }}>
-                    <Typography variant="body2" fontWeight={700} noWrap>
-                      {doc.filename}
-                    </Typography>
-                    <Typography
-                      variant="caption"
-                      color="text.secondary"
-                      sx={{ display: 'block', mt: 0.25 }}
-                    >
-                      {formatFileSize(doc.file_size_bytes)} • {formatTimestamp(doc.created_at)}
-                    </Typography>
-                    <Box sx={{ mt: 0.75, display: 'flex', gap: 0.75, alignItems: 'center', flexWrap: 'wrap' }}>
-                      <Chip
-                        size="small"
-                        label={doc.extraction_status || 'uploaded'}
-                        color={statusColor(doc.extraction_status || 'uploaded')}
-                        variant="outlined"
-                      />
-                      {doc.extraction_error && (
-                        <Typography variant="caption" color="error.main" noWrap>
-                          {doc.extraction_error}
+              {documents.map((doc) => {
+                const contextState = contextByDocumentId[doc.id]?.state;
+                const extractionStatus = (doc.extraction_status || '').toLowerCase();
+                const canRetryExtraction =
+                  extractionStatus === 'pending' || extractionStatus === 'failed';
+
+                return (
+                  <Box
+                    key={doc.id}
+                    sx={{
+                      display: 'flex',
+                      gap: 1.25,
+                      p: 1.5,
+                      borderRadius: 1,
+                      bgcolor: 'background.paper',
+                      border: 1,
+                      borderColor: 'divider',
+                    }}
+                  >
+                    <DescriptionOutlinedIcon
+                      sx={{ fontSize: 18, color: 'text.secondary', mt: 0.25 }}
+                    />
+                    <Box sx={{ minWidth: 0, flex: 1 }}>
+                      <Typography variant="body2" fontWeight={700} noWrap>
+                        {doc.filename}
+                      </Typography>
+                      <Typography
+                        variant="caption"
+                        color="text.secondary"
+                        sx={{ display: 'block', mt: 0.25 }}
+                      >
+                        {formatFileSize(doc.file_size_bytes)} • {formatTimestamp(doc.created_at)}
+                      </Typography>
+
+                      {doc.summary && (
+                        <Typography
+                          variant="caption"
+                          color="text.secondary"
+                          sx={{ display: 'block', mt: 0.5, lineHeight: 1.4 }}
+                        >
+                          {doc.summary}
                         </Typography>
+                      )}
+
+                      <Box
+                        sx={{
+                          mt: 0.75,
+                          display: 'flex',
+                          gap: 0.75,
+                          alignItems: 'center',
+                          flexWrap: 'wrap',
+                        }}
+                      >
+                        <Chip
+                          size="small"
+                          label={doc.extraction_status || 'uploaded'}
+                          color={statusColor(doc.extraction_status || 'uploaded')}
+                          variant="outlined"
+                        />
+
+                        {doc.doc_kind && (
+                          <Chip
+                            size="small"
+                            label={doc.doc_kind}
+                            variant="outlined"
+                            color="default"
+                          />
+                        )}
+
+                        {contextState && (
+                          <Chip
+                            size="small"
+                            label={`Step: ${humanizeContextState(contextState)}`}
+                            color={contextStateColor(contextState)}
+                            variant="outlined"
+                          />
+                        )}
+
+                        {doc.extraction_error && (
+                          <Typography variant="caption" color="error.main" noWrap>
+                            {doc.extraction_error}
+                          </Typography>
+                        )}
+                      </Box>
+
+                      {onSetDocumentState && contextState && (
+                        <Box sx={{ mt: 1, display: 'flex', gap: 0.75, flexWrap: 'wrap' }}>
+                          <Button
+                            size="small"
+                            variant={contextState === 'active' ? 'contained' : 'outlined'}
+                            disabled={isUpdatingContext}
+                            onClick={() => onSetDocumentState(doc.id, 'active')}
+                          >
+                            Use in Step
+                          </Button>
+                          <Button
+                            size="small"
+                            variant={contextState === 'reference' ? 'contained' : 'outlined'}
+                            disabled={isUpdatingContext}
+                            onClick={() => onSetDocumentState(doc.id, 'reference')}
+                          >
+                            Reference
+                          </Button>
+                          <Button
+                            size="small"
+                            color="warning"
+                            variant={contextState === 'excluded' ? 'contained' : 'outlined'}
+                            disabled={isUpdatingContext}
+                            onClick={() => onSetDocumentState(doc.id, 'excluded')}
+                          >
+                            Exclude
+                          </Button>
+                        </Box>
+                      )}
+                    </Box>
+
+                    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
+                      {onReextractDocument && canRetryExtraction && (
+                        <Tooltip title="Retry extraction">
+                          <span>
+                            <IconButton
+                              size="small"
+                              color="primary"
+                              disabled={isReextracting}
+                              onClick={() => onReextractDocument(doc)}
+                              sx={{ alignSelf: 'flex-start' }}
+                            >
+                              <AutorenewOutlinedIcon fontSize="small" />
+                            </IconButton>
+                          </span>
+                        </Tooltip>
+                      )}
+                      {onDeleteDocument && (
+                        <Tooltip title="Delete document">
+                          <span>
+                            <IconButton
+                              size="small"
+                              color="error"
+                              disabled={isDeleting}
+                              onClick={() => onDeleteDocument(doc)}
+                              sx={{ alignSelf: 'flex-start' }}
+                            >
+                              <DeleteOutlineIcon fontSize="small" />
+                            </IconButton>
+                          </span>
+                        </Tooltip>
                       )}
                     </Box>
                   </Box>
-                </Box>
-              ))}
+                );
+              })}
             </Box>
           )}
         </Box>
@@ -185,4 +350,4 @@ export function DocumentsPanel({
   );
 }
 
-export type { DocumentsPanelProps };
+export type { DocumentsPanelProps, DocumentContextLookup };

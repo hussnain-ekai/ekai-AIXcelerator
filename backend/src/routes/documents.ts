@@ -5,7 +5,40 @@ import multipart from '@fastify/multipart';
 
 import { postgresService } from '../services/postgresService.js';
 import { minioService } from '../services/minioService.js';
-import { MAX_FILE_SIZE_BYTES } from '../schemas/document.js';
+import {
+  extractDocumentContent,
+  type DocumentExtractionResult,
+} from '../services/documentExtractionService.js';
+import {
+  MAX_FILE_SIZE_BYTES,
+  applyContextParamSchema,
+  applyContextSchema,
+  contextCurrentParamSchema,
+  contextCurrentQuerySchema,
+  contextDeltaParamSchema,
+  contextDeltaQuerySchema,
+  deleteDocumentParamSchema,
+  documentContentParamSchema,
+  extractDocumentParamSchema,
+  listDocumentsParamSchema,
+  missionStepSchema,
+  uploadDocumentSchema,
+} from '../schemas/document.js';
+
+const DOCUMENTS_BUCKET = 'documents';
+
+const MISSION_STEPS = [
+  'discovery',
+  'requirements',
+  'modeling',
+  'generation',
+  'validation',
+  'publishing',
+] as const;
+
+type MissionStep = (typeof MISSION_STEPS)[number];
+
+type ContextSelectionState = 'candidate' | 'active' | 'reference' | 'excluded';
 
 interface UploadedDocumentRow {
   id: string;
@@ -19,6 +52,260 @@ interface UploadedDocumentRow {
   uploaded_by: string;
   created_at: string;
   extracted_at: string | null;
+  source_channel: string;
+  user_note: string | null;
+  doc_kind: string | null;
+  summary: string | null;
+  is_deleted: boolean;
+  deleted_at: string | null;
+  deleted_by: string | null;
+  context_version_id: string | null;
+}
+
+interface ContextVersion {
+  id: string;
+  version: number;
+}
+
+interface EvidenceSummary {
+  table_names: string[];
+  relationship_hints: string[];
+  metric_hints: string[];
+  excerpt: string | null;
+}
+
+function readFieldValue(field: unknown): string | undefined {
+  if (!field || typeof field !== 'object') return undefined;
+  const value = (field as { value?: unknown }).value;
+  return typeof value === 'string' ? value : undefined;
+}
+
+function normalizeStepName(input: string | null | undefined): MissionStep {
+  const normalized = (input ?? '').toLowerCase();
+
+  if (normalized === 'prepare' || normalized === 'transformation') {
+    return 'discovery';
+  }
+  if (normalized === 'requirements') return 'requirements';
+  if (normalized === 'modeling') return 'modeling';
+  if (normalized === 'generation') return 'generation';
+  if (normalized === 'validation') return 'validation';
+  if (normalized === 'publishing' || normalized === 'explorer') return 'publishing';
+
+  return 'discovery';
+}
+
+function inferDocumentKind(filename: string, contentType: string | null): string {
+  const lowerName = filename.toLowerCase();
+  const ext = lowerName.includes('.') ? lowerName.split('.').pop() ?? '' : '';
+  const mime = (contentType ?? '').toLowerCase();
+
+  if (
+    ext === 'sql' ||
+    ext === 'ddl' ||
+    ext === 'dbml' ||
+    mime.includes('sql') ||
+    lowerName.includes('schema') ||
+    lowerName.includes('create table')
+  ) {
+    return 'schema_definition';
+  }
+
+  if (ext === 'pbix' || lowerName.includes('power bi') || lowerName.includes('powerbi')) {
+    return 'bi_model';
+  }
+
+  if (lowerName.includes('erd') || lowerName.includes('diagram')) {
+    return 'erd_reference';
+  }
+
+  if (lowerName.includes('brd') || lowerName.includes('requirement')) {
+    return 'requirements_doc';
+  }
+
+  if (
+    lowerName.includes('glossary') ||
+    lowerName.includes('metric') ||
+    lowerName.includes('kpi') ||
+    lowerName.includes('policy')
+  ) {
+    return 'business_rules_doc';
+  }
+
+  if (ext === 'pdf' || ext === 'doc' || ext === 'docx') {
+    return 'business_doc';
+  }
+
+  if (ext === 'csv') {
+    return 'tabular_extract';
+  }
+
+  if (ext === 'txt' || ext === 'md') {
+    return 'notes';
+  }
+
+  return 'general_reference';
+}
+
+function inferStepCandidates(docKind: string, filename: string): MissionStep[] {
+  const lowerName = filename.toLowerCase();
+  const steps = new Set<MissionStep>();
+
+  switch (docKind) {
+    case 'schema_definition':
+    case 'erd_reference':
+    case 'bi_model':
+      steps.add('discovery');
+      steps.add('modeling');
+      steps.add('generation');
+      break;
+    case 'requirements_doc':
+      steps.add('requirements');
+      steps.add('modeling');
+      steps.add('generation');
+      break;
+    case 'business_rules_doc':
+      steps.add('requirements');
+      steps.add('modeling');
+      steps.add('validation');
+      break;
+    case 'business_doc':
+      steps.add('requirements');
+      steps.add('modeling');
+      break;
+    case 'tabular_extract':
+      steps.add('discovery');
+      steps.add('requirements');
+      break;
+    default:
+      steps.add('requirements');
+      break;
+  }
+
+  if (lowerName.includes('compliance') || lowerName.includes('regulation') || lowerName.includes('audit')) {
+    steps.add('validation');
+    steps.add('publishing');
+  }
+
+  return Array.from(steps);
+}
+
+function dedupeStrings(values: string[]): string[] {
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+
+  for (const value of values) {
+    const trimmed = value.trim();
+    if (!trimmed) continue;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(trimmed);
+  }
+
+  return deduped;
+}
+
+function extractEvidenceSummary(text: string | null): EvidenceSummary {
+  if (!text) {
+    return {
+      table_names: [],
+      relationship_hints: [],
+      metric_hints: [],
+      excerpt: null,
+    };
+  }
+
+  const tableNames = dedupeStrings(
+    Array.from(text.matchAll(/create\s+table\s+(?:if\s+not\s+exists\s+)?([A-Za-z0-9_."`]+)/gi)).map(
+      (match) => match[1] ?? '',
+    ),
+  ).slice(0, 25);
+
+  const relationshipHints = dedupeStrings(
+    Array.from(text.matchAll(/references\s+([A-Za-z0-9_."`]+)/gi)).map((match) => match[1] ?? ''),
+  ).slice(0, 25);
+
+  const metricHints = dedupeStrings(
+    Array.from(text.matchAll(/\b(kpi|metric|measure|sla|threshold|target)\b[^\n]{0,120}/gi)).map(
+      (match) => match[0] ?? '',
+    ),
+  ).slice(0, 20);
+
+  const excerpt = text.slice(0, 1200);
+
+  return {
+    table_names: tableNames,
+    relationship_hints: relationshipHints,
+    metric_hints: metricHints,
+    excerpt,
+  };
+}
+
+function summarizeDocument(
+  docKind: string,
+  evidenceSummary: EvidenceSummary,
+  textContent: string | null,
+): string {
+  if (docKind === 'schema_definition') {
+    const tableCount = evidenceSummary.table_names.length;
+    const relCount = evidenceSummary.relationship_hints.length;
+    return `Schema-focused document: ${tableCount} table references and ${relCount} relationship hints detected.`;
+  }
+
+  if (docKind === 'bi_model') {
+    return 'BI model file detected. Use this in discovery/modeling to cross-check entities, measures, and relationships.';
+  }
+
+  if (docKind === 'requirements_doc') {
+    const metricCount = evidenceSummary.metric_hints.length;
+    return `Requirements-oriented document detected. ${metricCount} potential KPI/metric hints extracted.`;
+  }
+
+  if (textContent) {
+    const firstLine = textContent
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => line.length > 0);
+
+    if (firstLine) {
+      return firstLine.slice(0, 240);
+    }
+  }
+
+  return 'Reference document uploaded. Review and activate relevant evidence by mission step before regeneration.';
+}
+
+function summarizeExtractionWarnings(warnings: string[]): string | null {
+  if (warnings.length === 0) return null;
+  const compact = warnings
+    .map((warning) => warning.replace(/\s+/g, ' ').trim())
+    .filter((warning) => warning.length > 0)
+    .slice(0, 6)
+    .join(' | ');
+  if (!compact) return null;
+  return compact.slice(0, 2000);
+}
+
+function buildEvidencePayload(
+  evidenceSummary: EvidenceSummary,
+  extraction: DocumentExtractionResult,
+): Record<string, unknown> {
+  return {
+    ...evidenceSummary,
+    extraction: {
+      method: extraction.extractionMethod,
+      status: extraction.extractionStatus,
+      warnings: extraction.extractionWarnings,
+      metadata: extraction.extractionMetadata,
+    },
+  };
+}
+
+function isRecoverableContextSchemaError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const code = (err as { code?: unknown }).code;
+  return code === '42P01' || code === '42703' || code === '23503';
 }
 
 export async function documentRoutes(app: FastifyInstance): Promise<void> {
@@ -30,143 +317,906 @@ export async function documentRoutes(app: FastifyInstance): Promise<void> {
     },
   });
 
-  /**
-   * POST /documents/upload
-   * Multipart file upload. Stores the file in MinIO (documents/uploads/)
-   * and creates a record in uploaded_documents.
-   *
-   * The form must include:
-   *   - file: the uploaded file (max 50MB)
-   *   - data_product_id: UUID of the data product
-   */
-  app.post(
-    '/upload',
-    async (request: FastifyRequest, reply) => {
-      const { snowflakeUser } = request.user;
-
-      const data = await request.file();
-
-      if (!data) {
-        return reply.status(400).send({
-          error: 'VALIDATION_ERROR',
-          message: 'No file uploaded. Send a multipart form with a "file" field.',
-        });
-      }
-
-      // Read data_product_id from form fields
-      const fields = data.fields;
-      const dataProductIdField = fields['data_product_id'];
-
-      let dataProductId: string | undefined;
-
-      if (
-        dataProductIdField &&
-        'value' in dataProductIdField &&
-        typeof dataProductIdField.value === 'string'
-      ) {
-        dataProductId = dataProductIdField.value;
-      }
-
-      if (!dataProductId) {
-        return reply.status(400).send({
-          error: 'VALIDATION_ERROR',
-          message: 'Missing required field: data_product_id',
-        });
-      }
-
-      // Verify the data product exists (RLS enforces workspace isolation)
-      const dpCheck = await postgresService.query(
-        'SELECT id FROM data_products WHERE id = $1',
-        [dataProductId],
+  async function createContextVersion(
+    dataProductId: string,
+    snowflakeUser: string,
+    reason: string,
+    summary: Record<string, unknown>,
+  ): Promise<ContextVersion | null> {
+    try {
+      const result = await postgresService.query(
+        `INSERT INTO context_versions
+           (data_product_id, version, reason, changed_by, change_summary)
+         VALUES ($1::uuid, 1, $2, $3, $4::jsonb)
+         RETURNING id, version`,
+        [dataProductId, reason, snowflakeUser, JSON.stringify(summary)],
         snowflakeUser,
       );
 
-      if (dpCheck.rowCount === 0) {
-        return reply.status(404).send({
-          error: 'NOT_FOUND',
-          message: 'Data product not found',
-        });
+      const row = result.rows[0] as { id: string; version: number } | undefined;
+      if (!row) return null;
+      return { id: row.id, version: Number(row.version) };
+    } catch (err) {
+      if (isRecoverableContextSchemaError(err)) {
+        app.log.warn(
+          { err, dataProductId },
+          'Context schema not available yet; proceeding without version tracking',
+        );
+        return null;
       }
+      throw err;
+    }
+  }
 
-      const filename = data.filename;
-      const contentType = data.mimetype;
-
-      // Consume the file stream into a buffer
-      const chunks: Buffer[] = [];
-      for await (const chunk of data.file) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-      }
-      const fileBuffer = Buffer.concat(chunks);
-
-      // Check if the file was truncated (exceeded limit)
-      if (data.file.truncated) {
-        return reply.status(413).send({
-          error: 'FILE_TOO_LARGE',
-          message: `File exceeds maximum size of ${MAX_FILE_SIZE_BYTES / (1024 * 1024)}MB`,
-        });
-      }
-
-      const fileSize = fileBuffer.length;
-      const documentId = crypto.randomUUID();
-      const minioPath = `${dataProductId}/uploads/${documentId}/${filename}`;
-
-      // Upload to MinIO
-      await minioService.uploadFile(
-        'documents',
-        minioPath,
-        fileBuffer,
-        contentType,
-      );
-
-      // Create database record
-      const insertResult = await postgresService.query(
-        `INSERT INTO uploaded_documents
-           (id, data_product_id, filename, minio_path, file_size_bytes,
-            content_type, uploaded_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         RETURNING id, filename, file_size_bytes, content_type, created_at`,
+  async function upsertContextSelection(
+    dataProductId: string,
+    step: MissionStep,
+    documentId: string,
+    evidenceId: string,
+    state: ContextSelectionState,
+    contextVersionId: string | null,
+    snowflakeUser: string,
+  ): Promise<void> {
+    try {
+      await postgresService.query(
+        `INSERT INTO context_step_selections
+           (data_product_id, step_name, document_id, evidence_id, state, selected_by, context_version_id)
+         VALUES ($1::uuid, $2, $3::uuid, $4::uuid, $5, $6, $7::uuid)
+         ON CONFLICT (data_product_id, step_name, evidence_id)
+         DO UPDATE
+           SET state = EXCLUDED.state,
+               selected_by = EXCLUDED.selected_by,
+               context_version_id = EXCLUDED.context_version_id,
+               updated_at = now()`,
         [
-          documentId,
           dataProductId,
-          filename,
-          minioPath,
-          fileSize,
-          contentType,
+          step,
+          documentId,
+          evidenceId,
+          state,
           snowflakeUser,
+          contextVersionId,
+        ],
+        snowflakeUser,
+      );
+    } catch (err) {
+      if (isRecoverableContextSchemaError(err)) return;
+      throw err;
+    }
+  }
+
+  /**
+   * POST /documents/upload
+   * Multipart file upload from any source channel (create flow, chat attachment,
+   * documents panel). Stores file in MinIO and records evidence/context metadata.
+   */
+  app.post('/upload', async (request: FastifyRequest, reply) => {
+    const { snowflakeUser } = request.user;
+    const data = await request.file();
+
+    if (!data) {
+      return reply.status(400).send({
+        error: 'VALIDATION_ERROR',
+        message: 'No file uploaded. Send a multipart form with a "file" field.',
+      });
+    }
+
+    const filename = data.filename;
+    const contentType = data.mimetype;
+
+    const chunks: Buffer[] = [];
+    for await (const chunk of data.file) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    const fileBuffer = Buffer.concat(chunks);
+
+    if (data.file.truncated) {
+      return reply.status(413).send({
+        error: 'FILE_TOO_LARGE',
+        message: `File exceeds maximum size of ${MAX_FILE_SIZE_BYTES / (1024 * 1024)}MB`,
+      });
+    }
+
+    // Parse multipart metadata only after streaming the file so fields appended after
+    // the file part are available for normal-sized uploads.
+    const fields = data.fields as Record<string, unknown>;
+    const rawUploadInput = {
+      data_product_id: readFieldValue(fields['data_product_id']),
+      source_channel: readFieldValue(fields['source_channel']),
+      user_note: readFieldValue(fields['user_note']),
+      auto_activate_step: readFieldValue(fields['auto_activate_step']),
+    };
+
+    const parsedUploadInput = uploadDocumentSchema.safeParse(rawUploadInput);
+    if (!parsedUploadInput.success) {
+      return reply.status(400).send({
+        error: 'VALIDATION_ERROR',
+        message: 'Invalid upload metadata',
+        details: parsedUploadInput.error.flatten().fieldErrors,
+      });
+    }
+
+    const {
+      data_product_id: dataProductId,
+      source_channel: sourceChannel,
+      user_note: userNote,
+      auto_activate_step: autoActivateStep,
+    } = parsedUploadInput.data;
+
+    const dpCheck = await postgresService.query(
+      'SELECT id FROM data_products WHERE id = $1::uuid',
+      [dataProductId],
+      snowflakeUser,
+    );
+
+    if (dpCheck.rowCount === 0) {
+      return reply.status(404).send({
+        error: 'NOT_FOUND',
+        message: 'Data product not found',
+      });
+    }
+
+    const fileSize = fileBuffer.length;
+    const documentId = crypto.randomUUID();
+    const minioPath = `${dataProductId}/uploads/${documentId}/${filename}`;
+
+    const docKind = inferDocumentKind(filename, contentType);
+    const stepCandidates = inferStepCandidates(docKind, filename);
+    const effectiveStepCandidates =
+      autoActivateStep && !stepCandidates.includes(autoActivateStep)
+        ? [...stepCandidates, autoActivateStep]
+        : stepCandidates;
+    const extraction = await extractDocumentContent({
+      dataProductId,
+      documentId,
+      filename,
+      contentType,
+      buffer: fileBuffer,
+    });
+    const extractedText = extraction.extractedText;
+    const evidenceSummary = extractEvidenceSummary(extractedText);
+    const summary =
+      extraction.summaryHint ?? summarizeDocument(docKind, evidenceSummary, extractedText);
+    const extractionStatus = extraction.extractionStatus;
+    const extractionError =
+      extractionStatus === 'completed'
+        ? null
+        : summarizeExtractionWarnings(extraction.extractionWarnings);
+    const extractedAt = extractionStatus === 'completed' ? new Date().toISOString() : null;
+
+    await minioService.uploadFile(DOCUMENTS_BUCKET, minioPath, fileBuffer, contentType);
+
+    const contextVersion = await createContextVersion(
+      dataProductId,
+      snowflakeUser,
+      'document_uploaded',
+      {
+        document_id: documentId,
+        source_channel: sourceChannel,
+        step_candidates: effectiveStepCandidates,
+        extraction_method: extraction.extractionMethod,
+        extraction_status: extractionStatus,
+      },
+    );
+
+    const insertResult = await postgresService.query(
+      `INSERT INTO uploaded_documents
+         (id, data_product_id, filename, minio_path, file_size_bytes,
+          content_type, extraction_status, extraction_error, extracted_content, extracted_at,
+          uploaded_by, source_channel, user_note, doc_kind, summary, context_version_id)
+       VALUES ($1::uuid, $2::uuid, $3, $4, $5,
+               $6, $7, $8, $9, $10,
+               $11, $12, $13, $14, $15, $16::uuid)
+       RETURNING id, filename, file_size_bytes, content_type, created_at, extraction_status`,
+      [
+        documentId,
+        dataProductId,
+        filename,
+        minioPath,
+        fileSize,
+        contentType,
+        extractionStatus,
+        extractionError,
+        extractedText,
+        extractedAt,
+        snowflakeUser,
+        sourceChannel,
+        userNote ?? null,
+        docKind,
+        summary,
+        contextVersion?.id ?? null,
+      ],
+      snowflakeUser,
+    );
+
+    const doc = insertResult.rows[0] as
+      | {
+          id: string;
+          filename: string;
+          file_size_bytes: number;
+          content_type: string;
+          created_at: string;
+          extraction_status: string;
+        }
+      | undefined;
+
+    if (!doc) {
+      return reply.status(500).send({
+        error: 'INTERNAL_ERROR',
+        message: 'Failed to create document record',
+      });
+    }
+
+    let evidenceId: string | null = null;
+
+    try {
+      const evidenceResult = await postgresService.query(
+        `INSERT INTO document_evidence
+           (data_product_id, document_id, evidence_type, step_candidates, impact_scope, payload, provenance)
+         VALUES ($1::uuid, $2::uuid, $3, $4::text[], $5::text[], $6::jsonb, $7::jsonb)
+         RETURNING id`,
+        [
+          dataProductId,
+          documentId,
+          'document_summary',
+          effectiveStepCandidates,
+          effectiveStepCandidates,
+          JSON.stringify(buildEvidencePayload(evidenceSummary, extraction)),
+          JSON.stringify({
+            source_channel: sourceChannel,
+            filename,
+            content_type: contentType,
+            extraction_method: extraction.extractionMethod,
+          }),
         ],
         snowflakeUser,
       );
 
-      const doc = insertResult.rows[0] as
+      evidenceId = (evidenceResult.rows[0] as { id: string } | undefined)?.id ?? null;
+    } catch (err) {
+      if (!isRecoverableContextSchemaError(err)) {
+        throw err;
+      }
+    }
+
+    if (evidenceId) {
+      const activeStep = autoActivateStep
+        ? missionStepSchema.safeParse(autoActivateStep).success
+          ? (autoActivateStep as MissionStep)
+          : undefined
+        : undefined;
+
+      for (const step of effectiveStepCandidates) {
+        const state: ContextSelectionState = activeStep === step ? 'active' : 'candidate';
+        await upsertContextSelection(
+          dataProductId,
+          step,
+          documentId,
+          evidenceId,
+          state,
+          contextVersion?.id ?? null,
+          snowflakeUser,
+        );
+      }
+    }
+
+    return reply.status(201).send({
+      id: doc.id,
+      filename: doc.filename,
+      size: doc.file_size_bytes,
+      content_type: doc.content_type,
+      created_at: doc.created_at,
+      extraction_status: doc.extraction_status,
+      source_channel: sourceChannel,
+      doc_kind: docKind,
+      summary,
+      extraction_method: extraction.extractionMethod,
+      step_candidates: effectiveStepCandidates,
+      context_version: contextVersion,
+    });
+  });
+
+  /**
+   * POST /documents/:id/extract
+   * Trigger extraction for an existing uploaded document.
+   */
+  app.post(
+    '/:id/extract',
+    async (request: FastifyRequest<{ Params: { id: string } }>, reply) => {
+      const paramResult = extractDocumentParamSchema.safeParse(request.params);
+      if (!paramResult.success) {
+        return reply.status(400).send({
+          error: 'VALIDATION_ERROR',
+          message: 'Invalid document id',
+        });
+      }
+
+      const { id } = paramResult.data;
+      const { snowflakeUser } = request.user;
+
+      const result = await postgresService.query(
+        `SELECT id, data_product_id, filename, minio_path, content_type, extraction_status, doc_kind
+         FROM uploaded_documents
+         WHERE id = $1::uuid AND is_deleted = false`,
+        [id],
+        snowflakeUser,
+      );
+
+      const doc = result.rows[0] as
         | {
             id: string;
+            data_product_id: string;
             filename: string;
-            file_size_bytes: number;
-            content_type: string;
-            created_at: string;
+            minio_path: string;
+            content_type: string | null;
+            extraction_status: string;
+            doc_kind: string | null;
           }
         | undefined;
 
       if (!doc) {
-        return reply.status(500).send({
-          error: 'INTERNAL_ERROR',
-          message: 'Failed to create document record',
+        return reply.status(404).send({
+          error: 'NOT_FOUND',
+          message: 'Document not found',
         });
       }
 
-      return reply.status(201).send({
-        id: doc.id,
-        filename: doc.filename,
-        size: doc.file_size_bytes,
-        content_type: doc.content_type,
-        created_at: doc.created_at,
+      if (doc.extraction_status === 'processing') {
+        return reply.status(409).send({
+          error: 'CONFLICT',
+          message: 'Extraction is already in progress',
+        });
+      }
+
+      await postgresService.query(
+        `UPDATE uploaded_documents
+         SET extraction_status = 'processing', extraction_error = NULL
+         WHERE id = $1::uuid`,
+        [id],
+        snowflakeUser,
+      );
+
+      try {
+        const fileBuffer = await minioService.getFile(DOCUMENTS_BUCKET, doc.minio_path);
+        const extraction = await extractDocumentContent({
+          dataProductId: doc.data_product_id,
+          documentId: doc.id,
+          filename: doc.filename,
+          contentType: doc.content_type,
+          buffer: fileBuffer,
+        });
+        const extractionError =
+          extraction.extractionStatus === 'completed'
+            ? null
+            : summarizeExtractionWarnings(extraction.extractionWarnings);
+        const extractedText = extraction.extractedText;
+        const docKind = doc.doc_kind ?? inferDocumentKind(doc.filename, doc.content_type);
+        const evidenceSummary = extractEvidenceSummary(extractedText);
+        const summary =
+          extraction.summaryHint ?? summarizeDocument(docKind, evidenceSummary, extractedText);
+        const contextVersion = await createContextVersion(
+          doc.data_product_id,
+          snowflakeUser,
+          'document_reextracted',
+          {
+            document_id: doc.id,
+            extraction_method: extraction.extractionMethod,
+            extraction_status: extraction.extractionStatus,
+          },
+        );
+
+        await postgresService.query(
+          `UPDATE uploaded_documents
+           SET extraction_status = $2::extraction_status,
+               extracted_content = $3,
+               extraction_error = $4,
+               summary = COALESCE($5, summary),
+               context_version_id = $6::uuid,
+               extracted_at = CASE
+                 WHEN ($2::extraction_status)::text IN ('completed', 'failed') THEN now()
+                 ELSE extracted_at
+               END
+           WHERE id = $1::uuid`,
+          [
+            id,
+            extraction.extractionStatus,
+            extractedText,
+            extractionError,
+            summary,
+            contextVersion?.id ?? null,
+          ],
+          snowflakeUser,
+        );
+
+        try {
+          await postgresService.query(
+            `UPDATE document_evidence
+             SET payload = $3::jsonb,
+                 provenance = COALESCE(provenance, '{}'::jsonb) || $4::jsonb
+             WHERE data_product_id = $1::uuid
+               AND document_id = $2::uuid`,
+            [
+              doc.data_product_id,
+              doc.id,
+              JSON.stringify(buildEvidencePayload(evidenceSummary, extraction)),
+              JSON.stringify({
+                extraction_method: extraction.extractionMethod,
+                extraction_status: extraction.extractionStatus,
+                updated_at: new Date().toISOString(),
+              }),
+            ],
+            snowflakeUser,
+          );
+        } catch (err) {
+          if (!isRecoverableContextSchemaError(err)) {
+            throw err;
+          }
+        }
+
+        try {
+          await postgresService.query(
+            `UPDATE context_step_selections
+             SET context_version_id = $3::uuid,
+                 updated_at = now()
+             WHERE data_product_id = $1::uuid
+               AND document_id = $2::uuid`,
+            [doc.data_product_id, doc.id, contextVersion?.id ?? null],
+            snowflakeUser,
+          );
+        } catch (err) {
+          if (!isRecoverableContextSchemaError(err)) {
+            throw err;
+          }
+        }
+
+        if (extraction.extractionStatus === 'failed') {
+          return reply.status(202).send({
+            status: 'failed',
+            message: extractionError ?? 'Extraction failed',
+            extraction_method: extraction.extractionMethod,
+            warnings: extraction.extractionWarnings,
+            context_version: contextVersion,
+          });
+        }
+
+        if (extraction.extractionStatus === 'pending') {
+          return reply.status(202).send({
+            status: 'pending',
+            message: extraction.summaryHint ?? 'Extraction did not produce text yet',
+            extraction_method: extraction.extractionMethod,
+            warnings: extraction.extractionWarnings,
+            context_version: contextVersion,
+          });
+        }
+
+        return reply.status(202).send({
+          status: 'completed',
+          extracted_chars: extractedText?.length ?? 0,
+          extraction_method: extraction.extractionMethod,
+          warnings: extraction.extractionWarnings,
+          summary,
+          context_version: contextVersion,
+        });
+      } catch (err) {
+        app.log.error({ err, documentId: id }, 'Document extraction failed');
+
+        await postgresService.query(
+          `UPDATE uploaded_documents
+           SET extraction_status = 'failed', extraction_error = $2
+           WHERE id = $1::uuid`,
+          [id, 'Extraction failed due to processing error'],
+          snowflakeUser,
+        );
+
+        return reply.status(500).send({
+          error: 'EXTRACTION_FAILED',
+          message: 'Failed to extract document content',
+        });
+      }
+    },
+  );
+
+  /**
+   * GET /documents/context/:dataProductId/current
+   * Return context selections grouped by mission step.
+   */
+  app.get(
+    '/context/:dataProductId/current',
+    async (
+      request: FastifyRequest<{
+        Params: { dataProductId: string };
+        Querystring: { step?: string };
+      }>,
+      reply,
+    ) => {
+      const paramResult = contextCurrentParamSchema.safeParse(request.params);
+      if (!paramResult.success) {
+        return reply.status(400).send({
+          error: 'VALIDATION_ERROR',
+          message: 'Invalid data product id',
+        });
+      }
+
+      const queryResult = contextCurrentQuerySchema.safeParse(request.query);
+      if (!queryResult.success) {
+        return reply.status(400).send({
+          error: 'VALIDATION_ERROR',
+          message: 'Invalid context query',
+          details: queryResult.error.flatten().fieldErrors,
+        });
+      }
+
+      const { dataProductId } = paramResult.data;
+      const { step } = queryResult.data;
+      const { snowflakeUser } = request.user;
+
+      let latestContextVersion: { id: string; version: number } | null = null;
+
+      try {
+        const latestResult = await postgresService.query(
+          `SELECT id, version
+           FROM context_versions
+           WHERE data_product_id = $1::uuid
+           ORDER BY version DESC
+           LIMIT 1`,
+          [dataProductId],
+          snowflakeUser,
+        );
+
+        const latest = latestResult.rows[0] as { id: string; version: number } | undefined;
+        if (latest) {
+          latestContextVersion = { id: latest.id, version: Number(latest.version) };
+        }
+      } catch (err) {
+        if (!isRecoverableContextSchemaError(err)) {
+          throw err;
+        }
+      }
+
+      const phaseResult = await postgresService.query(
+        `SELECT state->>'current_phase' AS current_phase
+         FROM data_products
+         WHERE id = $1::uuid`,
+        [dataProductId],
+        snowflakeUser,
+      );
+
+      const currentPhase =
+        (phaseResult.rows[0] as { current_phase?: string } | undefined)?.current_phase ?? 'discovery';
+      const currentStep = normalizeStepName(currentPhase);
+
+      const steps: Record<
+        MissionStep,
+        {
+          active: Array<Record<string, unknown>>;
+          candidate: Array<Record<string, unknown>>;
+          reference: Array<Record<string, unknown>>;
+          excluded: Array<Record<string, unknown>>;
+        }
+      > = {
+        discovery: { active: [], candidate: [], reference: [], excluded: [] },
+        requirements: { active: [], candidate: [], reference: [], excluded: [] },
+        modeling: { active: [], candidate: [], reference: [], excluded: [] },
+        generation: { active: [], candidate: [], reference: [], excluded: [] },
+        validation: { active: [], candidate: [], reference: [], excluded: [] },
+        publishing: { active: [], candidate: [], reference: [], excluded: [] },
+      };
+
+      try {
+        const whereStep = step ? 'AND cs.step_name = $2' : '';
+        const params: unknown[] = step ? [dataProductId, step] : [dataProductId];
+
+        const rows = await postgresService.query(
+          `SELECT
+             cs.step_name,
+             cs.state,
+             cs.updated_at,
+             de.id AS evidence_id,
+             de.evidence_type,
+             de.payload,
+             de.step_candidates,
+             de.impact_scope,
+             ud.id AS document_id,
+             ud.filename,
+             ud.doc_kind,
+             ud.summary,
+             ud.source_channel,
+             ud.created_at AS document_created_at
+           FROM context_step_selections cs
+           JOIN document_evidence de ON de.id = cs.evidence_id
+           JOIN uploaded_documents ud ON ud.id = cs.document_id
+           WHERE cs.data_product_id = $1::uuid
+             ${whereStep}
+             AND ud.is_deleted = false
+           ORDER BY cs.step_name, cs.updated_at DESC`,
+          params,
+          snowflakeUser,
+        );
+
+        for (const rawRow of rows.rows) {
+          const row = rawRow as {
+            step_name: string;
+            state: ContextSelectionState;
+            updated_at: string;
+            evidence_id: string;
+            evidence_type: string;
+            payload: Record<string, unknown>;
+            step_candidates: string[];
+            impact_scope: string[];
+            document_id: string;
+            filename: string;
+            doc_kind: string | null;
+            summary: string | null;
+            source_channel: string;
+            document_created_at: string;
+          };
+
+          const stepName = normalizeStepName(row.step_name);
+          const state = row.state;
+          if (!steps[stepName]) continue;
+
+          const item = {
+            evidence_id: row.evidence_id,
+            evidence_type: row.evidence_type,
+            payload: row.payload,
+            step_candidates: row.step_candidates,
+            impact_scope: row.impact_scope,
+            document: {
+              id: row.document_id,
+              filename: row.filename,
+              doc_kind: row.doc_kind,
+              summary: row.summary,
+              source_channel: row.source_channel,
+              created_at: row.document_created_at,
+            },
+            updated_at: row.updated_at,
+          };
+
+          steps[stepName][state].push(item);
+        }
+      } catch (err) {
+        if (!isRecoverableContextSchemaError(err)) {
+          throw err;
+        }
+      }
+
+      if (step) {
+        const parsedStep = missionStepSchema.safeParse(step);
+        if (!parsedStep.success) {
+          return reply.status(400).send({
+            error: 'VALIDATION_ERROR',
+            message: 'Invalid mission step',
+          });
+        }
+
+        return reply.send({
+          data_product_id: dataProductId,
+          current_step: currentStep,
+          requested_step: parsedStep.data,
+          context_version: latestContextVersion,
+          step: {
+            [parsedStep.data]: steps[parsedStep.data],
+          },
+        });
+      }
+
+      return reply.send({
+        data_product_id: dataProductId,
+        current_step: currentStep,
+        context_version: latestContextVersion,
+        steps,
       });
     },
   );
 
   /**
+   * GET /documents/context/:dataProductId/delta
+   * Return context version changes between two points.
+   */
+  app.get(
+    '/context/:dataProductId/delta',
+    async (
+      request: FastifyRequest<{
+        Params: { dataProductId: string };
+        Querystring: { from_version?: number; to_version?: number };
+      }>,
+      reply,
+    ) => {
+      const paramResult = contextDeltaParamSchema.safeParse(request.params);
+      if (!paramResult.success) {
+        return reply.status(400).send({
+          error: 'VALIDATION_ERROR',
+          message: 'Invalid data product id',
+        });
+      }
+
+      const queryResult = contextDeltaQuerySchema.safeParse(request.query);
+      if (!queryResult.success) {
+        return reply.status(400).send({
+          error: 'VALIDATION_ERROR',
+          message: 'Invalid delta query',
+          details: queryResult.error.flatten().fieldErrors,
+        });
+      }
+
+      const { dataProductId } = paramResult.data;
+      const { from_version: fromVersionRaw, to_version: toVersionRaw } = queryResult.data;
+      const { snowflakeUser } = request.user;
+
+      try {
+        const versionRows = await postgresService.query(
+          `SELECT id, version, reason, changed_by, change_summary, created_at
+           FROM context_versions
+           WHERE data_product_id = $1::uuid
+           ORDER BY version DESC
+           LIMIT 100`,
+          [dataProductId],
+          snowflakeUser,
+        );
+
+        const versions = versionRows.rows as Array<{
+          id: string;
+          version: number;
+          reason: string;
+          changed_by: string;
+          change_summary: Record<string, unknown>;
+          created_at: string;
+        }>;
+
+        if (versions.length === 0) {
+          return reply.send({
+            data_product_id: dataProductId,
+            from_version: null,
+            to_version: null,
+            changes: [],
+          });
+        }
+
+        const maxVersion = Number(versions[0]?.version ?? 1);
+        const toVersion = toVersionRaw ?? maxVersion;
+        const fromVersion = fromVersionRaw ?? Math.max(1, toVersion - 1);
+
+        const bounded = versions
+          .filter((row) => Number(row.version) >= fromVersion && Number(row.version) <= toVersion)
+          .sort((a, b) => Number(a.version) - Number(b.version));
+
+        return reply.send({
+          data_product_id: dataProductId,
+          from_version: fromVersion,
+          to_version: toVersion,
+          changes: bounded,
+        });
+      } catch (err) {
+        if (isRecoverableContextSchemaError(err)) {
+          return reply.send({
+            data_product_id: dataProductId,
+            from_version: null,
+            to_version: null,
+            changes: [],
+            note: 'Context version tables are not available yet. Apply migration first.',
+          });
+        }
+        throw err;
+      }
+    },
+  );
+
+  /**
+   * POST /documents/context/:dataProductId/apply
+   * User-driven activation/exclusion updates per mission step.
+   */
+  app.post(
+    '/context/:dataProductId/apply',
+    async (
+      request: FastifyRequest<{
+        Params: { dataProductId: string };
+        Body: {
+          step: MissionStep;
+          reason?: string;
+          updates: Array<{ evidence_id: string; state: ContextSelectionState }>;
+        };
+      }>,
+      reply,
+    ) => {
+      const paramResult = applyContextParamSchema.safeParse(request.params);
+      if (!paramResult.success) {
+        return reply.status(400).send({
+          error: 'VALIDATION_ERROR',
+          message: 'Invalid data product id',
+        });
+      }
+
+      const bodyResult = applyContextSchema.safeParse(request.body);
+      if (!bodyResult.success) {
+        return reply.status(400).send({
+          error: 'VALIDATION_ERROR',
+          message: 'Invalid context update payload',
+          details: bodyResult.error.flatten().fieldErrors,
+        });
+      }
+
+      const { dataProductId } = paramResult.data;
+      const { step, reason, updates } = bodyResult.data;
+      const { snowflakeUser } = request.user;
+
+      try {
+        const evidenceIds = updates.map((update) => update.evidence_id);
+        const evidenceRows = await postgresService.query(
+          `SELECT de.id, de.document_id
+           FROM document_evidence de
+           JOIN uploaded_documents ud ON ud.id = de.document_id
+           WHERE de.data_product_id = $1::uuid
+             AND de.id = ANY($2::uuid[])
+             AND ud.is_deleted = false`,
+          [dataProductId, evidenceIds],
+          snowflakeUser,
+        );
+
+        const evidenceMap = new Map<string, string>();
+        for (const row of evidenceRows.rows as Array<{ id: string; document_id: string }>) {
+          evidenceMap.set(row.id, row.document_id);
+        }
+
+        const missing = evidenceIds.filter((id) => !evidenceMap.has(id));
+        if (missing.length > 0) {
+          return reply.status(400).send({
+            error: 'VALIDATION_ERROR',
+            message: 'One or more evidence ids are invalid for this data product',
+            details: { missing_evidence_ids: missing },
+          });
+        }
+
+        const contextVersion = await createContextVersion(
+          dataProductId,
+          snowflakeUser,
+          'context_applied',
+          {
+            step,
+            updates: updates.map((update) => ({
+              evidence_id: update.evidence_id,
+              state: update.state,
+            })),
+            reason: reason ?? null,
+          },
+        );
+
+        for (const update of updates) {
+          const documentId = evidenceMap.get(update.evidence_id);
+          if (!documentId) continue;
+
+          await upsertContextSelection(
+            dataProductId,
+            step,
+            documentId,
+            update.evidence_id,
+            update.state,
+            contextVersion?.id ?? null,
+            snowflakeUser,
+          );
+        }
+
+        return reply.send({
+          data_product_id: dataProductId,
+          step,
+          applied: updates.length,
+          context_version: contextVersion,
+        });
+      } catch (err) {
+        if (isRecoverableContextSchemaError(err)) {
+          return reply.status(409).send({
+            error: 'CONTEXT_SCHEMA_MISSING',
+            message: 'Document context tables are not available yet. Apply migration first.',
+          });
+        }
+
+        throw err;
+      }
+    },
+  );
+
+  /**
    * GET /documents/:dataProductId
-   * List all uploaded documents for a data product.
+   * List all non-deleted uploaded documents for a data product.
    */
   app.get(
     '/:dataProductId',
@@ -174,16 +1224,27 @@ export async function documentRoutes(app: FastifyInstance): Promise<void> {
       request: FastifyRequest<{ Params: { dataProductId: string } }>,
       reply,
     ) => {
-      const { dataProductId } = request.params;
+      const paramResult = listDocumentsParamSchema.safeParse(request.params);
+      if (!paramResult.success) {
+        return reply.status(400).send({
+          error: 'VALIDATION_ERROR',
+          message: 'Invalid data product id',
+        });
+      }
+
+      const { dataProductId } = paramResult.data;
       const { snowflakeUser } = request.user;
 
       const result = await postgresService.query(
         `SELECT
            id, data_product_id, filename, minio_path, file_size_bytes,
            content_type, extraction_status, extraction_error,
-           uploaded_by, created_at, extracted_at
+           uploaded_by, created_at, extracted_at,
+           source_channel, user_note, doc_kind, summary,
+           is_deleted, deleted_at, deleted_by, context_version_id
          FROM uploaded_documents
-         WHERE data_product_id = $1
+         WHERE data_product_id = $1::uuid
+           AND is_deleted = false
          ORDER BY created_at DESC`,
         [dataProductId],
         snowflakeUser,
@@ -197,7 +1258,7 @@ export async function documentRoutes(app: FastifyInstance): Promise<void> {
 
   /**
    * GET /documents/:id/content
-   * Get the extracted text content of an uploaded document.
+   * Get extracted text content of an uploaded document.
    */
   app.get(
     '/:id/content',
@@ -205,14 +1266,23 @@ export async function documentRoutes(app: FastifyInstance): Promise<void> {
       request: FastifyRequest<{ Params: { id: string } }>,
       reply,
     ) => {
-      const { id } = request.params;
+      const paramResult = documentContentParamSchema.safeParse(request.params);
+      if (!paramResult.success) {
+        return reply.status(400).send({
+          error: 'VALIDATION_ERROR',
+          message: 'Invalid document id',
+        });
+      }
+
+      const { id } = paramResult.data;
       const { snowflakeUser } = request.user;
 
       const result = await postgresService.query(
         `SELECT
            id, filename, extracted_content, extraction_status
          FROM uploaded_documents
-         WHERE id = $1`,
+         WHERE id = $1::uuid
+           AND is_deleted = false`,
         [id],
         snowflakeUser,
       );
@@ -246,6 +1316,132 @@ export async function documentRoutes(app: FastifyInstance): Promise<void> {
         filename: doc.filename,
         content: doc.extracted_content,
         extraction_status: doc.extraction_status,
+      });
+    },
+  );
+
+  /**
+   * DELETE /documents/:id
+   * Soft delete document and exclude its evidence from active context.
+   */
+  app.delete(
+    '/:id',
+    async (request: FastifyRequest<{ Params: { id: string } }>, reply) => {
+      const paramResult = deleteDocumentParamSchema.safeParse(request.params);
+      if (!paramResult.success) {
+        return reply.status(400).send({
+          error: 'VALIDATION_ERROR',
+          message: 'Invalid document id',
+        });
+      }
+
+      const { id } = paramResult.data;
+      const { snowflakeUser } = request.user;
+
+      const result = await postgresService.query(
+        `SELECT id, data_product_id, minio_path, filename
+         FROM uploaded_documents
+         WHERE id = $1::uuid
+           AND is_deleted = false`,
+        [id],
+        snowflakeUser,
+      );
+
+      const doc = result.rows[0] as
+        | {
+            id: string;
+            data_product_id: string;
+            minio_path: string;
+            filename: string;
+          }
+        | undefined;
+
+      if (!doc) {
+        return reply.status(404).send({
+          error: 'NOT_FOUND',
+          message: 'Document not found',
+        });
+      }
+
+      let impactedSteps: string[] = [];
+      try {
+        const impacted = await postgresService.query(
+          `SELECT DISTINCT step_name
+           FROM context_step_selections
+           WHERE document_id = $1::uuid
+             AND state = 'active'`,
+          [id],
+          snowflakeUser,
+        );
+
+        impactedSteps = (impacted.rows as Array<{ step_name: string }>).map((row) => row.step_name);
+      } catch (err) {
+        if (!isRecoverableContextSchemaError(err)) {
+          throw err;
+        }
+      }
+
+      const contextVersion = await createContextVersion(
+        doc.data_product_id,
+        snowflakeUser,
+        'document_deleted',
+        {
+          document_id: id,
+          filename: doc.filename,
+          impacted_steps: impactedSteps,
+        },
+      );
+
+      await postgresService.query(
+        `UPDATE uploaded_documents
+         SET is_deleted = true,
+             deleted_at = now(),
+             deleted_by = $2,
+             context_version_id = $3::uuid
+         WHERE id = $1::uuid`,
+        [id, snowflakeUser, contextVersion?.id ?? null],
+        snowflakeUser,
+      );
+
+      try {
+        await postgresService.query(
+          `UPDATE context_step_selections
+           SET state = 'excluded',
+               selected_by = $2,
+               context_version_id = $3::uuid,
+               updated_at = now()
+           WHERE document_id = $1::uuid`,
+          [id, snowflakeUser, contextVersion?.id ?? null],
+          snowflakeUser,
+        );
+      } catch (err) {
+        if (!isRecoverableContextSchemaError(err)) {
+          throw err;
+        }
+      }
+
+      try {
+        await minioService.removeFile(DOCUMENTS_BUCKET, doc.minio_path);
+      } catch (err) {
+        app.log.warn(
+          { err, documentId: id, minioPath: doc.minio_path },
+          'Failed to remove document object from MinIO; metadata deletion still completed',
+        );
+      }
+
+      const recommendedActions = impactedSteps.length > 0
+        ? [
+            'Review impacted mission steps and decide whether regeneration is required.',
+            'Use context apply controls to activate alternative evidence before reruns.',
+          ]
+        : [];
+
+      return reply.send({
+        status: 'deleted',
+        document_id: id,
+        impacted_steps: impactedSteps,
+        context_version: contextVersion,
+        recommended_actions: recommendedActions,
       });
     },
   );

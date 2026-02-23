@@ -309,6 +309,7 @@ def _build_supervisor_contract(
     already_published: bool,
     forced_subagent: str | None = None,
     forced_intent: str | None = None,
+    document_context: dict[str, Any] | None = None,
 ) -> str:
     """Build a compact supervisor contract injected into orchestrator input."""
     current_phase = snapshot.get("current_phase") or "discovery"
@@ -335,6 +336,52 @@ def _build_supervisor_contract(
             "requirements_policy=ask focused high-signal questions, avoid generic fluff and info dumps, continue until requirements are complete"
         ),
     ]
+
+    if document_context:
+        context_step = str(document_context.get("step") or "").strip()
+        context_version = document_context.get("context_version")
+        active_items = document_context.get("active_items") or []
+        candidate_count = int(document_context.get("candidate_count") or 0)
+
+        if context_step:
+            lines.append(f"context_step={context_step}")
+        if context_version is not None:
+            lines.append(f"context_version={context_version}")
+
+        lines.append(
+            "document_context_policy=use active context evidence for the current mission step; "
+            "candidate/reference evidence is optional unless user activates it"
+        )
+        lines.append(f"context_active_items={len(active_items)}")
+        lines.append(f"context_candidate_items={candidate_count}")
+
+        for idx, item in enumerate(active_items[:8], start=1):
+            filename = str(item.get("filename") or "document")
+            doc_kind = str(item.get("doc_kind") or "reference")
+            summary = str(item.get("summary") or "").replace("\n", " ").strip()
+            summary = re.sub(r"\\s+", " ", summary)[:240]
+
+            payload = item.get("payload")
+            payload_text = ""
+            if isinstance(payload, dict):
+                table_names = payload.get("table_names")
+                metric_hints = payload.get("metric_hints")
+
+                table_str = ""
+                metric_str = ""
+                if isinstance(table_names, list):
+                    table_str = ", ".join(str(v) for v in table_names[:5])
+                if isinstance(metric_hints, list):
+                    metric_str = ", ".join(str(v) for v in metric_hints[:3])
+
+                if table_str:
+                    payload_text += f" tables={table_str};"
+                if metric_str:
+                    payload_text += f" metric_hints={metric_str};"
+
+            lines.append(
+                f"context_item_{idx}={doc_kind}|{filename}|{summary}{payload_text}".strip()
+            )
 
     if transition_target:
         lines.append(f"forced_transition={current_phase}->{transition_target}")
@@ -684,6 +731,112 @@ def _extract_user_message_from_supervisor_contract(content: str) -> str | None:
 
     recovered = content[idx + len(marker):].strip()
     return recovered or None
+
+
+def _phase_to_context_step(phase: str | None) -> str:
+    """Map internal phase labels to mission-control step labels."""
+    normalized = (phase or "").lower().strip()
+    if normalized in {"prepare", "transformation", "idle", ""}:
+        return "discovery"
+    if normalized in {"discovery", "requirements", "modeling", "generation", "validation", "publishing"}:
+        return normalized
+    if normalized == "explorer":
+        return "publishing"
+    return "discovery"
+
+
+async def _get_document_context_contract(
+    data_product_id: str,
+    phase: str | None,
+) -> dict[str, Any] | None:
+    """Load active document evidence for the current step to guide supervisor routing."""
+    step = _phase_to_context_step(phase)
+
+    try:
+        from services.postgres import get_pool as _gp, query as _q
+        from config import get_effective_settings
+
+        _settings = get_effective_settings()
+        _pool = await _gp(_settings.database_url)
+
+        version_rows = await _q(
+            _pool,
+            """SELECT version
+               FROM context_versions
+               WHERE data_product_id = $1::uuid
+               ORDER BY version DESC
+               LIMIT 1""",
+            data_product_id,
+        )
+        context_version = int(version_rows[0]["version"]) if version_rows else None
+
+        active_rows = await _q(
+            _pool,
+            """SELECT
+                   ud.filename,
+                   ud.doc_kind,
+                   ud.summary,
+                   de.evidence_type,
+                   de.payload
+               FROM context_step_selections cs
+               JOIN document_evidence de ON de.id = cs.evidence_id
+               JOIN uploaded_documents ud ON ud.id = cs.document_id
+               WHERE cs.data_product_id = $1::uuid
+                 AND cs.step_name = $2
+                 AND cs.state = 'active'
+                 AND COALESCE(ud.is_deleted, false) = false
+               ORDER BY cs.updated_at DESC
+               LIMIT 8""",
+            data_product_id,
+            step,
+        )
+
+        candidate_rows = await _q(
+            _pool,
+            """SELECT COUNT(*) AS candidate_count
+               FROM context_step_selections cs
+               JOIN uploaded_documents ud ON ud.id = cs.document_id
+               WHERE cs.data_product_id = $1::uuid
+                 AND cs.step_name = $2
+                 AND cs.state = 'candidate'
+                 AND COALESCE(ud.is_deleted, false) = false""",
+            data_product_id,
+            step,
+        )
+
+        candidate_count = int(candidate_rows[0]["candidate_count"]) if candidate_rows else 0
+
+        active_items: list[dict[str, Any]] = []
+        for row in active_rows:
+            payload = row.get("payload")
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+
+            active_items.append(
+                {
+                    "filename": row.get("filename"),
+                    "doc_kind": row.get("doc_kind"),
+                    "summary": row.get("summary"),
+                    "evidence_type": row.get("evidence_type"),
+                    "payload": payload,
+                }
+            )
+
+        return {
+            "step": step,
+            "context_version": context_version,
+            "active_items": active_items,
+            "candidate_count": candidate_count,
+        }
+    except Exception as e:
+        # The context routing tables may not exist in older environments yet.
+        logger.info("Document context pack unavailable for %s: %s", data_product_id, e)
+        return None
 
 
 async def _get_workflow_snapshot(data_product_id: str) -> dict[str, Any]:
@@ -1935,6 +2088,14 @@ async def _run_agent(
         # conversation history for this thread_id. We only send the new message.
         # Inject supervisor context contract for non-discovery turns only.
         # This keeps subagent routing deterministic without exposing internals to the user.
+        document_context_contract: dict[str, Any] | None = None
+        if not is_discovery:
+            effective_phase = supervisor_forced_phase or _current_phase
+            document_context_contract = await _get_document_context_contract(
+                data_product_id=data_product_id,
+                phase=effective_phase,
+            )
+
         if not is_discovery:
             actual_message = _build_supervisor_contract(
                 snapshot=workflow_snapshot,
@@ -1949,6 +2110,7 @@ async def _run_agent(
                     if post_publish_agent_instruction_update_intent
                     else None
                 ),
+                document_context=document_context_contract,
             )
 
         content = _build_multimodal_content(actual_message, file_contents)
@@ -2223,7 +2385,10 @@ async def _run_agent(
                     _pipeline_timer.phase_started("requirements")
                     await queue.put({"type": "phase_change", "data": {"from": old_phase, "to": "requirements"}})
                     await _persist_phase(data_product_id, "requirements")
-                elif tool_name in ("save_semantic_view", "fetch_documentation") and _current_phase == "requirements":
+                # Only persisted semantic-view writes should advance to generation.
+                # fetch_documentation may run during requirements refinement and
+                # must not force a phase jump on confirmation-only turns.
+                elif tool_name == "save_semantic_view" and _current_phase == "requirements":
                     old_phase = _current_phase
                     _current_phase = "generation"
                     _generation_phase_ran = True

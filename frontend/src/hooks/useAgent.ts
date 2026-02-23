@@ -31,6 +31,22 @@ interface QueuedOutboundMessage {
   files?: File[];
 }
 
+function phaseToMissionStep(
+  phase: string,
+): 'discovery' | 'requirements' | 'modeling' | 'generation' | 'validation' | 'publishing' {
+  const normalized = phase.toLowerCase();
+  if (normalized === 'prepare' || normalized === 'transformation' || normalized === 'idle') {
+    return 'discovery';
+  }
+  if (normalized === 'discovery') return 'discovery';
+  if (normalized === 'requirements') return 'requirements';
+  if (normalized === 'modeling') return 'modeling';
+  if (normalized === 'generation') return 'generation';
+  if (normalized === 'validation') return 'validation';
+  if (normalized === 'publishing' || normalized === 'explorer') return 'publishing';
+  return 'discovery';
+}
+
 /** Convert a File to base64 string. */
 async function fileToBase64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -76,12 +92,16 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
       if (!files || files.length === 0) return;
 
       let hadUploadFailure = false;
+      const currentStep = phaseToMissionStep(storeApi.getState().currentPhase);
 
       await Promise.all(
         files.map(async (file) => {
           const formData = new FormData();
-          formData.append('file', file);
           formData.append('data_product_id', dataProductId);
+          formData.append('source_channel', 'chat_attachment');
+          formData.append('auto_activate_step', currentStep);
+          // Keep file part last so multipart field metadata is always parsed first.
+          formData.append('file', file);
 
           try {
             await api.postForm('/documents/upload', formData);
@@ -102,7 +122,7 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
         });
       }
     },
-    [dataProductId, queryClient, addMessage],
+    [dataProductId, queryClient, addMessage, storeApi],
   );
 
   const connectToStream = useCallback(

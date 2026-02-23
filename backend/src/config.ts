@@ -56,6 +56,7 @@ const envSchema = z.object({
   SNOWFLAKE_WAREHOUSE: z.string().min(1),
   SNOWFLAKE_DATABASE: z.string().default(''),
   SNOWFLAKE_ROLE: z.string().min(1),
+  SNOWFLAKE_DOCUMENT_STAGE: z.string().default('@~'),
 
   // Connection tuning (optional)
   PG_IDLE_TIMEOUT_MS: z.coerce.number().default(30000),

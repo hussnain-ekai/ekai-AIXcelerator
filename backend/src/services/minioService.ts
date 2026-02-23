@@ -10,12 +10,25 @@ const client = new Minio.Client({
   secretKey: config.MINIO_SECRET_KEY,
 });
 
+const ensuredBuckets = new Set<string>();
+
+async function ensureBucket(bucket: string): Promise<void> {
+  if (ensuredBuckets.has(bucket)) return;
+
+  const exists = await client.bucketExists(bucket);
+  if (!exists) {
+    await client.makeBucket(bucket);
+  }
+  ensuredBuckets.add(bucket);
+}
+
 async function uploadFile(
   bucket: string,
   path: string,
   buffer: Buffer,
   contentType: string,
 ): Promise<void> {
+  await ensureBucket(bucket);
   await client.putObject(bucket, path, buffer, buffer.length, {
     'Content-Type': contentType,
   });
@@ -30,6 +43,10 @@ async function getFile(bucket: string, path: string): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
+async function removeFile(bucket: string, path: string): Promise<void> {
+  await client.removeObject(bucket, path);
+}
+
 async function healthCheck(): Promise<boolean> {
   try {
     await client.bucketExists('artifacts');
@@ -39,4 +56,4 @@ async function healthCheck(): Promise<boolean> {
   }
 }
 
-export const minioService = { client, uploadFile, getFile, healthCheck };
+export const minioService = { client, ensureBucket, uploadFile, getFile, removeFile, healthCheck };

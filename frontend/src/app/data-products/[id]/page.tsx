@@ -1,6 +1,6 @@
 'use client';
 
-import { use, useCallback, useEffect, useRef, useState } from 'react';
+import { use, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   Badge,
@@ -49,7 +49,17 @@ import { useDataProduct } from '@/hooks/useDataProducts';
 import { useAgent } from '@/hooks/useAgent';
 import { useSessionRecovery } from '@/hooks/useSessionRecovery';
 import { useArtifacts, useERDData, useQualityReport, useYAMLContent, useBRD, useDataDescription, useDataCatalog, useBusinessGlossary, useMetricsDefinitions, useValidationRules, useLineageData } from '@/hooks/useArtifacts';
-import { useDocuments, useUploadDocument } from '@/hooks/useDocuments';
+import {
+  useApplyDocumentContext,
+  useDeleteDocument,
+  useDocumentContext,
+  useDocuments,
+  useReextractDocument,
+  useUploadDocument,
+  type ContextSelectionState,
+  type MissionStep,
+  type UploadedDocument,
+} from '@/hooks/useDocuments';
 import { useQueryClient } from '@tanstack/react-query';
 import { ChatStoreProvider, useChatStore, useChatStoreApi } from '@/stores/chatStoreProvider';
 import type { ArtifactType } from '@/stores/chatStore';
@@ -79,6 +89,24 @@ function phaseForArtifactType(type: ArtifactType): 'DISCOVERY' | 'REQUIREMENTS' 
   }
 }
 
+function phaseToMissionStep(phase: string): MissionStep {
+  const normalized = phase.toLowerCase();
+  if (normalized === 'prepare' || normalized === 'transformation' || normalized === 'idle') {
+    return 'discovery';
+  }
+  if (normalized === 'discovery') return 'discovery';
+  if (normalized === 'requirements') return 'requirements';
+  if (normalized === 'modeling') return 'modeling';
+  if (normalized === 'generation') return 'generation';
+  if (normalized === 'validation') return 'validation';
+  if (normalized === 'publishing' || normalized === 'explorer') return 'publishing';
+  return 'discovery';
+}
+
+function missionStepLabel(step: MissionStep): string {
+  return `${step.charAt(0).toUpperCase()}${step.slice(1)}`;
+}
+
 /**
  * Outer wrapper: mounts a fresh ChatStoreProvider per data product.
  * When React unmounts this (navigating away), the store is destroyed.
@@ -106,6 +134,8 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
   const [editOpen, setEditOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [rerunConfirmOpen, setRerunConfirmOpen] = useState(false);
+  const [documentsUploadNotice, setDocumentsUploadNotice] = useState<string | null>(null);
+  const [documentsUploadNoticeSeverity, setDocumentsUploadNoticeSeverity] = useState<'info' | 'error'>('info');
   const truncateAfter = useChatStore((state) => state.truncateAfter);
   const editMessage = useChatStore((state) => state.editMessage);
   const messages = useChatStore((state) => state.messages);
@@ -128,6 +158,11 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
   const { data: persistedArtifacts } = useArtifacts(id);
   const { data: documentsResponse } = useDocuments(id);
   const uploadDocument = useUploadDocument(id);
+  const currentMissionStep = phaseToMissionStep(currentPhase);
+  const { data: documentContextResponse } = useDocumentContext(id, currentMissionStep);
+  const applyDocumentContext = useApplyDocumentContext(id);
+  const deleteDocument = useDeleteDocument(id);
+  const reextractDocument = useReextractDocument(id);
   const addMessage = useChatStore((state) => state.addMessage);
 
   const pipelineRunning = useChatStore((state) => state.pipelineRunning);
@@ -380,9 +415,177 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
 
   const handleUploadDocuments = useCallback(
     (files: File[]) => {
-      void Promise.all(files.map((file) => uploadDocument.mutateAsync(file))).catch(() => undefined);
+      setDocumentsUploadNotice(null);
+      setDocumentsUploadNoticeSeverity('info');
+
+      void (async () => {
+        const results = await Promise.allSettled(
+          files.map((file) => uploadDocument.mutateAsync(file)),
+        );
+
+        const failures = results.filter(
+          (result): result is PromiseRejectedResult => result.status === 'rejected',
+        );
+
+        if (failures.length === 0) {
+          if (files.length > 1) {
+            setDocumentsUploadNotice(`${files.length} files uploaded successfully.`);
+            setDocumentsUploadNoticeSeverity('info');
+          }
+          return;
+        }
+
+        const firstError = failures[0]?.reason;
+        const firstErrorMessage =
+          firstError instanceof Error && firstError.message.trim().length > 0
+            ? firstError.message
+            : 'Upload failed';
+        const failureSummary =
+          failures.length === files.length
+            ? `Upload failed: ${firstErrorMessage}`
+            : `${files.length - failures.length}/${files.length} files uploaded. ${failures.length} failed: ${firstErrorMessage}`;
+
+        setDocumentsUploadNotice(failureSummary);
+        setDocumentsUploadNoticeSeverity('error');
+
+        addMessage({
+          id: crypto.randomUUID(),
+          role: 'system',
+          content: failureSummary,
+          timestamp: new Date().toISOString(),
+        });
+      })();
     },
-    [uploadDocument],
+    [uploadDocument, addMessage],
+  );
+
+  const contextByDocumentId = useMemo(() => {
+    const lookup: Record<string, { evidenceId: string; state: ContextSelectionState }> = {};
+    const perStep = documentContextResponse?.step?.[currentMissionStep];
+    if (!perStep) return lookup;
+
+    const addItems = (
+      state: ContextSelectionState,
+      items: Array<{ evidence_id: string; document: { id: string } }>,
+    ) => {
+      for (const item of items) {
+        if (!lookup[item.document.id]) {
+          lookup[item.document.id] = {
+            evidenceId: item.evidence_id,
+            state,
+          };
+        }
+      }
+    };
+
+    addItems('active', perStep.active ?? []);
+    addItems('candidate', perStep.candidate ?? []);
+    addItems('reference', perStep.reference ?? []);
+    addItems('excluded', perStep.excluded ?? []);
+
+    return lookup;
+  }, [documentContextResponse, currentMissionStep]);
+
+  const handleSetDocumentState = useCallback(
+    (documentId: string, state: ContextSelectionState) => {
+      const entry = contextByDocumentId[documentId];
+      if (!entry) return;
+
+      void applyDocumentContext
+        .mutateAsync({
+          step: currentMissionStep,
+          reason: 'documents_panel_update',
+          updates: [{ evidence_id: entry.evidenceId, state }],
+        })
+        .catch(() => undefined);
+    },
+    [contextByDocumentId, applyDocumentContext, currentMissionStep],
+  );
+
+  const handleDeleteDocument = useCallback(
+    (document: UploadedDocument) => {
+      const filename = document.filename || 'document';
+      void deleteDocument
+        .mutateAsync(document.id)
+        .then((result) => {
+          const impactedSteps =
+            result.impacted_steps.length > 0
+              ? ` Impacted steps: ${result.impacted_steps.map((step) => missionStepLabel(step as MissionStep)).join(', ')}.`
+              : '';
+          const recommendedActions =
+            result.recommended_actions.length > 0
+              ? ` Recovery plan: ${result.recommended_actions.join(' ')}`
+              : '';
+          const summary = `Deleted "${filename}".${impactedSteps}${recommendedActions}`;
+
+          setDocumentsUploadNotice(summary);
+          setDocumentsUploadNoticeSeverity('info');
+
+          if (result.impacted_steps.length > 0) {
+            addMessage({
+              id: crypto.randomUUID(),
+              role: 'system',
+              content: summary,
+              timestamp: new Date().toISOString(),
+            });
+          }
+        })
+        .catch((error) => {
+          const message =
+            error instanceof Error && error.message.trim().length > 0
+              ? error.message
+              : `Failed to delete "${filename}"`;
+          setDocumentsUploadNotice(message);
+          setDocumentsUploadNoticeSeverity('error');
+        });
+    },
+    [deleteDocument, addMessage],
+  );
+
+  const handleReextractDocument = useCallback(
+    (document: UploadedDocument) => {
+      const filename = document.filename || 'document';
+      void reextractDocument
+        .mutateAsync(document.id)
+        .then((result) => {
+          if (result.status === 'completed') {
+            const message = `Extraction completed for "${filename}" (${result.extracted_chars ?? 0} chars).`;
+            setDocumentsUploadNotice(message);
+            setDocumentsUploadNoticeSeverity('info');
+            return;
+          }
+
+          if (result.status === 'pending') {
+            const message = result.message
+              ? `Extraction update for "${filename}": ${result.message}`
+              : `Extraction for "${filename}" is still pending.`;
+            setDocumentsUploadNotice(message);
+            setDocumentsUploadNoticeSeverity('info');
+            return;
+          }
+
+          const message = result.message
+            ? `Extraction failed for "${filename}": ${result.message}`
+            : `Extraction failed for "${filename}".`;
+          setDocumentsUploadNotice(message);
+          setDocumentsUploadNoticeSeverity('error');
+          addMessage({
+            id: crypto.randomUUID(),
+            role: 'system',
+            content: message,
+            timestamp: new Date().toISOString(),
+          });
+        })
+        .catch((error) => {
+          const message =
+            error instanceof Error && error.message.trim().length > 0
+              ? error.message
+              : `Failed to re-run extraction for "${filename}"`;
+          setDocumentsUploadNotice(message);
+          setDocumentsUploadNoticeSeverity('error');
+        });
+    },
+    [reextractDocument, addMessage],
   );
 
   return (
@@ -536,6 +739,16 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
         documents={documentsResponse?.data ?? []}
         onUploadFiles={handleUploadDocuments}
         isUploading={uploadDocument.isPending}
+        uploadNotice={documentsUploadNotice}
+        uploadNoticeSeverity={documentsUploadNoticeSeverity}
+        currentStep={missionStepLabel(currentMissionStep)}
+        contextByDocumentId={contextByDocumentId}
+        onSetDocumentState={handleSetDocumentState}
+        onDeleteDocument={handleDeleteDocument}
+        onReextractDocument={handleReextractDocument}
+        isUpdatingContext={applyDocumentContext.isPending}
+        isDeleting={deleteDocument.isPending}
+        isReextracting={reextractDocument.isPending}
       />
 
       {/* Artifacts list panel */}

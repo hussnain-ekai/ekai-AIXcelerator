@@ -44,6 +44,7 @@ Thumbs.db
 # Testing & Tooling
 # ===========================
 .playwright-mcp/
+.playwright-cli/
 playwright-report/
 test-results/
 coverage/
@@ -76,6 +77,8 @@ v0/
 # Temporary files
 # ===========================
 tmp/
+output/
+scratchpad/
 
 # ===========================
 # Misc
