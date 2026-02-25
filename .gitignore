@@ -24,6 +24,7 @@ __pycache__/
 # Build artifacts
 # ===========================
 .next/
+.next.broken*/
 dist/
 build/
 out/
@@ -52,16 +53,44 @@ coverage/
 *.log
 
 # ===========================
-# Screenshots & temp artifacts
+# Images & Screenshots
 # ===========================
-# Never commit screenshots or temporary images to root.
-# Reference images belong in images/ only.
+# Never commit screenshots, test captures, or binary images.
+# Only favicon.ico is allowed (frontend asset).
 *.png
 *.jpg
 *.jpeg
-!images/**
+*.gif
+*.bmp
+images/
+!frontend/public/favicon.ico
+
+# ===========================
+# Scratchpad & Ephemeral
+# ===========================
+# Local working files, test evidence, sample outputs — never track.
+scratchpad/
+tmp/
+output/
+docs/evidence/
+docs/ekai-outputs/
+
+# ===========================
+# Benchmark data (generated)
+# ===========================
+# Keep README and small samples; exclude large generated data.
+ai-service/.benchmarks/gold_cases_*.jsonl
+ai-service/.benchmarks/gold_predictions_*.json
+ai-service/.benchmarks/latest_report.json
+
+# ===========================
+# Sensitive / credentials
+# ===========================
 images/gemini-key.json
 images/gcp-credentials.json
+*.pem
+*.key
+*.p12
 
 # ===========================
 # Docker
@@ -72,13 +101,6 @@ docker-compose.override.yml
 # v0 prototype backup
 # ===========================
 v0/
-
-# ===========================
-# Temporary files
-# ===========================
-tmp/
-output/
-scratchpad/
 
 # ===========================
 # Misc
