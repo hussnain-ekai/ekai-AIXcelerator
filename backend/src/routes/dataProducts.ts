@@ -17,7 +17,8 @@ interface DataProductRow {
   workspace_id: string;
   name: string;
   description: string | null;
-  database_reference: string;
+  product_type: string;
+  database_reference: string | null;
   schemas: string[];
   tables: string[];
   status: string;
@@ -140,6 +141,7 @@ export async function dataProductRoutes(app: FastifyInstance): Promise<void> {
           dp.workspace_id,
           dp.name,
           dp.description,
+          dp.product_type,
           dp.database_reference,
           dp.schemas,
           dp.tables,
@@ -207,7 +209,7 @@ export async function dataProductRoutes(app: FastifyInstance): Promise<void> {
         });
       }
 
-      const { name, description, database_reference, schemas, tables } =
+      const { name, description, product_type, database_reference, schemas, tables } =
         parseResult.data;
       const { snowflakeUser } = request.user;
 
@@ -232,24 +234,28 @@ export async function dataProductRoutes(app: FastifyInstance): Promise<void> {
       // Generate a session ID for the agent conversation
       const sessionId = crypto.randomUUID();
 
+      // Determine initial phase based on product type
+      const initialPhase = product_type === 'document' ? 'requirements' : 'discovery';
+
       // Insert data product
       try {
         const insertResult = await postgresService.query(
           `INSERT INTO data_products
-             (workspace_id, name, description, database_reference, schemas, tables, state)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)
+             (workspace_id, name, description, product_type, database_reference, schemas, tables, state)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
            RETURNING
-             id, workspace_id, name, description, database_reference, schemas, tables,
+             id, workspace_id, name, description, product_type, database_reference, schemas, tables,
              status, state, health_score, published_at, published_agent_fqn,
              created_at, updated_at`,
           [
             workspaceId,
             name,
             description,
-            database_reference,
+            product_type,
+            database_reference ?? null,
             schemas,
             tables,
-            JSON.stringify({ session_id: sessionId, current_phase: 'discovery' }),
+            JSON.stringify({ session_id: sessionId, current_phase: initialPhase }),
           ],
           snowflakeUser,
         );
@@ -297,7 +303,7 @@ export async function dataProductRoutes(app: FastifyInstance): Promise<void> {
 
       const result = await postgresService.query(
         `SELECT
-           id, workspace_id, name, description, database_reference, schemas, tables,
+           id, workspace_id, name, description, product_type, database_reference, schemas, tables,
            status, state, health_score, published_at, published_agent_fqn,
            created_at, updated_at
          FROM data_products
@@ -317,6 +323,7 @@ export async function dataProductRoutes(app: FastifyInstance): Promise<void> {
 
       return reply.send({
         ...product,
+        product_type: product.product_type ?? 'structured',
         status: resolveWorkflowStatus(product.status, product.state),
       });
     },
@@ -399,7 +406,7 @@ export async function dataProductRoutes(app: FastifyInstance): Promise<void> {
         SET ${setClauses.join(', ')}
         WHERE id = $${paramIndex}
         RETURNING
-          id, workspace_id, name, description, database_reference, schemas, tables,
+          id, workspace_id, name, description, product_type, database_reference, schemas, tables,
           status, state, health_score, published_at, published_agent_fqn,
           created_at, updated_at
       `;
@@ -422,6 +429,7 @@ export async function dataProductRoutes(app: FastifyInstance): Promise<void> {
 
       return reply.send({
         ...product,
+        product_type: product.product_type ?? 'structured',
         status: resolveWorkflowStatus(product.status, product.state),
       });
     },

@@ -7,7 +7,7 @@ import {
   Box,
   Breadcrumbs,
   Button,
-  Chip,
+
   Dialog,
   DialogActions,
   DialogContent,
@@ -54,6 +54,7 @@ import {
   useApplyDocumentContext,
   useDeleteDocument,
   useDocumentContext,
+  useDocumentContextDelta,
   useDocuments,
   useReextractDocument,
   useSemanticRegistry,
@@ -109,27 +110,7 @@ function missionStepLabel(step: MissionStep): string {
   return `${step.charAt(0).toUpperCase()}${step.slice(1)}`;
 }
 
-function trustStateLabel(state: string | null): string | null {
-  if (!state) return null;
-  switch (state) {
-    case 'answer_ready':
-      return 'Answer ready';
-    case 'answer_with_warnings':
-      return 'Answer with warnings';
-    case 'abstained_missing_evidence':
-      return 'Abstained: missing evidence';
-    case 'abstained_conflicting_evidence':
-      return 'Abstained: conflicting evidence';
-    case 'blocked_access':
-      return 'Blocked by access';
-    case 'failed_recoverable':
-      return 'Recoverable failure';
-    case 'failed_admin':
-      return 'Needs admin action';
-    default:
-      return state;
-  }
-}
+/* trustStateLabel removed — trust state is backend-only, not shown to users */
 
 /**
  * Outer wrapper: mounts a fresh ChatStoreProvider per data product.
@@ -165,7 +146,7 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
   const messages = useChatStore((state) => state.messages);
   const isStreaming = useChatStore((state) => state.isStreaming);
   const currentPhase = useChatStore((state) => state.currentPhase);
-  const answerTrustState = useChatStore((state) => state.answerTrustState);
+
   const clearMessages = useChatStore((state) => state.clearMessages);
   const setHydrated = useChatStore((state) => state.setHydrated);
   const artifacts = useChatStore((state) => state.artifacts);
@@ -186,6 +167,7 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
   const uploadDocument = useUploadDocument(id);
   const currentMissionStep = phaseToMissionStep(currentPhase);
   const { data: documentContextResponse } = useDocumentContext(id, currentMissionStep);
+  const { data: contextDeltaResponse } = useDocumentContextDelta(id);
   const applyDocumentContext = useApplyDocumentContext(id);
   const deleteDocument = useDeleteDocument(id);
   const reextractDocument = useReextractDocument(id);
@@ -438,7 +420,7 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
   const tableCount = dataProduct?.tables?.length ?? 0;
   const documentCount = documentsResponse?.data.length ?? 0;
   const artifactCount = artifacts.length;
-  const trustLabel = trustStateLabel(answerTrustState);
+
 
   const handleUploadDocuments = useCallback(
     (files: File[]) => {
@@ -564,11 +546,18 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
             result.impacted_steps.length > 0
               ? ` Impacted steps: ${result.impacted_steps.map((step) => missionStepLabel(step as MissionStep)).join(', ')}.`
               : '';
+          const staleArtifacts = (result.stale_artifacts ?? [])
+            .map((artifact) => artifact.artifact_label || artifact.artifact_type)
+            .filter((value, index, all) => value && all.indexOf(value) === index);
+          const staleSummary =
+            staleArtifacts.length > 0
+              ? ` Refresh recommended for: ${staleArtifacts.join(', ')}.`
+              : '';
           const recommendedActions =
             result.recommended_actions.length > 0
               ? ` Recovery plan: ${result.recommended_actions.join(' ')}`
               : '';
-          const summary = `Deleted "${filename}".${impactedSteps}${recommendedActions}`;
+          const summary = `Deleted "${filename}".${impactedSteps}${staleSummary}${recommendedActions}`;
 
           setDocumentsUploadNotice(summary);
           setDocumentsUploadNoticeSeverity('info');
@@ -697,21 +686,7 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
               {dataProduct.description}
             </Typography>
           )}
-          {trustLabel && (
-            <Chip
-              size="small"
-              label={trustLabel}
-              sx={{
-                ml: 1,
-                borderColor: answerTrustState?.startsWith('failed') || answerTrustState?.startsWith('abstained')
-                  ? 'warning.main'
-                  : 'success.main',
-                borderWidth: 1,
-                borderStyle: 'solid',
-                bgcolor: 'background.paper',
-              }}
-            />
-          )}
+          {/* Trust state badge removed — backend-only feature, not for end users */}
         </Box>
         <Box sx={{ display: 'flex', gap: 1 }}>
           <Button
@@ -776,6 +751,7 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
         <MessageThread
           messages={messages}
           isStreaming={isStreaming}
+          dataProductId={id}
           onOpenArtifact={handleOpenPanel}
           onEditMessage={handleEditMessage}
           onRetryMessage={handleRetryMessage}
@@ -817,6 +793,9 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
         isUpdatingContext={applyDocumentContext.isPending}
         isDeleting={deleteDocument.isPending}
         isReextracting={reextractDocument.isPending}
+        contextImpactedSteps={contextDeltaResponse?.impacted_steps ?? []}
+        contextStaleArtifacts={contextDeltaResponse?.stale_artifacts ?? []}
+        contextRecommendedActions={contextDeltaResponse?.recommended_actions ?? []}
       />
 
       {/* Artifacts list panel */}

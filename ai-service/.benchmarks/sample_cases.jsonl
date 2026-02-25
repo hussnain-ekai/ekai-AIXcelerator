@@ -1,0 +1,3 @@
+{"case_id":"str-001","category":"structured","question":"What was total generation last month?","expected_answer":"total generation was 1250","required_citations":1}
+{"case_id":"doc-001","category":"document","question":"What exact amount is listed on invoice INV-100?","expected_numbers":[4200],"required_citations":1}
+{"case_id":"hyb-001","category":"hybrid","question":"Which countries saw GDP decline while reports mention infrastructure growth?","expected_answer":"countries with gdp decline and infrastructure growth","required_citations":2}

@@ -53,6 +53,11 @@ CREATE CONSTRAINT table_fqn IF NOT EXISTS FOR (t:Table) REQUIRE t.fqn IS UNIQUE;
 CREATE CONSTRAINT column_fqn IF NOT EXISTS FOR (c:Column) REQUIRE c.fqn IS UNIQUE;
 CREATE INDEX table_classification IF NOT EXISTS FOR (t:Table) ON (t.classification);
 CREATE INDEX table_data_product IF NOT EXISTS FOR (t:Table) ON (t.data_product_id);
+CREATE CONSTRAINT doc_id IF NOT EXISTS FOR (d:Document) REQUIRE d.document_id IS UNIQUE;
+CREATE CONSTRAINT chunk_id IF NOT EXISTS FOR (c:DocumentChunk) REQUIRE c.chunk_id IS UNIQUE;
+CREATE CONSTRAINT fact_id IF NOT EXISTS FOR (f:DocumentFact) REQUIRE f.fact_id IS UNIQUE;
+CREATE CONSTRAINT entity_name IF NOT EXISTS FOR (e:Entity) REQUIRE e.name IS UNIQUE;
+CREATE CONSTRAINT dp_id IF NOT EXISTS FOR (dp:DataProduct) REQUIRE dp.data_product_id IS UNIQUE;
 CYPHER
 echo "  ✓ Neo4j constraints created"
 

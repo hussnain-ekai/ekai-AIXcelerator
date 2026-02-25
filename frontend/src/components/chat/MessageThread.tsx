@@ -8,6 +8,9 @@ import {
   Collapse,
   CircularProgress,
   Button,
+  Dialog,
+  DialogContent,
+  DialogTitle,
   IconButton,
   Paper,
   TextField,
@@ -29,42 +32,70 @@ import type {
   ReasoningUpdate,
 } from '@/stores/chatStore';
 import type { AnswerContract } from '@/lib/answerContract';
+import { api } from '@/lib/api';
 import { useChatStore } from '@/stores/chatStoreProvider';
 import { ArtifactCard } from './ArtifactCard';
 
 interface MessageThreadProps {
   messages: ChatMessage[];
   isStreaming: boolean;
+  dataProductId?: string;
   onOpenArtifact?: (type: ArtifactType) => void;
   onEditMessage?: (messageId: string, newContent: string) => void;
   onRetryMessage?: (messageId: string) => void;
 }
 
 const GOLD = '#D4A843';
+const TRUST_CONTRACT_UI_ENABLED =
+  process.env.NEXT_PUBLIC_TRUST_UX_ENABLED !== 'false';
 
 const TRUST_LABELS: Record<string, string> = {
   answer_ready: 'Answer ready',
-  answer_with_warnings: 'Answer with warnings',
-  abstained_missing_evidence: 'Abstained: missing evidence',
-  abstained_conflicting_evidence: 'Abstained: conflicting evidence',
-  blocked_access: 'Blocked by access policy',
-  failed_recoverable: 'Failed, recoverable',
-  failed_admin: 'Failed, needs admin',
+  answer_with_warnings: 'Answer needs review',
+  abstained_missing_evidence: 'Need more evidence',
+  abstained_conflicting_evidence: 'Conflicting evidence',
+  blocked_access: 'Access blocked',
+  failed_recoverable: 'Action required',
+  failed_admin: 'Admin action required',
+};
+
+const SOURCE_LABELS: Record<string, string> = {
+  structured: 'Structured source',
+  document: 'Document source',
+  hybrid: 'Hybrid source',
+  unknown: 'Source unknown',
 };
 
 const EXACTNESS_LABELS: Record<string, string> = {
   validated_exact: 'Validated exact value',
-  estimated: 'Estimated value',
+  estimated: 'Estimated answer',
   insufficient_evidence: 'Insufficient evidence',
-  not_applicable: 'Not an exact-value question',
+  not_applicable: 'Context answer',
 };
 
-const SOURCE_LABELS: Record<string, string> = {
-  structured: 'Structured',
-  document: 'Document',
-  hybrid: 'Hybrid',
-  unknown: 'Unknown source',
+const CONFIDENCE_LABELS: Record<string, string> = {
+  high: 'High confidence',
+  medium: 'Medium confidence',
+  abstain: 'Abstained',
 };
+
+function formatRecencyLabel(contract: AnswerContract, observedAt?: string): string {
+  const metadata = contract.metadata ?? {};
+  const candidate =
+    (typeof metadata.evidence_created_at === 'string' && metadata.evidence_created_at) ||
+    (typeof metadata.observed_at === 'string' && metadata.observed_at) ||
+    observedAt ||
+    '';
+  const parsed = candidate ? Date.parse(candidate) : Number.NaN;
+  if (!Number.isFinite(parsed)) return 'Recency unknown';
+
+  const ageMinutes = Math.max(0, Math.floor((Date.now() - parsed) / 60_000));
+  if (ageMinutes < 60) return 'Updated <1h ago';
+  const ageHours = Math.floor(ageMinutes / 60);
+  if (ageHours < 24) return `Updated ${ageHours}h ago`;
+  const ageDays = Math.floor(ageHours / 24);
+  return `Updated ${ageDays}d ago`;
+}
 
 /* ------------------------------------------------------------------ */
 /*  Message content filters                                            */
@@ -219,12 +250,12 @@ function getPhaseStatusLabel(currentPhase: string, recentToolNames: string[]): s
 
 function getStallHint(currentPhase: string): string {
   if (currentPhase === 'discovery' || currentPhase === 'prepare') {
-    return 'Large datasets can take longer during profiling and preparation. ekaiX is still processing.';
+    return 'Profiling can take longer on large datasets. ekaiX is still working on this step.';
   }
   if (currentPhase === 'requirements') {
-    return 'Requirement capture or BRD drafting can pause briefly while responses are composed.';
+    return 'Requirement capture and BRD drafting can have short quiet periods while content is prepared.';
   }
-  return 'This step is still active. ekaiX will continue and update you when new output is available.';
+  return 'This step is still running. ekaiX will post the next update automatically.';
 }
 
 function getToolDisplayName(toolName: string): string {
@@ -262,11 +293,13 @@ function AgentMessage({
   onOpenArtifact,
   onRetry,
   isStreaming,
+  dataProductId,
 }: {
   message: ChatMessage;
   onOpenArtifact?: (type: ArtifactType) => void;
   onRetry?: (messageId: string) => void;
   isStreaming: boolean;
+  dataProductId?: string;
 }): React.ReactNode {
   const [copied, setCopied] = useState(false);
 
@@ -385,6 +418,7 @@ function AgentMessage({
           </Box>
         )}
       </Paper>
+      {/* Trust contract evidence card removed — backend-only feature, not for end users */}
       {/* Action buttons */}
       <Box
         className="message-actions"
@@ -618,36 +652,77 @@ function SystemMessage({ message }: { message: ChatMessage }): React.ReactNode {
 
 function AnswerTrustCard({
   contract,
-  isStreaming,
+  dataProductId,
+  showSender = true,
+  observedAt,
 }: {
   contract: AnswerContract | null;
-  isStreaming: boolean;
+  dataProductId?: string;
+  showSender?: boolean;
+  observedAt?: string;
 }): React.ReactNode {
-  if (!contract) return null;
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const [evidenceDialogOpen, setEvidenceDialogOpen] = useState(false);
+  const [evidenceDialogTitle, setEvidenceDialogTitle] = useState('');
+  const [evidenceDialogBody, setEvidenceDialogBody] = useState<string>('');
+  const [loadingReference, setLoadingReference] = useState<string | null>(null);
 
-  const trustLabel = TRUST_LABELS[contract.trust_state] ?? 'Answer status';
-  const sourceLabel = SOURCE_LABELS[contract.source_mode] ?? 'Unknown source';
-  const exactnessLabel = EXACTNESS_LABELS[contract.exactness_state] ?? 'Not specified';
-  const confidenceLabel = contract.confidence_decision === 'abstain'
-    ? 'Abstain'
-    : contract.confidence_decision === 'high'
-      ? 'High confidence'
-      : 'Medium confidence';
+  const handleOpenEvidence = useCallback(
+    async (citationType: string, referenceId: string) => {
+      if (!dataProductId) return;
+      const key = `${citationType}:${referenceId}`;
+      setLoadingReference(key);
+      try {
+        const qs = new URLSearchParams({
+          citation_type: citationType,
+          reference_id: referenceId,
+        });
+        const payload = await api.get<Record<string, unknown>>(
+          `/documents/semantic/${dataProductId}/evidence/link?${qs.toString()}`,
+        );
+        setEvidenceDialogTitle(`${citationType} • ${referenceId}`);
+        setEvidenceDialogBody(JSON.stringify(payload, null, 2));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to load evidence detail';
+        setEvidenceDialogTitle(`${citationType} • ${referenceId}`);
+        setEvidenceDialogBody(message);
+      } finally {
+        setLoadingReference(null);
+        setEvidenceDialogOpen(true);
+      }
+    },
+    [dataProductId],
+  );
+
+  if (!contract) return null;
 
   const isNegativeState =
     contract.trust_state.startsWith('abstained') ||
     contract.trust_state.startsWith('failed') ||
     contract.trust_state === 'blocked_access';
-
-  const trustColor = isNegativeState ? 'warning.main' : 'success.main';
   const citationCount = contract.citations.length;
+  const hasEvidence = citationCount > 0;
+  const forceNeedsEvidence = !hasEvidence && !isNegativeState;
+  const trustColor = isNegativeState || forceNeedsEvidence ? 'warning.main' : 'divider';
+  const trustLabel = forceNeedsEvidence
+    ? 'Need more evidence'
+    : (TRUST_LABELS[contract.trust_state] ?? null);
+  const sourceLabel = SOURCE_LABELS[contract.source_mode] ?? SOURCE_LABELS.unknown;
+  const exactnessLabel = EXACTNESS_LABELS[contract.exactness_state] ?? EXACTNESS_LABELS.not_applicable;
+  const confidenceLabel = CONFIDENCE_LABELS[contract.confidence_decision] ?? CONFIDENCE_LABELS.medium;
+  const recencyLabel = formatRecencyLabel(contract, observedAt);
+  const evidenceLine = hasEvidence
+    ? `${citationCount} source${citationCount === 1 ? '' : 's'} linked`
+    : 'No linked sources for this answer yet.';
 
   return (
-    <Box sx={{ display: 'flex', alignItems: 'flex-start', maxWidth: '75%' }}>
-      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, width: '100%', maxWidth: 620 }}>
-        <Typography variant="caption" sx={{ fontWeight: 700, color: GOLD }}>
-          ekaiX
-        </Typography>
+    <Box sx={{ display: 'flex', alignItems: 'flex-start', width: '100%' }}>
+      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, width: '100%' }}>
+        {showSender && (
+          <Typography variant="caption" sx={{ fontWeight: 700, color: GOLD }}>
+            ekaiX
+          </Typography>
+        )}
         <Paper
           elevation={0}
           sx={{
@@ -658,60 +733,124 @@ function AnswerTrustCard({
             borderColor: trustColor,
           }}
         >
-          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.75, mb: 1 }}>
-            <Chip size="small" label={trustLabel} sx={{ borderColor: trustColor, borderWidth: 1, borderStyle: 'solid' }} />
+          {trustLabel && (
+            <Chip
+              size="small"
+              label={trustLabel}
+              sx={{ borderColor: trustColor, borderWidth: 1, borderStyle: 'solid', mb: 1 }}
+            />
+          )}
+
+          <Box sx={{ display: 'flex', gap: 0.75, flexWrap: 'wrap', mb: 1 }}>
             <Chip size="small" variant="outlined" label={sourceLabel} />
             <Chip size="small" variant="outlined" label={exactnessLabel} />
             <Chip size="small" variant="outlined" label={confidenceLabel} />
+            <Chip size="small" variant="outlined" label={recencyLabel} />
           </Box>
 
           {contract.evidence_summary && (
-            <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block' }}>
-              Evidence summary: {contract.evidence_summary}
+            <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block', mb: 0.5 }}>
+              {contract.evidence_summary}
             </Typography>
           )}
 
-          <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block', mt: 0.5 }}>
-            Citations available: {citationCount}
-            {isStreaming ? ' • updating while agent runs' : ''}
-          </Typography>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+            <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+              {evidenceLine}
+            </Typography>
+            {(citationCount > 0 || contract.recovery_actions.length > 0 || contract.conflict_notes.length > 0) && (
+              <Button
+                size="small"
+                variant="text"
+                onClick={() => setDetailsOpen((prev) => !prev)}
+                sx={{ minWidth: 0, px: 0.5, textTransform: 'none', fontSize: '0.72rem' }}
+              >
+                {detailsOpen ? 'Hide details' : 'View details'}
+              </Button>
+            )}
+          </Box>
 
-          {contract.citations.length > 0 && (
-            <Box sx={{ mt: 1 }}>
-              {contract.citations.slice(0, 4).map((citation) => (
-                <Typography
-                  key={`${citation.citation_type}-${citation.reference_id}`}
-                  variant="caption"
-                  sx={{ display: 'block', color: 'text.secondary' }}
-                >
-                  • {citation.label ?? citation.reference_id} ({citation.citation_type})
+          <Collapse in={detailsOpen}>
+            {contract.citations.length > 0 && (
+              <Box sx={{ mt: 1 }}>
+                {contract.citations.slice(0, 8).map((citation) => {
+                  const key = `${citation.citation_type}:${citation.reference_id}`;
+                  return (
+                    <Box
+                      key={key}
+                      sx={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        gap: 1,
+                        mb: 0.5,
+                      }}
+                    >
+                      <Typography variant="caption" sx={{ color: 'text.secondary', pr: 1 }}>
+                        • {citation.label ?? citation.reference_id}
+                      </Typography>
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        disabled={!dataProductId || loadingReference === key}
+                        onClick={() =>
+                          handleOpenEvidence(citation.citation_type, citation.reference_id)
+                        }
+                        sx={{ minWidth: 0, px: 1, textTransform: 'none', fontSize: '0.68rem' }}
+                      >
+                        {loadingReference === key ? 'Loading...' : 'Open source'}
+                      </Button>
+                    </Box>
+                  );
+                })}
+              </Box>
+            )}
+
+            {contract.conflict_notes.length > 0 && (
+              <Alert severity="warning" sx={{ mt: 1, py: 0.25 }}>
+                <Typography variant="caption">
+                  {contract.conflict_notes.join(' | ')}
                 </Typography>
-              ))}
-            </Box>
-          )}
+              </Alert>
+            )}
 
-          {contract.conflict_notes.length > 0 && (
-            <Alert severity="warning" sx={{ mt: 1, py: 0.25 }}>
-              <Typography variant="caption">
-                {contract.conflict_notes.join(' | ')}
-              </Typography>
-            </Alert>
-          )}
-
-          {contract.recovery_actions.length > 0 && (
-            <Box sx={{ mt: 1 }}>
-              <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block', mb: 0.5 }}>
-                Recovery actions:
-              </Typography>
-              {contract.recovery_actions.slice(0, 3).map((action, idx) => (
-                <Typography key={`${action.action}-${idx}`} variant="caption" sx={{ display: 'block', color: 'text.secondary' }}>
-                  {idx + 1}. {action.description}
+            {contract.recovery_actions.length > 0 && (
+              <Box sx={{ mt: 1 }}>
+                <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block', mb: 0.5 }}>
+                  Recovery actions:
                 </Typography>
-              ))}
-            </Box>
-          )}
+                {contract.recovery_actions.slice(0, 4).map((action, idx) => (
+                  <Typography key={`${action.action}-${idx}`} variant="caption" sx={{ display: 'block', color: 'text.secondary' }}>
+                    {idx + 1}. {action.description}
+                  </Typography>
+                ))}
+              </Box>
+            )}
+          </Collapse>
         </Paper>
       </Box>
+      <Dialog
+        open={evidenceDialogOpen}
+        onClose={() => setEvidenceDialogOpen(false)}
+        fullWidth
+        maxWidth="md"
+      >
+        <DialogTitle>{evidenceDialogTitle || 'Evidence detail'}</DialogTitle>
+        <DialogContent>
+          <Typography
+            component="pre"
+            sx={{
+              m: 0,
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word',
+              fontSize: '0.78rem',
+              lineHeight: 1.5,
+            }}
+          >
+            {evidenceDialogBody}
+          </Typography>
+        </DialogContent>
+      </Dialog>
     </Box>
   );
 }
@@ -811,7 +950,7 @@ function LiveAgentStatus({
     ? pipelineProgress.label
     : recentToolActions.length > 0
       ? recentToolActions.join(' -> ')
-      : 'Waiting for next execution update...';
+      : 'Coordinating the next step...';
   const summaryText = isPipelineComplete
     ? 'Analysis complete'
     : assistantReasoning || (
@@ -861,7 +1000,7 @@ function LiveAgentStatus({
                   {pipelineProgress
                     ? ` • Step ${pipelineProgress.stepIndex + 1}/${pipelineProgress.totalSteps}`
                     : ''}
-                  {looksStalled ? ` • no visible updates for ${staleSeconds}s` : ''}
+                  {looksStalled ? ` • still running (quiet for ${staleSeconds}s)` : ''}
                 </Typography>
               </Box>
             </Box>
@@ -913,7 +1052,7 @@ function LiveAgentStatus({
                 </Typography>
               )}
               <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-                System activity: {systemActivity}
+                Recent activity: {systemActivity}
               </Typography>
               {looksStalled && (
                 <Typography variant="caption" sx={{ color: 'warning.main' }}>
@@ -934,12 +1073,14 @@ function MessageBubble({
   onEditMessage,
   onRetryMessage,
   isStreaming,
+  dataProductId,
 }: {
   message: ChatMessage;
   onOpenArtifact?: (type: ArtifactType) => void;
   onEditMessage?: (messageId: string, newContent: string) => void;
   onRetryMessage?: (messageId: string) => void;
   isStreaming: boolean;
+  dataProductId?: string;
 }): React.ReactNode {
   switch (message.role) {
     case 'assistant':
@@ -949,6 +1090,7 @@ function MessageBubble({
           onOpenArtifact={onOpenArtifact}
           onRetry={onRetryMessage}
           isStreaming={isStreaming}
+          dataProductId={dataProductId}
         />
       );
     case 'user':
@@ -970,6 +1112,7 @@ function MessageBubble({
 export function MessageThread({
   messages,
   isStreaming,
+  dataProductId,
   onOpenArtifact,
   onEditMessage,
   onRetryMessage,
@@ -979,7 +1122,6 @@ export function MessageThread({
   const currentPhase = useChatStore((state) => state.currentPhase);
   const reasoningUpdate = useChatStore((state) => state.reasoningUpdate);
   const reasoningLog = useChatStore((state) => state.reasoningLog);
-  const latestAnswerContract = useChatStore((state) => state.latestAnswerContract);
   const visibleMessages = messages.filter((m) => !isHiddenMessage(m));
 
   useEffect(() => {
@@ -1026,6 +1168,7 @@ export function MessageThread({
           onEditMessage={onEditMessage}
           onRetryMessage={onRetryMessage}
           isStreaming={isStreaming}
+          dataProductId={dataProductId}
         />
       ))}
 
@@ -1037,8 +1180,6 @@ export function MessageThread({
         reasoningUpdate={reasoningUpdate}
         reasoningLog={reasoningLog}
       />
-
-      <AnswerTrustCard contract={latestAnswerContract} isStreaming={isStreaming} />
 
       <div ref={bottomRef} />
     </Box>

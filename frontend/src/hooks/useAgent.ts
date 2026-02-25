@@ -32,6 +32,29 @@ interface QueuedOutboundMessage {
   files?: File[];
 }
 
+function buildFallbackAnswerContract(reason: string) {
+  return {
+    source_mode: 'unknown' as const,
+    exactness_state: 'not_applicable' as const,
+    confidence_decision: 'medium' as const,
+    trust_state: 'answer_with_warnings' as const,
+    evidence_summary: reason,
+    conflict_notes: [],
+    citations: [],
+    recovery_actions: [
+      {
+        action: 'request_sources',
+        description: 'Ask ekaiX to provide explicit citations or rerun with additional context.',
+        metadata: {},
+      },
+    ],
+    metadata: {
+      fallback_contract: true,
+      observed_at: new Date().toISOString(),
+    },
+  };
+}
+
 function phaseToMissionStep(
   phase: string,
 ): 'discovery' | 'requirements' | 'modeling' | 'generation' | 'validation' | 'publishing' {
@@ -71,6 +94,8 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
   const pendingQueueRef = useRef<QueuedOutboundMessage[]>([]);
   const dispatchInFlightRef = useRef(false);
   const flushQueuedMessagesRef = useRef<() => Promise<void>>(async () => undefined);
+  const sawAssistantTokensRef = useRef(false);
+  const lastStatusMessageRef = useRef('');
   const storeApi = useChatStoreApi();
 
   const setSessionId = useChatStore((s) => s.setSessionId);
@@ -87,8 +112,26 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
   const setReasoningUpdate = useChatStore((s) => s.setReasoningUpdate);
   const clearReasoningLog = useChatStore((s) => s.clearReasoningLog);
   const setAnswerContract = useChatStore((s) => s.setAnswerContract);
+  const attachAnswerContractToLastAssistant = useChatStore(
+    (s) => s.attachAnswerContractToLastAssistant,
+  );
   const clearAnswerContract = useChatStore((s) => s.clearAnswerContract);
   const sessionId = useChatStore((s) => s.sessionId);
+
+  const ensureFallbackContractForLatestAssistant = useCallback(() => {
+    const state = storeApi.getState();
+    if (state.latestAnswerContract) return;
+
+    const latestAssistant = [...state.messages]
+      .reverse()
+      .find((message) => message.role === 'assistant');
+    const latestText = latestAssistant?.content?.trim() ?? '';
+    if (!latestText) return;
+
+    attachAnswerContractToLastAssistant(
+      buildFallbackAnswerContract('Answer generated without an explicit evidence contract.'),
+    );
+  }, [storeApi, attachAnswerContractToLastAssistant]);
 
   const persistAttachmentsInDocumentLibrary = useCallback(
     async (files?: File[]) => {
@@ -136,6 +179,7 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
 
       const handlers: SSEHandlers = {
         onToken: (text: string) => {
+          sawAssistantTokensRef.current = true;
           if (!storeApi.getState().isStreaming) {
             setStreaming(true);
           }
@@ -143,12 +187,14 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
           if (lastMessage?.role === 'assistant' && lastMessage.isStreaming) {
             updateLastAssistantMessage(lastMessage.content + text);
           } else {
+            const pendingContract = storeApi.getState().latestAnswerContract;
             addMessage({
               id: crypto.randomUUID(),
               role: 'assistant',
               content: text,
               timestamp: new Date().toISOString(),
               isStreaming: true,
+              answerContract: pendingContract,
             });
           }
         },
@@ -165,8 +211,10 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
           if (finalized) {
             updateLastAssistantMessage(finalized);
           }
+          ensureFallbackContractForLatestAssistant();
           finalizeLastMessage();
           setStreaming(false);
+          sawAssistantTokensRef.current = false;
         },
         onToolCall: (toolName: string) => {
           if (!storeApi.getState().isStreaming) {
@@ -239,15 +287,59 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
           if (rawContract) {
             const normalized = normalizeAnswerContract(rawContract);
             if (normalized) {
-              setAnswerContract(normalized);
+              attachAnswerContractToLastAssistant({
+                ...normalized,
+                metadata: {
+                  ...normalized.metadata,
+                  observed_at:
+                    typeof normalized.metadata?.observed_at === 'string'
+                      ? normalized.metadata.observed_at
+                      : new Date().toISOString(),
+                },
+              });
             }
           }
 
-          if (message) {
+          const normalizedMessage = message.trim();
+          if (normalizedMessage) {
+            const compact = normalizedMessage.toLowerCase().replace(/\s+/g, ' ');
+            if (compact === lastStatusMessageRef.current) return;
+
+            const latest = storeApi.getState().messages.at(-1);
+            const latestAssistantText =
+              latest?.role === 'assistant' ? latest.content.trim().toLowerCase() : '';
+            const contractSummaryRaw =
+              typeof (data?.answer_contract as { evidence_summary?: unknown } | undefined)?.evidence_summary === 'string'
+                ? (data?.answer_contract as { evidence_summary?: string }).evidence_summary
+                : typeof (data?.contract as { evidence_summary?: unknown } | undefined)?.evidence_summary === 'string'
+                  ? (data?.contract as { evidence_summary?: string }).evidence_summary
+                  : '';
+            const contractSummary = (contractSummaryRaw ?? '')
+              .trim()
+              .toLowerCase()
+              .replace(/\s+/g, ' ');
+
+            if (contractSummary && contractSummary === compact) return;
+            if (
+              latestAssistantText &&
+              (latestAssistantText.includes(compact) || compact.includes(latestAssistantText))
+            ) {
+              return;
+            }
+            if (
+              sawAssistantTokensRef.current &&
+              !/(failed|error|action required|blocked|retry|timed out|did not complete)/i.test(
+                normalizedMessage,
+              )
+            ) {
+              return;
+            }
+
+            lastStatusMessageRef.current = compact;
             addMessage({
               id: crypto.randomUUID(),
-              role: 'assistant',
-              content: message,
+              role: 'system',
+              content: normalizedMessage,
               timestamp: new Date().toISOString(),
             });
           }
@@ -325,12 +417,15 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
                 metadata: {},
               },
             ],
-            metadata: { reason },
+            // Recency signal used by trust badges.
+            metadata: { reason, observed_at: new Date().toISOString() },
           });
           setStreaming(false);
           setIsConnected(false);
           setPipelineProgress(null);
           setPipelineRunning(false);
+          sawAssistantTokensRef.current = false;
+          lastStatusMessageRef.current = '';
           addMessage({
             id: crypto.randomUUID(),
             role: 'system',
@@ -342,11 +437,14 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
           });
         },
         onDone: () => {
+          ensureFallbackContractForLatestAssistant();
           finalizeLastMessage();
           setStreaming(false);
           setIsConnected(false);
           setPipelineProgress(null);
           setPipelineRunning(false);
+          sawAssistantTokensRef.current = false;
+          lastStatusMessageRef.current = '';
           queueMicrotask(() => {
             void flushQueuedMessagesRef.current();
           });
@@ -370,13 +468,16 @@ function useAgent({ dataProductId }: UseAgentOptions): UseAgentReturn {
       setPipelineRunning,
       setDataTier,
       setReasoningUpdate,
-      setAnswerContract,
+      attachAnswerContractToLastAssistant,
+      ensureFallbackContractForLatestAssistant,
     ],
   );
 
   const dispatchMessage = useCallback(
     async (content: string, files?: File[]) => {
       dispatchInFlightRef.current = true;
+      sawAssistantTokensRef.current = false;
+      lastStatusMessageRef.current = '';
       clearReasoningLog();
       clearAnswerContract();
       setStreaming(true);

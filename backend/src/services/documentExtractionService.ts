@@ -25,6 +25,11 @@ interface FileProfile {
   supportsSnowflakeExtract: boolean;
 }
 
+interface PageContent {
+  pageNumber: number;
+  text: string;
+}
+
 interface SnowflakeExtractionAttempt {
   extractedText: string | null;
   extractionStatus: ExtractionStatus;
@@ -32,6 +37,7 @@ interface SnowflakeExtractionAttempt {
   extractionWarnings: string[];
   extractionMetadata: Record<string, unknown>;
   summaryHint?: string;
+  pages?: PageContent[];
 }
 
 interface DocumentExtractionResult {
@@ -41,6 +47,7 @@ interface DocumentExtractionResult {
   extractionWarnings: string[];
   extractionMetadata: Record<string, unknown>;
   summaryHint?: string;
+  pages?: PageContent[];
 }
 
 const TEXT_EXTENSIONS = new Set([
@@ -314,6 +321,33 @@ function extractTextFromParseDocument(
   return flattened.join('\n').slice(0, 500_000);
 }
 
+function extractPagesFromParseDocument(
+  parsed: Record<string, unknown>,
+): PageContent[] | null {
+  const pages = parsed.pages;
+  if (!Array.isArray(pages) || pages.length === 0) return null;
+
+  const result: PageContent[] = [];
+  for (let i = 0; i < pages.length; i += 1) {
+    const page = pages[i];
+    if (!page || typeof page !== 'object') continue;
+    const record = page as Record<string, unknown>;
+    const content = record.content;
+    if (typeof content !== 'string' || content.trim().length === 0) continue;
+    // Page number from the object, or fall back to 1-based index
+    const rawPageNum = typeof record.pageNumber === 'number'
+      ? record.pageNumber
+      : typeof record.page_number === 'number'
+        ? record.page_number
+        : i + 1;
+    // Normalize to 1-based; treat 0 as first page
+    const pageNum = rawPageNum > 0 ? rawPageNum : i + 1;
+    result.push({ pageNumber: pageNum, text: content.trim() });
+  }
+
+  return result.length > 0 ? result : null;
+}
+
 function extractTextFromAiExtract(
   extracted: Record<string, unknown>,
 ): string | null {
@@ -413,6 +447,7 @@ async function runSnowflakeParseDocument(
   if (!parsed) return null;
 
   const extractedText = extractTextFromParseDocument(parsed);
+  const extractedPages = extractPagesFromParseDocument(parsed);
   const pageCount = Array.isArray(parsed.pages) ? parsed.pages.length : undefined;
 
   return {
@@ -430,6 +465,7 @@ async function runSnowflakeParseDocument(
       typeof parsed.summary === 'string' && parsed.summary.trim().length > 0
         ? parsed.summary.trim().slice(0, 280)
         : undefined,
+    pages: extractedPages ?? undefined,
   };
 }
 
@@ -759,4 +795,197 @@ export async function extractDocumentContent(
   };
 }
 
-export type { ExtractionStatus, DocumentExtractionResult, DocumentExtractionInput };
+/**
+ * Upload document chunks to Snowflake for Cortex Search Service indexing.
+ *
+ * Creates EKAIX.{sanitized_dp_name}_DOCS schema and DOC_CHUNKS table,
+ * then uses SPLIT_TEXT_RECURSIVE_CHARACTER to chunk the extracted text
+ * and inserts into Snowflake. This is the Tier 1 foundation for document
+ * intelligence — enabling Cortex Search over uploaded documents.
+ */
+export async function uploadChunksToSnowflake(
+  dataProductId: string,
+  dataProductName: string,
+  documentId: string,
+  filename: string,
+  docKind: string | null,
+  extractedText: string,
+): Promise<{ chunkCount: number; schema: string }> {
+  // Sanitize data product name for schema identifier
+  const sanitized = dataProductName
+    .replace(/\s+/g, '_')
+    .replace(/[^A-Za-z0-9_]/g, '')
+    .replace(/_+/g, '_')
+    .toUpperCase()
+    .slice(0, 200) || 'DEFAULT';
+  const docsSchema = `${sanitized}_DOCS`;
+
+  // Ensure EKAIX database and docs schema exist
+  await snowflakeService.executeQuery('CREATE DATABASE IF NOT EXISTS EKAIX');
+  await snowflakeService.executeQuery(
+    `CREATE SCHEMA IF NOT EXISTS "EKAIX"."${docsSchema}"`,
+  );
+
+  const fqSchema = `"EKAIX"."${docsSchema}"`;
+
+  // Create DOC_CHUNKS table if not exists
+  await snowflakeService.executeQuery(`
+    CREATE TABLE IF NOT EXISTS ${fqSchema}.DOC_CHUNKS (
+      chunk_id VARCHAR NOT NULL,
+      document_id VARCHAR NOT NULL,
+      filename VARCHAR,
+      doc_kind VARCHAR,
+      page_no INTEGER,
+      section_path VARCHAR,
+      chunk_seq INTEGER,
+      chunk_text VARCHAR,
+      uploaded_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+    )
+  `);
+
+  // Escape text for Snowflake $$ literal (no escaping needed inside $$)
+  // But we need to handle the case where text contains $$ itself
+  const safeText = extractedText.replace(/\$\$/g, '$ $');
+  const safeDocId = documentId.replace(/'/g, "''");
+  const safeFilename = filename.replace(/'/g, "''");
+  const safeDocKind = (docKind ?? 'general').replace(/'/g, "''");
+
+  // Use Snowflake SPLIT_TEXT_RECURSIVE_CHARACTER for chunking and insert
+  const insertSql = `
+    INSERT INTO ${fqSchema}.DOC_CHUNKS
+      (chunk_id, document_id, filename, doc_kind, page_no, section_path, chunk_seq, chunk_text)
+    SELECT
+      UUID_STRING(),
+      '${safeDocId}',
+      '${safeFilename}',
+      '${safeDocKind}',
+      NULL,
+      'auto_chunk_' || (c.index + 1)::VARCHAR,
+      c.index + 1,
+      c.value::VARCHAR
+    FROM TABLE(FLATTEN(
+      SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER(
+        $$${safeText}$$, 'markdown', 1500, 200
+      )
+    )) c
+  `;
+  await snowflakeService.executeQuery(insertSql);
+
+  // Get chunk count
+  const countResult = await snowflakeService.executeQuery(
+    `SELECT COUNT(*) AS cnt FROM ${fqSchema}.DOC_CHUNKS WHERE document_id = '${safeDocId}'`,
+  );
+  const chunkCount = Number(
+    (countResult.rows[0] as Record<string, unknown>)?.cnt ??
+    (countResult.rows[0] as Record<string, unknown>)?.CNT ?? 0,
+  );
+
+  return { chunkCount, schema: `EKAIX.${docsSchema}` };
+}
+
+/**
+ * Extract a section header from the first line of a markdown text block.
+ * Returns the header text (without # prefix) or null if no header found.
+ */
+function extractSectionHeader(text: string): string | null {
+  const firstLine = text.split('\n', 1)[0]?.trim() ?? '';
+  if (firstLine.startsWith('#')) {
+    // Strip leading # characters and whitespace
+    return firstLine.replace(/^#+\s*/, '').trim().slice(0, 200) || null;
+  }
+  return null;
+}
+
+/**
+ * Upload document chunks to Snowflake with page-level attribution.
+ *
+ * Instead of chunking the entire document as one blob, chunks each page
+ * independently and tracks page_no and section_path for citation support.
+ * Falls back to uploadChunksToSnowflake() if page-aware upload fails.
+ */
+export async function uploadPageAwareChunksToSnowflake(
+  dataProductId: string,
+  dataProductName: string,
+  documentId: string,
+  filename: string,
+  docKind: string | null,
+  pages: PageContent[],
+): Promise<{ chunkCount: number; schema: string }> {
+  const sanitized = dataProductName
+    .replace(/\s+/g, '_')
+    .replace(/[^A-Za-z0-9_]/g, '')
+    .replace(/_+/g, '_')
+    .toUpperCase()
+    .slice(0, 200) || 'DEFAULT';
+  const docsSchema = `${sanitized}_DOCS`;
+
+  // Ensure EKAIX database and docs schema exist
+  await snowflakeService.executeQuery('CREATE DATABASE IF NOT EXISTS EKAIX');
+  await snowflakeService.executeQuery(
+    `CREATE SCHEMA IF NOT EXISTS "EKAIX"."${docsSchema}"`,
+  );
+
+  const fqSchema = `"EKAIX"."${docsSchema}"`;
+
+  // Create DOC_CHUNKS table if not exists (same as uploadChunksToSnowflake)
+  await snowflakeService.executeQuery(`
+    CREATE TABLE IF NOT EXISTS ${fqSchema}.DOC_CHUNKS (
+      chunk_id VARCHAR NOT NULL,
+      document_id VARCHAR NOT NULL,
+      filename VARCHAR,
+      doc_kind VARCHAR,
+      page_no INTEGER,
+      section_path VARCHAR,
+      chunk_seq INTEGER,
+      chunk_text VARCHAR,
+      uploaded_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+    )
+  `);
+
+  const safeDocId = documentId.replace(/'/g, "''");
+  const safeFilename = filename.replace(/'/g, "''");
+  const safeDocKind = (docKind ?? 'general').replace(/'/g, "''");
+
+  let totalChunks = 0;
+
+  for (const page of pages) {
+    const safeText = page.text.replace(/\$\$/g, '$ $');
+    const sectionHeader = extractSectionHeader(page.text);
+    const safeSectionPath = sectionHeader
+      ? sectionHeader.replace(/'/g, "''")
+      : `page_${page.pageNumber}`;
+
+    const insertSql = `
+      INSERT INTO ${fqSchema}.DOC_CHUNKS
+        (chunk_id, document_id, filename, doc_kind, page_no, section_path, chunk_seq, chunk_text)
+      SELECT
+        UUID_STRING(),
+        '${safeDocId}',
+        '${safeFilename}',
+        '${safeDocKind}',
+        ${page.pageNumber},
+        '${safeSectionPath}',
+        c.index + 1,
+        c.value::VARCHAR
+      FROM TABLE(FLATTEN(
+        SNOWFLAKE.CORTEX.SPLIT_TEXT_RECURSIVE_CHARACTER(
+          $$${safeText}$$, 'markdown', 1500, 200
+        )
+      )) c
+    `;
+    await snowflakeService.executeQuery(insertSql);
+  }
+
+  // Get total chunk count for this document
+  const countResult = await snowflakeService.executeQuery(
+    `SELECT COUNT(*) AS cnt FROM ${fqSchema}.DOC_CHUNKS WHERE document_id = '${safeDocId}'`,
+  );
+  totalChunks = Number(
+    (countResult.rows[0] as Record<string, unknown>)?.cnt ??
+    (countResult.rows[0] as Record<string, unknown>)?.CNT ?? 0,
+  );
+
+  return { chunkCount: totalChunks, schema: `EKAIX.${docsSchema}` };
+}
+
+export type { ExtractionStatus, DocumentExtractionResult, DocumentExtractionInput, PageContent };

@@ -32,6 +32,15 @@ interface DocumentRegistryLookup {
   diagnostics: Record<string, unknown>;
 }
 
+interface StaleArtifactContextImpact {
+  artifact_type: string;
+  artifact_label: string;
+  impacted_steps: string[];
+  snapshot_context_version: number | null;
+  latest_context_version: number | null;
+  reason: string;
+}
+
 interface DocumentsPanelProps {
   open: boolean;
   onClose: () => void;
@@ -49,6 +58,9 @@ interface DocumentsPanelProps {
   isUpdatingContext?: boolean;
   isDeleting?: boolean;
   isReextracting?: boolean;
+  contextImpactedSteps?: string[];
+  contextStaleArtifacts?: StaleArtifactContextImpact[];
+  contextRecommendedActions?: string[];
 }
 
 function formatTimestamp(iso: string): string {
@@ -110,6 +122,9 @@ export function DocumentsPanel({
   isUpdatingContext = false,
   isDeleting = false,
   isReextracting = false,
+  contextImpactedSteps = [],
+  contextStaleArtifacts = [],
+  contextRecommendedActions = [],
 }: DocumentsPanelProps): React.ReactNode {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -190,6 +205,53 @@ export function DocumentsPanel({
             >
               {uploadNotice}
             </Typography>
+          )}
+          {(contextImpactedSteps.length > 0 || contextStaleArtifacts.length > 0) && (
+            <Box
+              sx={{
+                mb: 1.5,
+                p: 1.25,
+                borderRadius: 1,
+                border: 1,
+                borderColor: 'warning.main',
+                bgcolor: 'warning.50',
+              }}
+            >
+              <Typography variant="caption" sx={{ display: 'block', color: 'text.secondary', mb: 0.75 }}>
+                Context impact from document changes
+              </Typography>
+              {contextImpactedSteps.length > 0 && (
+                <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap', mb: 0.75 }}>
+                  {contextImpactedSteps.slice(0, 6).map((step) => (
+                    <Chip
+                      key={`step-${step}`}
+                      size="small"
+                      color="warning"
+                      variant="outlined"
+                      label={`${step.charAt(0).toUpperCase()}${step.slice(1)}`}
+                    />
+                  ))}
+                </Box>
+              )}
+              {contextStaleArtifacts.length > 0 && (
+                <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap', mb: 0.5 }}>
+                  {contextStaleArtifacts.slice(0, 8).map((artifact) => (
+                    <Chip
+                      key={`${artifact.artifact_type}-${artifact.latest_context_version ?? 'na'}`}
+                      size="small"
+                      color="warning"
+                      variant="filled"
+                      label={`${artifact.artifact_label} may be stale`}
+                    />
+                  ))}
+                </Box>
+              )}
+              {contextRecommendedActions.length > 0 && (
+                <Typography variant="caption" sx={{ display: 'block', color: 'text.secondary' }}>
+                  {contextRecommendedActions[0]}
+                </Typography>
+              )}
+            </Box>
           )}
           {documents.length === 0 ? (
             <Typography

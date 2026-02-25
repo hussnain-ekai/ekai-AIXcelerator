@@ -1,0 +1,42 @@
+manifest_version: 1
+
+version:
+  name: ekaiX
+  label: "ekai AIXcelerator"
+  comment: "Governed enterprise intelligence system - Snowflake Native App"
+
+artifacts:
+  setup_script: setup_script.sql
+  default_streamlit: null
+  extension_code: false
+
+  container_services:
+    images:
+      - /spcs_services/frontend/
+      - /spcs_services/backend/
+      - /spcs_services/ai-service/
+
+configuration:
+  log_level:
+    type: STRING
+    default: INFO
+  trace_level:
+    type: STRING
+    default: "OFF"
+
+privileges:
+  - CREATE COMPUTE POOL:
+      description: "Create compute pools for ekaiX services"
+  - CREATE WAREHOUSE:
+      description: "Create warehouses for query execution"
+  - BIND SERVICE ENDPOINT:
+      description: "Expose service endpoints"
+
+references:
+  - snowflake_warehouse:
+      label: "Query Warehouse"
+      description: "Warehouse for executing Snowflake queries"
+      privileges:
+        - USAGE
+      object_type: WAREHOUSE
+      register_callback: config_reference_callback

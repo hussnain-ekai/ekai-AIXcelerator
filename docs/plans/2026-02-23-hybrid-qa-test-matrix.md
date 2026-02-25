@@ -45,3 +45,5 @@ Initial QA matrix for `HYB-QA-001` covering core answer paths:
 - Backend API integration tests: registry/facts/chunks/evidence endpoints.
 - AI contract tests: source mode, exactness state, trust state transitions.
 - Playwright E2E: evidence visibility, abstain UX, long-running status behavior.
+- Benchmark gate (HYB-QA-005):
+  - `cd ai-service && venv/bin/python scripts/run_hybrid_benchmark.py --cases .benchmarks/gold_cases_300.jsonl --predictions .benchmarks/gold_predictions_300.json --fail-on-gate`

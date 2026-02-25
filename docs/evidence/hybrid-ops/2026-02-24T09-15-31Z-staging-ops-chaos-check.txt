@@ -1,0 +1,20 @@
+Running hybrid ops chaos check
+  endpoint: http://localhost:8000/documents/semantic/019c8c84-7ad8-74cf-b1be-da855153d2c0/ops/dashboard?window_hours=24&trace_limit=25&alert_limit=100
+  user:     dev@localhost
+{
+  "data_product_id": "019c8c84-7ad8-74cf-b1be-da855153d2c0",
+  "window_hours": 24,
+  "summary": {
+    "total_answers": 63,
+    "abstained_answers": 24,
+    "conflicting_answers": 4,
+    "citation_missing_answers": 34,
+    "avg_citations": 0.635,
+    "avg_tool_calls": 5.333
+  },
+  "alerts_count": 4,
+  "trace_count": 25,
+  "alert_event_count": 3,
+  "generated_at": "2026-02-24T09:15:31.604Z"
+}
+Hybrid ops chaos check passed.

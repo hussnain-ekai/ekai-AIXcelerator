@@ -1,0 +1,23 @@
+spec:
+  container:
+    - name: backend
+      image: /ekaix/app/image_repo/backend:latest
+      resources:
+        requests:
+          cpu: 0.5
+          memory: 512Mi
+        limits:
+          cpu: 2
+          memory: 2Gi
+      env:
+        NODE_ENV: production
+        PORT: "8000"
+      secrets:
+        - snowflake-secret
+      readinessProbe:
+        port: 8000
+        path: /health
+  endpoint:
+    - name: backend
+      port: 8000
+      public: false

@@ -1,0 +1,47 @@
+name: Hybrid Ops Staging Chaos
+
+on:
+  workflow_dispatch:
+    inputs:
+      data_product_id:
+        description: Data product id to validate in staging
+        required: true
+      window_hours:
+        description: Dashboard lookback window in hours
+        required: false
+        default: "24"
+      expect_signal:
+        description: Expected alert signal in staging run
+        required: false
+        default: "citation_missing_answers"
+
+jobs:
+  staging-chaos:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate staging secrets
+        shell: bash
+        run: |
+          [[ -n "${{ secrets.STAGING_API_URL }}" ]] || { echo "Missing STAGING_API_URL secret"; exit 1; }
+          [[ -n "${{ secrets.STAGING_E2E_USER }}" ]] || { echo "Missing STAGING_E2E_USER secret"; exit 1; }
+
+      - name: Run staging ops chaos check
+        shell: bash
+        env:
+          STAGING_API_URL: ${{ secrets.STAGING_API_URL }}
+          STAGING_E2E_USER: ${{ secrets.STAGING_E2E_USER }}
+        run: |
+          scripts/run-hybrid-ops-staging-evidence.sh \
+            "${{ github.event.inputs.data_product_id }}" \
+            "${{ github.event.inputs.window_hours }}" \
+            "${{ github.event.inputs.expect_signal }}"
+
+      - name: Upload staging ops evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: hybrid-ops-staging-chaos-evidence
+          path: docs/evidence/hybrid-ops/*staging-ops-*

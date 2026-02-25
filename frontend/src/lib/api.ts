@@ -24,10 +24,18 @@ class ApiRequestError extends Error {
 
 function getAuthHeaders(): Record<string, string> {
   const user = useAuthStore.getState().user;
-  const effectiveUser =
-    user ?? (process.env.NODE_ENV === 'development' ? 'dev@localhost' : null);
+  const configuredDevUser = process.env.NEXT_PUBLIC_DEV_USER?.trim();
+  const localDevUser =
+    typeof window !== 'undefined' &&
+    (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
+      ? 'dev@localhost'
+      : null;
+  const effectiveUser = user ?? configuredDevUser ?? localDevUser;
   if (effectiveUser) {
-    return { 'Sf-Context-Current-User': effectiveUser };
+    return {
+      'Sf-Context-Current-User': effectiveUser,
+      'X-Dev-User': effectiveUser,
+    };
   }
   return {};
 }

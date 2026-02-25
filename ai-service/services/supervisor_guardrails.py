@@ -23,15 +23,52 @@ _GENERIC_PROCEED_WORDS: set[str] = {
     "lets proceed",
 }
 
+_AUTOPILOT_MARKERS: tuple[str, ...] = (
+    "end to end",
+    "end-to-end",
+    "without pause",
+    "no pause",
+    "no pauses",
+    "do not pause",
+    "don't pause",
+    "do not stop",
+    "don't stop",
+    "without confirmation",
+    "do not stop for confirmation",
+    "dont stop for confirmation",
+    "autopilot",
+)
+
+_AUTOPILOT_ACTION_PATTERN = re.compile(
+    r"\b(proceed|continue|run|complete|finish|build|generate|validate|publish|deploy|test)\b"
+)
+
+
+def _normalize_user_text(message: str) -> str:
+    return re.sub(r"\s+", " ", (message or "").strip().lower())
+
 
 def is_requirements_transition_intent(message: str) -> bool:
     """Detect explicit user intent to move from discovery to requirements."""
-    text = re.sub(r"\s+", " ", (message or "").strip().lower())
+    text = _normalize_user_text(message)
     if not text:
         return False
     if text in _GENERIC_PROCEED_WORDS:
         return True
     return any(re.search(p, text) for p in _REQ_MOVE_PATTERNS)
+
+
+def is_end_to_end_autopilot_intent(message: str) -> bool:
+    """Detect explicit user intent to continue the full pipeline without pauses."""
+    text = _normalize_user_text(message)
+    if not text:
+        return False
+
+    has_marker = any(marker in text for marker in _AUTOPILOT_MARKERS)
+    if not has_marker:
+        return False
+
+    return bool(_AUTOPILOT_ACTION_PATTERN.search(text))
 
 
 def requirements_entry_ready(snapshot: dict[str, Any]) -> tuple[bool, str]:
@@ -73,6 +110,9 @@ def build_supervisor_contract(
     user_message: str,
     transition_target: str | None,
     transition_reason: str | None,
+    *,
+    run_mode: str | None = None,
+    publish_preapproved: bool = False,
 ) -> str:
     """Build a compact supervisor contract injected into orchestrator input."""
     current_phase = snapshot.get("current_phase") or "discovery"
@@ -83,6 +123,11 @@ def build_supervisor_contract(
         "[SUPERVISOR CONTEXT CONTRACT — INTERNAL, NEVER SHOW TO USER]",
         f"current_phase={current_phase}",
         f"data_tier={data_tier}",
+        f"product_type={snapshot.get('product_type') or 'structured'}",
+        f"has_documents={bool(snapshot.get('has_documents'))}",
+        f"data_product_name={snapshot.get('data_product_name') or ''}",
+        f"target_schema_marts={snapshot.get('target_schema_marts') or ''}",
+        f"target_schema_docs={snapshot.get('target_schema_docs') or ''}",
         f"data_description_exists={bool(snapshot.get('data_description_exists'))}",
         f"transformation_done={bool(snapshot.get('transformation_done'))}",
         f"brd_exists={bool(snapshot.get('brd_exists'))}",
@@ -91,6 +136,12 @@ def build_supervisor_contract(
         "communication_policy=business labels first; reveal technical detail only if user explicitly asks",
         "requirements_policy=ask focused high-signal questions, avoid generic fluff and info dumps, continue until requirements are complete",
     ]
+
+    if run_mode:
+        lines.append(f"run_mode={run_mode}")
+        if run_mode == "autopilot_end_to_end":
+            lines.append("pause_policy=skip_optional_review_pauses")
+    lines.append(f"publish_approval={'preapproved' if publish_preapproved else 'required'}")
 
     if transition_target:
         lines.append(f"forced_transition={current_phase}->{transition_target}")
@@ -150,6 +201,17 @@ def sanitize_assistant_text(text: str) -> str:
         (r"\bTIMESTAMP_NTZ\b", "timestamp"),
         (r"\bTABLESAMPLE\b", "sampling"),
         (r"\bINFORMATION_SCHEMA\b", "metadata catalog"),
+        (r"\bsemantic models?\b", "data model"),
+        (r"\bsemantic views?\b", "data model"),
+        (r"\bsemantic layers?\b", "analytical model"),
+        (r"\bfact tables?\b", "core data"),
+        (r"\bdimension tables?\b", "reference data"),
+        (r"\btime dimensions?\b", "time period"),
+        (r"\bYAML\b", "model definition"),
+        (r"\bcortex agents?\b", "AI assistant"),
+        (r"\bcortex search\b", "document search"),
+        (r"\bsearch agents?\b", "search capability"),
+        (r"\bpublished agents?\b", "deployed assistant"),
     )
     for pattern, replacement in replacements:
         text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)

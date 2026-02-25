@@ -1,0 +1,2437 @@
+{
+  "by_category": {
+    "document": {
+      "abstain_validity": 1.0,
+      "citation_validity": 1.0,
+      "correctness": 1.0,
+      "count": 100.0,
+      "critical_error_rate": 0.0
+    },
+    "hybrid": {
+      "abstain_validity": 1.0,
+      "citation_validity": 1.0,
+      "correctness": 1.0,
+      "count": 100.0,
+      "critical_error_rate": 0.0
+    },
+    "structured": {
+      "abstain_validity": 1.0,
+      "citation_validity": 1.0,
+      "correctness": 1.0,
+      "count": 100.0,
+      "critical_error_rate": 0.0
+    }
+  },
+  "cases_total": 300,
+  "missing_predictions": [],
+  "overall": {
+    "abstain_validity": 1.0,
+    "citation_validity": 1.0,
+    "correctness": 1.0,
+    "count": 300.0,
+    "critical_error_rate": 0.0
+  },
+  "release_gate_passed": true,
+  "results": [
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-001",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-002",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-003",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-004",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-005",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-006",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-007",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-008",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-009",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-010",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-011",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-012",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-013",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-014",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-015",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-016",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-017",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-018",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-019",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-020",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-021",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-022",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-023",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-024",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-025",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-026",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-027",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-028",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-029",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-030",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-031",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-032",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-033",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-034",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-035",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-036",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-037",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-038",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-039",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-040",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-041",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-042",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-043",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-044",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-045",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-046",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-047",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-048",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-049",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-050",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-051",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-052",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-053",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-054",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-055",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-056",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-057",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-058",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-059",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-060",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-061",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-062",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-063",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-064",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-065",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-066",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-067",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-068",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-069",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-070",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-071",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-072",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-073",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-074",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-075",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-076",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-077",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-078",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-079",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-080",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-081",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-082",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-083",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-084",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-085",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-086",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-087",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-088",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-089",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-090",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-091",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-092",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-093",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-094",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-095",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-096",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-097",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-098",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-099",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "str-100",
+      "category": "structured",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-001",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-002",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-003",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-004",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-005",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-006",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-007",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-008",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-009",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-010",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-011",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-012",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-013",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-014",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-015",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-016",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-017",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-018",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-019",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-020",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-021",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-022",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-023",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-024",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-025",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-026",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-027",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-028",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-029",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-030",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-031",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-032",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-033",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-034",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-035",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-036",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-037",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-038",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-039",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-040",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-041",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-042",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-043",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-044",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-045",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-046",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-047",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-048",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-049",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-050",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-051",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-052",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-053",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-054",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-055",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-056",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-057",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-058",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-059",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-060",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-061",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-062",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-063",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-064",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-065",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-066",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-067",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-068",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-069",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-070",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-071",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-072",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-073",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-074",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-075",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-076",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-077",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-078",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-079",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-080",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-081",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-082",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-083",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-084",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-085",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-086",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-087",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-088",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-089",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-090",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-091",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-092",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-093",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-094",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-095",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-096",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-097",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-098",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-099",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "doc-100",
+      "category": "document",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-001",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-002",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-003",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-004",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-005",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-006",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-007",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-008",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-009",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-010",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-011",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-012",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-013",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-014",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-015",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-016",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-017",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-018",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-019",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-020",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-021",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-022",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-023",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-024",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-025",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-026",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-027",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-028",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-029",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-030",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-031",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-032",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-033",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-034",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-035",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-036",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-037",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-038",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-039",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-040",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-041",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-042",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-043",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-044",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-045",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-046",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-047",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-048",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-049",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-050",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-051",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-052",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-053",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-054",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-055",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-056",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-057",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-058",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-059",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-060",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-061",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-062",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-063",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-064",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-065",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-066",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-067",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-068",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-069",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-070",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-071",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-072",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-073",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-074",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-075",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-076",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-077",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-078",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-079",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-080",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-081",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-082",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-083",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-084",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-085",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-086",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-087",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-088",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-089",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-090",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-091",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-092",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-093",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-094",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-095",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-096",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-097",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-098",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-099",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    },
+    {
+      "abstain_valid": 1.0,
+      "case_id": "hyb-100",
+      "category": "hybrid",
+      "citation_valid": 1.0,
+      "correctness": 1.0,
+      "critical_error": 0.0
+    }
+  ]
+}

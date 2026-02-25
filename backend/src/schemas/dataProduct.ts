@@ -5,10 +5,14 @@ import { z } from 'zod';
 export const createDataProductSchema = z.object({
   name: z.string().min(1).max(256),
   description: z.string().max(2000).optional().default(''),
-  database_reference: z.string().min(1),
-  schemas: z.array(z.string().min(1)).min(1),
-  tables: z.array(z.string().min(1)).min(1),
-});
+  product_type: z.enum(['structured', 'document', 'hybrid']).optional().default('structured'),
+  database_reference: z.string().min(1).optional(),
+  schemas: z.array(z.string().min(1)).optional().default([]),
+  tables: z.array(z.string().min(1)).optional().default([]),
+}).refine(
+  (data) => data.product_type !== 'structured' || (data.database_reference && data.tables && data.tables.length > 0),
+  { message: 'Structured products require database_reference and at least one table' }
+);
 
 export type CreateDataProductInput = z.infer<typeof createDataProductSchema>;
 

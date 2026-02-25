@@ -18,7 +18,8 @@ interface DataProduct {
   id: string;
   name: string;
   description?: string;
-  database_reference: string;
+  product_type: 'structured' | 'document' | 'hybrid';
+  database_reference: string | null;
   schemas?: string[];
   tables?: string[];
   status: 'discovery' | 'requirements' | 'generation' | 'validation' | 'published' | 'archived';
@@ -41,9 +42,10 @@ interface DataProductsResponse {
 interface DataProductCreateInput {
   name: string;
   description?: string;
-  database_reference: string;
-  schemas: string[];
-  tables: string[];
+  product_type?: 'structured' | 'document' | 'hybrid';
+  database_reference?: string;
+  schemas?: string[];
+  tables?: string[];
 }
 
 interface DataProductUpdateInput {

@@ -1,14 +1,15 @@
-"""Document extraction endpoint for multimodal fallback parsing."""
+"""Document extraction and graph normalization endpoints."""
 
 import base64
 import io
 import json
 import logging
 import re
+import uuid
 import zipfile
 from typing import Any, Literal
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
 
@@ -446,3 +447,163 @@ async def extract_document(req: DocumentExtractRequest) -> DocumentExtractRespon
             method="ai_multimodal_fallback",
             warnings=warnings,
         )
+
+
+# ---------------------------------------------------------------------------
+# Normalize-to-graph: extract structured facts from document text and persist
+# them as Document/Chunk/Fact/Entity nodes in the Neo4j knowledge graph.
+# ---------------------------------------------------------------------------
+
+
+class NormalizeToGraphRequest(BaseModel):
+    data_product_id: str
+    document_id: str
+    extracted_text: str = Field(min_length=1)
+    title: str = ""
+    mime_type: str = "application/octet-stream"
+
+
+class NormalizeToGraphResponse(BaseModel):
+    status: str
+    chunks_count: int = 0
+    facts_count: int = 0
+    entities_count: int = 0
+
+
+@router.post("/normalize-to-graph", response_model=NormalizeToGraphResponse)
+async def normalize_to_graph(req: NormalizeToGraphRequest) -> NormalizeToGraphResponse:
+    """Extract structured facts from document text and persist to Neo4j graph.
+
+    Uses LLM structured output to identify chunks, facts, and entities,
+    then writes them to the document intelligence graph.
+    """
+    from tools.neo4j_document_tools import (
+        upsert_document_node,
+        upsert_document_chunks,
+        upsert_document_facts,
+        link_fact_to_entity,
+    )
+
+    # Step 1: Upsert the Document node
+    try:
+        await upsert_document_node.ainvoke({
+            "data_product_id": req.data_product_id,
+            "document_id": req.document_id,
+            "title": req.title,
+            "mime_type": req.mime_type,
+        })
+    except Exception as e:
+        logger.error("Failed to upsert document node: %s", e)
+        raise HTTPException(status_code=500, detail=f"Failed to create document node: {e}")
+
+    # Step 2: Use LLM to extract chunks, facts, and entities
+    extraction_prompt = (
+        "Analyze this document text and extract structured knowledge.\n"
+        "Return strict JSON with this structure:\n"
+        "{\n"
+        '  "chunks": [{"text": "section text", "position": 0}],\n'
+        '  "facts": [{"statement": "fact statement", "category": "metric|rule|definition|relationship", "chunk_position": 0}],\n'
+        '  "entities": [{"name": "entity name", "entity_type": "metric|person|concept|organization|table|column", "fact_indices": [0]}]\n'
+        "}\n\n"
+        "Rules:\n"
+        "- Break text into logical sections as chunks\n"
+        "- Extract concrete, verifiable facts from each chunk\n"
+        "- Identify named entities mentioned in facts\n"
+        "- fact_indices references the 0-based index in the facts array\n"
+        "- No markdown, no explanations outside JSON\n\n"
+        f"Document text:\n{req.extracted_text[:MAX_LLM_TEXT_BLOCK_CHARS]}"
+    )
+
+    try:
+        model = get_chat_model()
+        response = await model.ainvoke([HumanMessage(content=extraction_prompt)])
+        response_text = _response_content_to_text(response.content)
+        parsed = _extract_json_from_text(response_text)
+    except Exception as e:
+        logger.warning("LLM extraction for graph normalization failed: %s", e)
+        return NormalizeToGraphResponse(status="partial", chunks_count=0, facts_count=0, entities_count=0)
+
+    if not parsed:
+        logger.warning("LLM did not return parseable JSON for graph normalization")
+        return NormalizeToGraphResponse(status="partial", chunks_count=0, facts_count=0, entities_count=0)
+
+    chunks_raw = parsed.get("chunks", [])
+    facts_raw = parsed.get("facts", [])
+    entities_raw = parsed.get("entities", [])
+
+    # Step 3: Upsert chunks
+    chunk_id_map: dict[int, str] = {}
+    chunks_for_neo4j = []
+    for i, chunk in enumerate(chunks_raw):
+        chunk_id = str(uuid.uuid4())
+        chunk_id_map[chunk.get("position", i)] = chunk_id
+        chunks_for_neo4j.append({
+            "chunk_id": chunk_id,
+            "text": chunk.get("text", ""),
+            "position": chunk.get("position", i),
+        })
+
+    chunks_count = 0
+    if chunks_for_neo4j:
+        try:
+            await upsert_document_chunks.ainvoke({
+                "document_id": req.document_id,
+                "chunks": json.dumps(chunks_for_neo4j),
+            })
+            chunks_count = len(chunks_for_neo4j)
+        except Exception as e:
+            logger.error("Failed to upsert document chunks: %s", e)
+
+    # Step 4: Upsert facts per chunk
+    fact_id_list: list[str] = []
+    facts_count = 0
+    # Group facts by their chunk
+    chunk_facts: dict[str, list[dict[str, Any]]] = {}
+    for fact in facts_raw:
+        chunk_pos = fact.get("chunk_position", 0)
+        chunk_id = chunk_id_map.get(chunk_pos, list(chunk_id_map.values())[0] if chunk_id_map else "")
+        if not chunk_id:
+            continue
+        fact_id = str(uuid.uuid4())
+        fact_id_list.append(fact_id)
+        chunk_facts.setdefault(chunk_id, []).append({
+            "fact_id": fact_id,
+            "statement": fact.get("statement", ""),
+            "category": fact.get("category"),
+        })
+
+    for chunk_id, facts in chunk_facts.items():
+        try:
+            await upsert_document_facts.ainvoke({
+                "chunk_id": chunk_id,
+                "facts": json.dumps(facts),
+            })
+            facts_count += len(facts)
+        except Exception as e:
+            logger.error("Failed to upsert facts for chunk %s: %s", chunk_id, e)
+
+    # Step 5: Link entities to facts
+    entities_count = 0
+    for entity in entities_raw:
+        entity_name = entity.get("name", "")
+        entity_type = entity.get("entity_type", "concept")
+        fact_indices = entity.get("fact_indices", [])
+
+        for idx in fact_indices:
+            if 0 <= idx < len(fact_id_list):
+                try:
+                    await link_fact_to_entity.ainvoke({
+                        "fact_id": fact_id_list[idx],
+                        "entity_name": entity_name,
+                        "entity_type": entity_type,
+                    })
+                except Exception as e:
+                    logger.error("Failed to link entity %s to fact: %s", entity_name, e)
+        entities_count += 1
+
+    return NormalizeToGraphResponse(
+        status="completed",
+        chunks_count=chunks_count,
+        facts_count=facts_count,
+        entities_count=entities_count,
+    )

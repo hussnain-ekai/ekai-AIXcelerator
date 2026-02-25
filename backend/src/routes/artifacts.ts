@@ -1,8 +1,13 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
+import { z } from 'zod';
 
 import { postgresService } from '../services/postgresService.js';
 import { minioService } from '../services/minioService.js';
 import { neo4jService } from '../services/neo4jService.js';
+
+const exportParamSchema = z.object({
+  dataProductId: z.string().uuid(),
+});
 
 interface ArtifactRow {
   id: string;
@@ -199,6 +204,91 @@ export async function artifactRoutes(app: FastifyInstance): Promise<void> {
           message: 'Artifact content not found in storage',
         });
       }
+    },
+  );
+
+  /**
+   * GET /artifacts/:dataProductId/export
+   * Export all latest artifacts for a data product as a downloadable JSON bundle.
+   * Returns each artifact's metadata and content (fetched from MinIO).
+   * Uses JSON format because the archiver package is not available.
+   */
+  app.get(
+    '/:dataProductId/export',
+    async (
+      request: FastifyRequest<{ Params: { dataProductId: string } }>,
+      reply,
+    ) => {
+      const paramResult = exportParamSchema.safeParse(request.params);
+      if (!paramResult.success) {
+        return reply.status(400).send({
+          error: 'VALIDATION_ERROR',
+          message: 'Invalid data product ID',
+        });
+      }
+
+      const { dataProductId } = paramResult.data;
+      const { snowflakeUser } = request.user;
+
+      // Get latest version of each artifact type
+      const result = await postgresService.query(
+        `SELECT DISTINCT ON (artifact_type)
+           id, artifact_type, minio_path, filename, version
+         FROM artifacts
+         WHERE data_product_id = $1
+         ORDER BY artifact_type, version DESC`,
+        [dataProductId],
+        snowflakeUser,
+      );
+
+      interface ExportArtifactRow {
+        id: string;
+        artifact_type: string;
+        minio_path: string;
+        filename: string | null;
+        version: number;
+      }
+
+      const artifacts = result.rows as ExportArtifactRow[];
+
+      if (artifacts.length === 0) {
+        return reply.status(404).send({
+          error: 'NOT_FOUND',
+          message: 'No artifacts found for this data product',
+        });
+      }
+
+      // Fetch content for each artifact from MinIO
+      const manifest = await Promise.all(
+        artifacts.map(async (artifact) => {
+          let content: string | null = null;
+          try {
+            const buffer = await minioService.getFile('artifacts', artifact.minio_path);
+            content = buffer.toString('utf-8');
+          } catch {
+            content = null;
+          }
+          return {
+            artifact_type: artifact.artifact_type,
+            filename: artifact.filename,
+            version: artifact.version,
+            content,
+          };
+        }),
+      );
+
+      // Return as JSON bundle (archiver package not available)
+      void reply.header('Content-Type', 'application/json');
+      void reply.header(
+        'Content-Disposition',
+        `attachment; filename="artifacts-${dataProductId.slice(0, 8)}.json"`,
+      );
+      return reply.send({
+        data_product_id: dataProductId,
+        exported_at: new Date().toISOString(),
+        artifact_count: manifest.length,
+        artifacts: manifest,
+      });
     },
   );
 

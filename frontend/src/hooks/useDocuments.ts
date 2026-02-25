@@ -1,3 +1,4 @@
+import { useEffect, useRef } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api';
 
@@ -74,6 +75,15 @@ interface ContextVersion {
   version: number;
 }
 
+interface StaleArtifact {
+  artifact_type: string;
+  artifact_label: string;
+  impacted_steps: MissionStep[];
+  snapshot_context_version: number | null;
+  latest_context_version: number | null;
+  reason: string;
+}
+
 interface DocumentContextResponse {
   data_product_id: string;
   current_step: MissionStep;
@@ -99,10 +109,31 @@ interface ApplyContextResponse {
   context_version: ContextVersion | null;
 }
 
+interface ContextDeltaChange {
+  id: string;
+  version: number;
+  reason: string;
+  changed_by: string;
+  change_summary: Record<string, unknown>;
+  created_at: string;
+}
+
+interface ContextDeltaResponse {
+  data_product_id: string;
+  from_version: number | null;
+  to_version: number | null;
+  changes: ContextDeltaChange[];
+  impacted_steps: MissionStep[];
+  stale_artifacts: StaleArtifact[];
+  recommended_actions: string[];
+  note?: string;
+}
+
 interface DeleteDocumentResponse {
   status: 'deleted';
   document_id: string;
   impacted_steps: string[];
+  stale_artifacts?: StaleArtifact[];
   context_version: ContextVersion | null;
   recommended_actions: string[];
 }
@@ -250,6 +281,9 @@ function useUploadDocument(dataProductId: string) {
     },
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['documents', dataProductId] });
+      void queryClient.invalidateQueries({ queryKey: ['documents-semantic-registry', dataProductId] });
+      void queryClient.invalidateQueries({ queryKey: ['document-context', dataProductId] });
+      void queryClient.invalidateQueries({ queryKey: ['document-context-delta', dataProductId] });
     },
   });
 }
@@ -266,6 +300,30 @@ function useDocumentContext(
           ? `/documents/context/${dataProductId}/current?step=${step}`
           : `/documents/context/${dataProductId}/current`,
       ),
+    enabled: !!dataProductId,
+  });
+}
+
+function useDocumentContextDelta(
+  dataProductId: string | null,
+  options?: { fromVersion?: number; toVersion?: number },
+) {
+  return useQuery<ContextDeltaResponse>({
+    queryKey: [
+      'document-context-delta',
+      dataProductId,
+      options?.fromVersion ?? null,
+      options?.toVersion ?? null,
+    ],
+    queryFn: () => {
+      const query = new URLSearchParams();
+      if (options?.fromVersion !== undefined) query.set('from_version', String(options.fromVersion));
+      if (options?.toVersion !== undefined) query.set('to_version', String(options.toVersion));
+      const qs = query.toString();
+      return api.get<ContextDeltaResponse>(
+        `/documents/context/${dataProductId}/delta${qs ? `?${qs}` : ''}`,
+      );
+    },
     enabled: !!dataProductId,
   });
 }
@@ -378,6 +436,9 @@ function useApplyDocumentContext(dataProductId: string) {
       void queryClient.invalidateQueries({
         queryKey: ['document-context', dataProductId, 'all'],
       });
+      void queryClient.invalidateQueries({
+        queryKey: ['document-context-delta', dataProductId],
+      });
     },
   });
 }
@@ -391,6 +452,12 @@ function useDeleteDocument(dataProductId: string) {
       void queryClient.invalidateQueries({ queryKey: ['documents', dataProductId] });
       void queryClient.invalidateQueries({
         queryKey: ['document-context', dataProductId],
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ['document-context-delta', dataProductId],
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ['documents-semantic-registry', dataProductId],
       });
     },
   });
@@ -407,30 +474,107 @@ function useReextractDocument(dataProductId: string) {
       void queryClient.invalidateQueries({
         queryKey: ['document-context', dataProductId],
       });
+      void queryClient.invalidateQueries({
+        queryKey: ['document-context-delta', dataProductId],
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ['documents-semantic-registry', dataProductId],
+      });
     },
   });
+}
+
+interface DocumentStatusResponse {
+  document_id: string;
+  filename: string;
+  extraction_status: string;
+  extraction_error: string | null;
+  extracted_at: string | null;
+}
+
+function useDocumentStatus(
+  dataProductId: string | null,
+  documentId: string | null,
+  enabled = false,
+) {
+  return useQuery<DocumentStatusResponse>({
+    queryKey: ['document-status', dataProductId, documentId],
+    queryFn: () =>
+      api.get<DocumentStatusResponse>(
+        `/documents/${dataProductId}/${documentId}/status`,
+      ),
+    enabled: !!dataProductId && !!documentId && enabled,
+    refetchInterval: 3000,
+  });
+}
+
+/**
+ * Poll extraction status for a document after upload.
+ * Automatically stops polling when status is 'completed' or 'failed',
+ * and invalidates the documents list.
+ */
+function useDocumentExtractionPoller(
+  dataProductId: string | null,
+  documentId: string | null,
+  extractionStatus: string | null | undefined,
+) {
+  const queryClient = useQueryClient();
+  const shouldPoll =
+    !!dataProductId &&
+    !!documentId &&
+    (extractionStatus === 'pending' || extractionStatus === 'processing');
+
+  const statusQuery = useDocumentStatus(dataProductId, documentId, shouldPoll);
+
+  const prevStatus = useRef(extractionStatus);
+  useEffect(() => {
+    const currentStatus = statusQuery.data?.extraction_status;
+    if (
+      currentStatus &&
+      currentStatus !== prevStatus.current &&
+      (currentStatus === 'completed' || currentStatus === 'failed')
+    ) {
+      void queryClient.invalidateQueries({ queryKey: ['documents', dataProductId] });
+      void queryClient.invalidateQueries({
+        queryKey: ['documents-semantic-registry', dataProductId],
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ['document-context', dataProductId],
+      });
+    }
+    prevStatus.current = currentStatus ?? extractionStatus;
+  }, [statusQuery.data, dataProductId, extractionStatus, queryClient]);
+
+  return statusQuery;
 }
 
 export { useDocuments, useUploadDocument };
 export {
   useDocumentContext,
+  useDocumentContextDelta,
   useApplyDocumentContext,
   useDeleteDocument,
   useReextractDocument,
+  useDocumentStatus,
+  useDocumentExtractionPoller,
   useSemanticRegistry,
   useSemanticChunks,
   useSemanticFacts,
   useSemanticEvidence,
 };
 export type {
+  StaleArtifact,
   UploadedDocument,
   DocumentsResponse,
   UploadDocumentResponse,
+  DocumentStatusResponse,
   MissionStep,
   ContextSelectionState,
   DocumentContextResponse,
   StepContextState,
   DocumentContextItem,
+  ContextDeltaResponse,
+  ContextDeltaChange,
   ReextractDocumentResponse,
   SemanticRegistryResponse,
   SemanticRegistryRow,

@@ -19,6 +19,8 @@ interface ChatMessage {
   timestamp: string;
   toolCalls?: ToolCall[];
   isStreaming?: boolean;
+  /** Per-answer trust contract used for source/confidence/exactness rendering. */
+  answerContract?: AnswerContract | null;
   /** Artifact types to render as clickable cards inline with this message. */
   artifactRefs?: ArtifactType[];
   /** File attachments on user messages. */
@@ -94,6 +96,7 @@ interface ChatState {
   setReasoningUpdate: (message: string | null, source?: 'llm' | 'fallback') => void;
   clearReasoningLog: () => void;
   setAnswerContract: (contract: AnswerContract | null) => void;
+  attachAnswerContractToLastAssistant: (contract: AnswerContract) => void;
   clearAnswerContract: () => void;
   attachArtifactToLastAssistant: (artifactType: ArtifactType) => void;
   truncateAfter: (messageId: string) => void;
@@ -120,6 +123,20 @@ const INITIAL_STATE = {
   latestAnswerContract: null as AnswerContract | null,
   answerTrustState: null as AnswerTrustState | null,
 };
+
+function withObservedAt(contract: AnswerContract): AnswerContract {
+  const observedAt =
+    typeof contract.metadata?.observed_at === 'string'
+      ? contract.metadata.observed_at
+      : new Date().toISOString();
+  return {
+    ...contract,
+    metadata: {
+      ...contract.metadata,
+      observed_at: observedAt,
+    },
+  };
+}
 
 export type ChatStore = ReturnType<typeof createChatStore>;
 
@@ -259,9 +276,33 @@ export function createChatStore() {
       }),
 
     setAnswerContract: (contract: AnswerContract | null) =>
-      set({
-        latestAnswerContract: contract,
-        answerTrustState: contract?.trust_state ?? null,
+      set(() => {
+        const normalized = contract ? withObservedAt(contract) : null;
+        return {
+          latestAnswerContract: normalized,
+          answerTrustState: normalized?.trust_state ?? null,
+        };
+      }),
+
+    attachAnswerContractToLastAssistant: (contract: AnswerContract) =>
+      set((state) => {
+        const normalized = withObservedAt(contract);
+        const messages = [...state.messages];
+        for (let i = messages.length - 1; i >= 0; i -= 1) {
+          const message = messages[i];
+          if (message && message.role === 'assistant') {
+            messages[i] = { ...message, answerContract: normalized };
+            return {
+              messages,
+              latestAnswerContract: normalized,
+              answerTrustState: normalized.trust_state,
+            };
+          }
+        }
+        return {
+          latestAnswerContract: normalized,
+          answerTrustState: normalized.trust_state,
+        };
       }),
 
     clearAnswerContract: () =>

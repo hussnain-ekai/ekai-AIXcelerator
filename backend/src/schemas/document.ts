@@ -58,6 +58,12 @@ export type ExtractDocumentParam = z.infer<typeof extractDocumentParamSchema>;
 export const deleteDocumentParamSchema = documentContentParamSchema;
 export type DeleteDocumentParam = z.infer<typeof deleteDocumentParamSchema>;
 
+export const documentStatusParamSchema = z.object({
+  dataProductId: z.string().uuid(),
+  documentId: z.string().uuid(),
+});
+export type DocumentStatusParam = z.infer<typeof documentStatusParamSchema>;
+
 export const contextCurrentParamSchema = z.object({
   dataProductId: z.string().uuid(),
 });
@@ -136,6 +142,85 @@ export const semanticEvidenceQuerySchema = z.object({
   offset: z.coerce.number().int().min(0).optional().default(0),
 });
 export type SemanticEvidenceQuery = z.infer<typeof semanticEvidenceQuerySchema>;
+
+export const semanticEvidenceLinkParamSchema = semanticRegistryParamSchema;
+export type SemanticEvidenceLinkParam = z.infer<typeof semanticEvidenceLinkParamSchema>;
+
+export const semanticEvidenceLinkQuerySchema = z.object({
+  citation_type: z.enum(['sql', 'document_fact', 'document_chunk']),
+  reference_id: z.string().trim().min(1).max(256),
+  query_id: z.string().trim().min(1).max(128).optional(),
+});
+export type SemanticEvidenceLinkQuery = z.infer<typeof semanticEvidenceLinkQuerySchema>;
+
+export const semanticAuditParamSchema = semanticRegistryParamSchema;
+export type SemanticAuditParam = z.infer<typeof semanticAuditParamSchema>;
+
+export const semanticAuditQuerySchema = z.object({
+  query_id: z.string().trim().min(1).max(128).optional(),
+  final_decision: z.string().trim().min(1).max(32).optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional().default(100),
+  offset: z.coerce.number().int().min(0).optional().default(0),
+});
+export type SemanticAuditQuery = z.infer<typeof semanticAuditQuerySchema>;
+
+export const semanticOpsSummaryParamSchema = semanticRegistryParamSchema;
+export type SemanticOpsSummaryParam = z.infer<typeof semanticOpsSummaryParamSchema>;
+
+export const semanticOpsSummaryQuerySchema = z.object({
+  window_hours: z.coerce.number().int().min(1).max(24 * 30).optional().default(24),
+});
+export type SemanticOpsSummaryQuery = z.infer<typeof semanticOpsSummaryQuerySchema>;
+
+export const semanticOpsDashboardParamSchema = semanticRegistryParamSchema;
+export type SemanticOpsDashboardParam = z.infer<typeof semanticOpsDashboardParamSchema>;
+
+export const semanticOpsDashboardQuerySchema = z.object({
+  window_hours: z.coerce.number().int().min(1).max(24 * 30).optional().default(24),
+  trace_limit: z.coerce.number().int().min(1).max(200).optional().default(25),
+  alert_limit: z.coerce.number().int().min(1).max(500).optional().default(100),
+});
+export type SemanticOpsDashboardQuery = z.infer<typeof semanticOpsDashboardQuerySchema>;
+
+export const governanceAuditParamSchema = semanticRegistryParamSchema;
+export type GovernanceAuditParam = z.infer<typeof governanceAuditParamSchema>;
+
+export const governanceAuditQuerySchema = z.object({
+  event_type: z.string().trim().min(1).max(64).optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional().default(100),
+  offset: z.coerce.number().int().min(0).optional().default(0),
+});
+export type GovernanceAuditQuery = z.infer<typeof governanceAuditQuerySchema>;
+
+export const legalHoldParamSchema = semanticRegistryParamSchema;
+export type LegalHoldParam = z.infer<typeof legalHoldParamSchema>;
+
+export const legalHoldBodySchema = z
+  .object({
+    document_id: z.string().uuid(),
+    action: z.enum(['activate', 'release']).optional().default('activate'),
+    hold_reason: z.string().trim().min(1).max(2000).optional(),
+    hold_ref: z.string().trim().max(128).optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (value.action === 'activate' && !value.hold_reason) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['hold_reason'],
+        message: 'hold_reason is required when action=activate',
+      });
+    }
+  });
+export type LegalHoldBody = z.infer<typeof legalHoldBodySchema>;
+
+export const retentionRunParamSchema = semanticRegistryParamSchema;
+export type RetentionRunParam = z.infer<typeof retentionRunParamSchema>;
+
+export const retentionRunBodySchema = z.object({
+  retention_now: z.string().datetime().optional(),
+  dry_run: z.coerce.boolean().optional().default(false),
+});
+export type RetentionRunBody = z.infer<typeof retentionRunBodySchema>;
 
 // --- Allowed MIME types ---
 

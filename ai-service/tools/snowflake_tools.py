@@ -16,11 +16,10 @@ import logging
 import re
 from typing import Any
 
-import requests
 from langchain_core.tools import tool
 
 from config import get_settings
-from services.snowflake import execute_query_sync, get_connection
+from services.snowflake import execute_query_sync
 
 # ---------------------------------------------------------------------------
 # Data isolation context — set by the router before agent invocation
@@ -93,6 +92,14 @@ def _check_cross_database_reference(sql_upper: str, allowed_db: str) -> str | No
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]{0,254}$")
 
 
+def _strip_wrapping_quotes(value: str) -> str:
+    """Remove one level of wrapping double quotes from an identifier token."""
+    token = value.strip()
+    if len(token) >= 2 and token[0] == '"' and token[-1] == '"':
+        return token[1:-1]
+    return token
+
+
 def _validate_identifier(name: str, label: str = "identifier") -> str | None:
     """Validate a Snowflake identifier. Returns error message or None if valid."""
     if not name or not name.strip():
@@ -100,6 +107,66 @@ def _validate_identifier(name: str, label: str = "identifier") -> str | None:
     if not _IDENTIFIER_RE.match(name):
         return f"Invalid {label}: '{name}'. Only alphanumeric characters, underscores, and $ are allowed."
     return None
+
+
+def _auto_fix_target_schema(target_schema: str) -> str:
+    """Auto-correct target_schema when the LLM passes a UUID or invalid identifier.
+
+    The LLM sometimes constructs target_schema as EKAIX.{UUID}_MARTS instead of
+    EKAIX.{SANITIZED_NAME}_MARTS. This helper detects invalid schemas and
+    re-derives from the data product name context set by the router.
+    """
+    from tools.naming import sanitize_dp_name, EKAIX_DATABASE
+    from tools.postgres_tools import get_data_product_name
+
+    parts = target_schema.split(".")
+    if len(parts) != 2:
+        return target_schema  # let normal validation catch format errors
+
+    db_part, schema_part = parts
+    # Check if the schema part is invalid (contains hyphens = UUID pattern)
+    if _validate_identifier(schema_part, "schema") is None:
+        return target_schema  # already valid, no fix needed
+
+    # Try to derive correct schema from data product name context
+    dp_name = get_data_product_name()
+    if dp_name:
+        fixed_schema = f"{sanitize_dp_name(dp_name)}_MARTS"
+        logger.info(
+            "Auto-fixed invalid target_schema: '%s' -> '%s.%s' (from dp_name='%s')",
+            target_schema, EKAIX_DATABASE, fixed_schema, dp_name,
+        )
+        return f"{EKAIX_DATABASE}.{fixed_schema}"
+
+    # Fallback: sanitize what we have (strip hyphens, uppercase)
+    import re as _re
+    sanitized = _re.sub(r"[^A-Za-z0-9_$]", "_", schema_part).strip("_").upper()
+    if sanitized and _validate_identifier(sanitized, "schema") is None:
+        logger.info(
+            "Auto-fixed invalid target_schema via sanitization: '%s' -> '%s.%s'",
+            target_schema, db_part, sanitized,
+        )
+        return f"{db_part}.{sanitized}"
+
+    return target_schema  # return as-is, let normal validation produce the error
+
+
+def _auto_fix_semantic_view_fqn(fqn: str) -> str:
+    """Auto-correct a semantic view FQN (DATABASE.SCHEMA.VIEW) with invalid schema part."""
+    parts = fqn.split(".")
+    if len(parts) != 3:
+        return fqn
+
+    db_part, schema_part, view_part = parts
+    if _validate_identifier(schema_part, "schema") is None:
+        return fqn  # already valid
+
+    # Re-derive the schema from data product name context
+    fixed_schema_fqn = _auto_fix_target_schema(f"{db_part}.{schema_part}")
+    fixed_parts = fixed_schema_fqn.split(".")
+    if len(fixed_parts) == 2:
+        return f"{fixed_parts[0]}.{fixed_parts[1]}.{view_part}"
+    return fqn
 
 
 def _validate_fqn(fqn: str) -> tuple[list[str], str | None]:
@@ -122,6 +189,87 @@ def _validate_fqn(fqn: str) -> tuple[list[str], str | None]:
     return parts, None
 
 
+def _normalize_fqn_parts(
+    fqn: str,
+    *,
+    expected_parts: int,
+    labels: list[str],
+) -> tuple[list[str], str | None]:
+    """Split and validate an FQN while tolerating wrapped double quotes."""
+    if not fqn or not fqn.strip():
+        return [], "FQN cannot be empty"
+
+    raw_parts = [part.strip() for part in fqn.split(".")]
+    if len(raw_parts) != expected_parts:
+        return raw_parts, (
+            f"Invalid FQN format: '{fqn}'. Expected {expected_parts} dot-separated parts, "
+            f"got {len(raw_parts)}"
+        )
+
+    normalized = [_strip_wrapping_quotes(part) for part in raw_parts]
+    for part, label in zip(normalized, labels):
+        err = _validate_identifier(part, label)
+        if err:
+            return normalized, err
+    return normalized, None
+
+
+def _resolve_role_for_grant(role: str) -> tuple[str | None, str | None]:
+    """Resolve role token for GRANT. Supports literal CURRENT_ROLE() safely."""
+    token = _strip_wrapping_quotes(role or "")
+    if not token:
+        return None, "role cannot be empty"
+
+    if re.fullmatch(r"(?i)current_role\s*\(\s*\)", token) or token.upper() == "CURRENT_ROLE":
+        try:
+            rows = execute_query_sync("SELECT CURRENT_ROLE() AS ROLE_NAME")
+            if not rows:
+                return None, "Unable to resolve CURRENT_ROLE() for grant."
+            role_name = rows[0].get("ROLE_NAME") or rows[0].get("role_name") or rows[0].get("CURRENT_ROLE()")
+            resolved = str(role_name or "").strip()
+            resolved = _strip_wrapping_quotes(resolved)
+            if not resolved:
+                return None, "Unable to resolve CURRENT_ROLE() for grant."
+            err = _validate_identifier(resolved, "role")
+            if err:
+                return None, err
+            return resolved, None
+        except Exception as e:
+            return None, f"Failed to resolve CURRENT_ROLE(): {e}"
+
+    err = _validate_identifier(token, "role")
+    if err:
+        return None, err
+    return token, None
+
+
+def _lookup_agent_fqn_by_name(database: str, agent_name: str) -> list[str] | None:
+    """Find an existing Cortex Agent FQN by name inside a database."""
+    try:
+        safe_name = agent_name.replace("'", "''")
+        rows = execute_query_sync(f'SHOW AGENTS LIKE \'{safe_name}\' IN DATABASE "{database}"')
+    except Exception as e:
+        logger.warning("grant_agent_access: failed to lookup agents in %s: %s", database, e)
+        return None
+
+    for row in rows:
+        db_name = str(row.get("database_name") or row.get("database") or "").strip()
+        schema_name = str(row.get("schema_name") or row.get("schema") or "").strip()
+        name = str(row.get("name") or row.get("agent_name") or "").strip()
+        if not db_name or not schema_name or not name:
+            continue
+        if name.upper() != agent_name.upper():
+            continue
+        candidate = [
+            _strip_wrapping_quotes(db_name),
+            _strip_wrapping_quotes(schema_name),
+            _strip_wrapping_quotes(name),
+        ]
+        if all(_validate_identifier(part, label) is None for part, label in zip(candidate, ["database", "schema", "agent"])):
+            return candidate
+    return None
+
+
 def _quoted_fqn(parts: list[str]) -> str:
     """Build a safely quoted FQN from validated parts."""
     return ".".join(f'"{p}"' for p in parts)
@@ -136,6 +284,75 @@ def _tool_error(tool_name: str, message: str, **extra: Any) -> str:
     result: dict[str, Any] = {"error": message, "tool": tool_name}
     result.update(extra)
     return json.dumps(result)
+
+
+_MISSING_OBJECT_RE = re.compile(
+    r"Object\s+'([^']+)'\s+does not exist or not authorized",
+    re.IGNORECASE,
+)
+
+
+def _normalize_fqn_text(fqn: str) -> str:
+    """Normalize an FQN token by stripping wrapping quotes and spaces."""
+    return ".".join(
+        _strip_wrapping_quotes(part.strip())
+        for part in fqn.split(".")
+        if part and part.strip()
+    )
+
+
+def _extract_missing_object_fqn(error_message: str) -> str | None:
+    """Extract missing object FQN from common Snowflake compilation errors."""
+    match = _MISSING_OBJECT_RE.search(error_message or "")
+    if not match:
+        return None
+    value = _normalize_fqn_text(match.group(1))
+    return value if value else None
+
+
+def _choose_allowed_table_replacement(
+    missing_fqn: str,
+    allowed_tables: list[str],
+) -> str | None:
+    """Choose a deterministic source-table replacement by table-name match."""
+    missing_parts = _normalize_fqn_text(missing_fqn).split(".")
+    if len(missing_parts) != 3:
+        return None
+
+    wanted_table = missing_parts[2].upper()
+    wanted_schema = missing_parts[1].upper()
+
+    normalized_allowed: list[str] = []
+    for raw in allowed_tables:
+        value = _normalize_fqn_text(str(raw))
+        if len(value.split(".")) == 3:
+            normalized_allowed.append(value)
+
+    candidates = [fqn for fqn in normalized_allowed if fqn.split(".")[2].upper() == wanted_table]
+    if len(candidates) == 1:
+        return candidates[0]
+
+    if len(candidates) > 1:
+        schema_candidates = [fqn for fqn in candidates if fqn.split(".")[1].upper() == wanted_schema]
+        if len(schema_candidates) == 1:
+            return schema_candidates[0]
+
+    return None
+
+
+def _rewrite_sql_table_reference(sql: str, from_fqn: str, to_fqn: str) -> str:
+    """Replace a 3-part table reference in SQL, tolerant to quotes and spacing."""
+    from_parts = _normalize_fqn_text(from_fqn).split(".")
+    to_parts = _normalize_fqn_text(to_fqn).split(".")
+    if len(from_parts) != 3 or len(to_parts) != 3:
+        return sql
+
+    pattern = re.compile(
+        rf'(?i)"?{re.escape(from_parts[0])}"?\s*\.\s*"?{re.escape(from_parts[1])}"?\s*\.\s*"?{re.escape(from_parts[2])}"?'
+    )
+    replacement = _quoted_fqn(to_parts)
+    rewritten, count = pattern.subn(lambda _m: replacement, sql)
+    return rewritten if count > 0 else sql
 
 
 # ---------------------------------------------------------------------------
@@ -496,8 +713,51 @@ def execute_rcr_query(sql: str) -> str:
         }, default=str)
 
     except Exception as e:
-        logger.error("execute_rcr_query failed: %s — SQL: %s", e, sql[:200])
-        return _tool_error("execute_rcr_query", str(e))
+        error_msg = str(e)
+        missing_fqn = _extract_missing_object_fqn(error_msg)
+        allowed_tables = _allowed_tables.get() or []
+
+        # Self-heal common explorer failure:
+        # LLM guesses EKAIX.<dp>_MARTS.<source_table> that doesn't exist.
+        # If table name uniquely matches a selected source table, retry once with the
+        # real source FQN so the user still gets an answer in the same turn.
+        if missing_fqn and allowed_tables:
+            missing_parts = _normalize_fqn_text(missing_fqn).split(".")
+            if len(missing_parts) == 3 and missing_parts[0].upper() == "EKAIX":
+                replacement_fqn = _choose_allowed_table_replacement(missing_fqn, allowed_tables)
+                if replacement_fqn:
+                    rewritten_sql = _rewrite_sql_table_reference(sql, missing_fqn, replacement_fqn)
+                    if rewritten_sql != sql:
+                        try:
+                            logger.warning(
+                                "execute_rcr_query auto-remap: %s -> %s",
+                                missing_fqn,
+                                replacement_fqn,
+                            )
+                            rows = execute_query_sync(rewritten_sql)
+                            return json.dumps({
+                                "row_count": len(rows),
+                                "rows": rows[:row_limit],
+                                "autocorrected_from": _normalize_fqn_text(missing_fqn),
+                                "autocorrected_to": _normalize_fqn_text(replacement_fqn),
+                            }, default=str)
+                        except Exception as retry_err:
+                            error_msg = f"{error_msg} | retry_after_table_remap_failed: {retry_err}"
+
+            # If we still failed, return a scoped hint with allowed tables.
+            return _tool_error(
+                "execute_rcr_query",
+                (
+                    f"Referenced object '{_normalize_fqn_text(missing_fqn)}' is not available "
+                    "in this data product context."
+                ),
+                missing_object=_normalize_fqn_text(missing_fqn),
+                allowed_tables=[_normalize_fqn_text(str(t)) for t in allowed_tables[:20]],
+                retryable=True,
+            )
+
+        logger.error("execute_rcr_query failed: %s — SQL: %s", error_msg, sql[:200])
+        return _tool_error("execute_rcr_query", error_msg)
 
 
 @tool
@@ -512,6 +772,8 @@ def create_semantic_view(yaml_content: str, target_schema: str, verify_only: boo
         target_schema: Fully qualified schema (DATABASE.SCHEMA) where the view will be created.
         verify_only: If True, validates YAML without creating the view.
     """
+    # Auto-fix target schema if LLM passed UUID or invalid identifier
+    target_schema = _auto_fix_target_schema(target_schema)
     # Validate target schema (DATABASE.SCHEMA)
     schema_parts = target_schema.split(".")
     if len(schema_parts) != 2:
@@ -624,22 +886,26 @@ def create_semantic_view(yaml_content: str, target_schema: str, verify_only: boo
 @tool
 def create_cortex_agent(
     name: str,
-    semantic_view_fqn: str,
     target_schema: str,
+    semantic_view_fqn: str = "",
     description: str = "",
     instructions: str = "",
     model_name: str = "claude-3-5-sonnet",
     warehouse: str = "",
 ) -> str:
-    """Create a Cortex Agent backed by a semantic view.
+    """Create a Cortex Agent backed by a semantic view, document search, or both.
 
     Deploys the agent to Snowflake Intelligence so end users can query
-    the semantic model through natural language. Uses CREATE AGENT ... FROM SPECIFICATION.
+    through natural language. Uses CREATE AGENT ... FROM SPECIFICATION.
+    Supports three modes:
+    - Structured only: semantic_view_fqn provided, no documents
+    - Document only: no semantic_view_fqn, documents available (search service)
+    - Hybrid: both semantic_view_fqn and document search service
 
     Args:
         name: Name for the new Cortex Agent.
-        semantic_view_fqn: Fully qualified name of the semantic view (DATABASE.SCHEMA.VIEW).
         target_schema: Schema where the agent will be created (DATABASE.SCHEMA).
+        semantic_view_fqn: Fully qualified name of the semantic view (DATABASE.SCHEMA.VIEW). Optional — omit for document-only agents.
         description: Business description of the agent.
         instructions: System prompt instructions for the agent.
         model_name: LLM model for orchestration (default: claude-3-5-sonnet).
@@ -657,6 +923,8 @@ def create_cortex_agent(
             "Publishing is blocked: explicit user approval is required before deployment.",
         )
 
+    # Auto-fix target schema if LLM passed UUID or invalid identifier
+    target_schema = _auto_fix_target_schema(target_schema)
     # Validate target schema
     schema_parts = target_schema.split(".")
     if len(schema_parts) != 2:
@@ -666,10 +934,13 @@ def create_cortex_agent(
         if err:
             return _tool_error("create_cortex_agent", err)
 
-    # Validate semantic view FQN
-    sv_parts = semantic_view_fqn.split(".")
-    if len(sv_parts) != 3:
-        return _tool_error("create_cortex_agent", f"semantic_view_fqn must be DATABASE.SCHEMA.VIEW, got: '{semantic_view_fqn}'")
+    # Validate semantic view FQN if provided
+    has_semantic_view = bool(semantic_view_fqn and semantic_view_fqn.strip())
+    if has_semantic_view:
+        semantic_view_fqn = _auto_fix_semantic_view_fqn(semantic_view_fqn)
+        sv_parts = semantic_view_fqn.split(".")
+        if len(sv_parts) != 3:
+            return _tool_error("create_cortex_agent", f"semantic_view_fqn must be DATABASE.SCHEMA.VIEW, got: '{semantic_view_fqn}'")
 
     # Auto-create EKAIX database + schema if needed
     if schema_parts[0].upper() == "EKAIX":
@@ -692,8 +963,73 @@ def create_cortex_agent(
         safe_desc = description.replace("'", "''")
         safe_inst = instructions.replace("'", "''")
 
-        # Build the agent specification YAML.
-        # tool_resources MUST be a top-level key (not nested inside tools).
+        # Check if data product has a document search service in Snowflake.
+        # Derive docs schema from data product name (avoids broken async PG check).
+        has_documents = False
+        docs_schema_fqn = ""
+        try:
+            from tools.naming import sanitize_dp_name
+            from tools.postgres_tools import get_data_product_name
+            dp_name = get_data_product_name()
+            if dp_name:
+                docs_schema_fqn = f"{schema_parts[0]}.{sanitize_dp_name(dp_name)}_DOCS"
+                quoted_docs = f'"{schema_parts[0]}"."{sanitize_dp_name(dp_name)}_DOCS"'
+                # Check if search service exists (created by create_document_search_service)
+                try:
+                    svc_rows = execute_query_sync(
+                        f"SHOW CORTEX SEARCH SERVICES IN SCHEMA {quoted_docs}"
+                    )
+                    has_documents = bool(svc_rows)
+                except Exception:
+                    # Schema or service doesn't exist — also check DOC_CHUNKS table
+                    try:
+                        chunk_rows = execute_query_sync(
+                            f"SELECT COUNT(*) AS cnt FROM {quoted_docs}.DOC_CHUNKS"
+                        )
+                        has_documents = chunk_rows and int(
+                            chunk_rows[0].get("CNT") or chunk_rows[0].get("cnt") or 0
+                        ) > 0
+                    except Exception:
+                        pass
+                if has_documents:
+                    logger.info("create_cortex_agent: found documents in %s", docs_schema_fqn)
+        except Exception as e:
+            logger.debug("Could not check document availability for Cortex Search binding: %s", e)
+
+        # Must have at least one tool source
+        if not has_semantic_view and not has_documents:
+            return _tool_error(
+                "create_cortex_agent",
+                "Agent requires at least one tool: a semantic view (structured data) or document search service (documents). Neither is available.",
+            )
+
+        # Build tools and resources lists based on what's available
+        tools_yaml_parts: list[str] = []
+        resources_yaml_parts: list[str] = []
+
+        if has_semantic_view:
+            tools_yaml_parts.append("""  - tool_spec:
+      type: cortex_analyst_text_to_sql
+      name: Analyst
+      description: 'Answers questions about the data using the semantic model'""")
+            resources_yaml_parts.append(f"""  Analyst:
+    semantic_view: '{semantic_view_fqn}'
+    execution_environment:
+      type: warehouse
+      warehouse: '{warehouse}'""")
+
+        if has_documents and docs_schema_fqn:
+            tools_yaml_parts.append("""  - tool_spec:
+      type: cortex_search
+      name: DocumentSearch
+      description: 'Searches uploaded documents for relevant context and evidence'""")
+            resources_yaml_parts.append(f"""  DocumentSearch:
+    search_service: '{docs_schema_fqn}.EKAIX_DOCUMENT_SEARCH'
+    max_results: 5""")
+
+        tools_yaml = "\n".join(tools_yaml_parts)
+        resources_yaml = "\n".join(resources_yaml_parts)
+
         spec_yaml = f"""models:
   orchestration: {model_name}
 orchestration:
@@ -704,25 +1040,20 @@ instructions:
   response: '{safe_inst}'
   system: '{safe_desc}'
 tools:
-  - tool_spec:
-      type: cortex_analyst_text_to_sql
-      name: Analyst
-      description: 'Answers questions about the data using the semantic model'
+{tools_yaml}
 tool_resources:
-  Analyst:
-    semantic_view: '{semantic_view_fqn}'
-    execution_environment:
-      type: warehouse
-      warehouse: '{warehouse}'"""
+{resources_yaml}"""
 
         sql = f"CREATE OR REPLACE AGENT {agent_fqn}\n  COMMENT = '{safe_desc}'\n  FROM SPECIFICATION\n  $${spec_yaml}$$"
 
         execute_query_sync(sql)
         display_fqn = f"{target_schema}.{name}"
+        mode = "hybrid" if has_semantic_view and has_documents else ("document-search" if has_documents else "structured")
         return json.dumps({
             "status": "success",
             "agent_fqn": display_fqn,
-            "message": f"Cortex Agent {display_fqn} created successfully",
+            "mode": mode,
+            "message": f"Cortex Agent {display_fqn} created successfully ({mode} mode)",
         })
 
     except Exception as e:
@@ -738,10 +1069,11 @@ def grant_agent_access(agent_fqn: str, role: str) -> str:
         agent_fqn: Fully qualified name of the Cortex Agent.
         role: Snowflake role to grant access to.
     """
-    # Validate role
-    err = _validate_identifier(role, "role")
+    # Resolve role (supports CURRENT_ROLE()).
+    resolved_role, err = _resolve_role_for_grant(role)
     if err:
         return _tool_error("grant_agent_access", err)
+    assert resolved_role is not None
 
     # Publish gate: grants are part of deployment and require approval.
     if not _publish_approved.get():
@@ -750,193 +1082,179 @@ def grant_agent_access(agent_fqn: str, role: str) -> str:
             "Publishing is blocked: explicit user approval is required before deployment.",
         )
 
-    # Validate agent FQN
-    parts = agent_fqn.split(".")
-    if len(parts) != 3:
-        return _tool_error("grant_agent_access", f"agent_fqn must be DATABASE.SCHEMA.AGENT, got: '{agent_fqn}'")
-    for part, label in zip(parts, ["database", "schema", "agent"]):
-        err = _validate_identifier(part, label)
-        if err:
-            return _tool_error("grant_agent_access", err)
+    # Auto-fix agent FQN if schema part contains UUID/hyphens
+    agent_fqn = _auto_fix_semantic_view_fqn(agent_fqn)
+    # Validate and normalize agent FQN (tolerate quoted tokens).
+    parts, err = _normalize_fqn_parts(
+        agent_fqn,
+        expected_parts=3,
+        labels=["database", "schema", "agent"],
+    )
+    if err:
+        return _tool_error("grant_agent_access", err)
 
     try:
         quoted_fqn = _quoted_fqn(parts)
-        sql = f'GRANT USAGE ON AGENT {quoted_fqn} TO ROLE "{role}"'
+        sql = f'GRANT USAGE ON AGENT {quoted_fqn} TO ROLE "{resolved_role}"'
         execute_query_sync(sql)
         return json.dumps({
             "status": "success",
-            "message": f"Granted USAGE on {agent_fqn} to role {role}",
+            "message": f"Granted USAGE on {parts[0]}.{parts[1]}.{parts[2]} to role {resolved_role}",
         })
 
     except Exception as e:
-        logger.error("grant_agent_access failed: %s", e)
-        return _tool_error("grant_agent_access", str(e), agent_fqn=agent_fqn, role=role)
+        error_msg = str(e)
+        normalized = error_msg.lower()
+
+        # Retry with discovered schema casing if the provided FQN casing/path was wrong.
+        if "does not exist" in normalized or "not authorized" in normalized:
+            resolved_parts = _lookup_agent_fqn_by_name(parts[0], parts[2])
+            if resolved_parts and resolved_parts != parts:
+                try:
+                    quoted_fqn = _quoted_fqn(resolved_parts)
+                    sql = f'GRANT USAGE ON AGENT {quoted_fqn} TO ROLE "{resolved_role}"'
+                    execute_query_sync(sql)
+                    return json.dumps({
+                        "status": "success",
+                        "message": (
+                            f"Granted USAGE on {resolved_parts[0]}.{resolved_parts[1]}.{resolved_parts[2]} "
+                            f"to role {resolved_role}"
+                        ),
+                    })
+                except Exception as retry_err:
+                    error_msg = f"{error_msg} | retry_with_resolved_agent_failed: {retry_err}"
+
+        logger.error("grant_agent_access failed: %s", error_msg)
+        return _tool_error(
+            "grant_agent_access",
+            error_msg,
+            agent_fqn=agent_fqn,
+            role=resolved_role,
+        )
 
 
 @tool
 def query_cortex_agent(agent_fqn: str, question: str) -> str:
     """Ask a question to a published Cortex Agent and return its answer.
 
-    Sends the question to the Cortex Agent REST API and returns the
-    natural language response. Use this after publishing to answer
-    business questions via the semantic model.
+    Sends the question through Snowflake SQL `SNOWFLAKE.CORTEX.AGENT_RUN`
+    and returns the natural language response.
 
     Args:
         agent_fqn: Fully qualified name (DATABASE.SCHEMA.AGENT).
         question: Natural language question to ask.
     """
-    parts = agent_fqn.split(".")
-    if len(parts) != 3:
-        return _tool_error("query_cortex_agent",
-                           f"agent_fqn must be DATABASE.SCHEMA.AGENT, got: '{agent_fqn}'")
-
-    database, schema, agent_name = parts
-
-    try:
-        conn = get_connection()
-        token = conn.rest.token
-    except Exception as e:
-        logger.error("query_cortex_agent: cannot get session token: %s", e)
+    parts, err = _normalize_fqn_parts(
+        agent_fqn,
+        expected_parts=3,
+        labels=["database", "schema", "agent"],
+    )
+    if err:
         return _tool_error(
             "query_cortex_agent",
-            f"Authentication failed: {e}",
-            error_type="auth",
-            retryable=True,
+            f"agent_fqn must be DATABASE.SCHEMA.AGENT, got: '{agent_fqn}'",
         )
 
-    settings = get_settings()
-    account = settings.snowflake_account
-    host = f"{account}.snowflakecomputing.com"
-    url = f"https://{host}/api/v2/databases/{database}/schemas/{schema}/agents/{agent_name}:run"
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f'Snowflake Token="{token}"',
-        "Accept": "text/event-stream",
-    }
-    body = {
+    normalized_fqn = ".".join(parts)
+    request_payload = {
+        "fully_qualified_name": normalized_fqn,
         "messages": [
-            {"role": "user", "content": [{"type": "text", "text": question}]}
-        ]
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": question}],
+            }
+        ],
     }
 
     try:
-        resp = requests.post(url, headers=headers, json=body, stream=True, timeout=120)
+        request_json = json.dumps(request_payload, separators=(",", ":"))
+        request_sql_payload = request_json.replace("'", "''")
+        rows = execute_query_sync(
+            f"SELECT SNOWFLAKE.CORTEX.AGENT_RUN($${request_sql_payload}$$) AS RESPONSE"
+        )
+        raw_response = str((rows[0].get("RESPONSE") if rows else "") or "")
+        if not raw_response:
+            return _tool_error(
+                "query_cortex_agent",
+                "Cortex Agent returned an empty response.",
+                error_type="unknown",
+                retryable=True,
+            )
 
-        if resp.status_code != 200:
-            status = resp.status_code
-            if status in (401, 403):
+        try:
+            parsed = json.loads(raw_response)
+        except Exception:
+            return json.dumps({
+                "status": "success",
+                "answer": raw_response,
+            })
+
+        # Error envelope returned by AGENT_RUN.
+        if isinstance(parsed, dict) and parsed.get("code"):
+            msg = str(parsed.get("message") or "Cortex Agent request failed.")
+            lower_msg = msg.lower()
+            if "not authorized" in lower_msg or "access" in lower_msg:
                 return _tool_error(
                     "query_cortex_agent",
-                    f"HTTP {status}: Cortex Agent access/authentication failed.",
+                    msg,
                     error_type="auth",
-                    http_status=status,
                     retryable=True,
                 )
-            if status == 404:
+            if "does not exist" in lower_msg or "not found" in lower_msg:
                 return _tool_error(
                     "query_cortex_agent",
-                    "HTTP 404: Cortex Agent not found.",
+                    msg,
                     error_type="not_found",
-                    http_status=status,
                     retryable=False,
-                )
-            if status == 429:
-                return _tool_error(
-                    "query_cortex_agent",
-                    "HTTP 429: Cortex Agent rate limit reached.",
-                    error_type="rate_limit",
-                    http_status=status,
-                    retryable=True,
-                )
-            if status >= 500:
-                return _tool_error(
-                    "query_cortex_agent",
-                    f"HTTP {status}: Cortex Agent service is temporarily unavailable.",
-                    error_type="transient",
-                    http_status=status,
-                    retryable=True,
                 )
             return _tool_error(
                 "query_cortex_agent",
-                f"HTTP {status}: {resp.text[:300]}",
+                msg,
                 error_type="request",
-                http_status=status,
-                retryable=False,
+                retryable=True,
             )
 
-        # Parse SSE events
-        full_answer = ""
-        sql_generated = ""
-
-        for line in resp.iter_lines(decode_unicode=True):
-            if not line:
-                continue
-            if line.startswith("event: "):
-                event_type = line[7:].strip()
-                continue
-            if not line.startswith("data: "):
-                continue
-
-            data_str = line[6:]
-            if data_str == "[DONE]":
-                break
-
-            try:
-                data = json.loads(data_str)
-            except json.JSONDecodeError:
-                continue
-
-            # Extract text from various event formats
-            event_type_local = data.get("type", "")
-
-            if event_type_local == "response.text.delta":
-                full_answer += data.get("text", "")
-
-            # Final response event contains full content
-            content = data.get("content", [])
+        answer_text = ""
+        if isinstance(parsed, dict):
+            content = parsed.get("content", [])
             if isinstance(content, list):
+                texts: list[str] = []
                 for item in content:
-                    if not isinstance(item, dict):
-                        continue
-                    if item.get("type") == "text":
-                        text = item.get("text", "")
-                        if text and text not in full_answer:
-                            full_answer = text
-                    if item.get("type") == "tool_results":
-                        tr_content = item.get("content", [])
-                        if isinstance(tr_content, list):
-                            for sub in tr_content:
-                                if isinstance(sub, dict) and "sql" in sub:
-                                    sql_generated = sub["sql"]
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        txt = str(item.get("text") or "").strip()
+                        if txt:
+                            texts.append(txt)
+                answer_text = "\n".join(texts).strip()
+            if not answer_text:
+                answer_text = str(parsed.get("text") or "").strip()
+        else:
+            answer_text = str(parsed).strip()
 
-        result: dict[str, Any] = {
-            "status": "success",
-            "answer": full_answer or "(No answer returned by agent)",
-        }
-        if sql_generated:
-            result["sql"] = sql_generated
+        if not answer_text:
+            answer_text = "(No answer returned by agent)"
 
-        logger.info("query_cortex_agent success: agent=%s, answer_len=%d, has_sql=%s",
-                     agent_fqn, len(full_answer), bool(sql_generated))
-        return json.dumps(result)
-
-    except requests.exceptions.Timeout:
-        return _tool_error(
-            "query_cortex_agent",
-            "Request timed out (120s)",
-            error_type="timeout",
-            retryable=True,
+        logger.info(
+            "query_cortex_agent success via AGENT_RUN: agent=%s, answer_len=%d",
+            normalized_fqn,
+            len(answer_text),
         )
+        return json.dumps({"status": "success", "answer": answer_text})
     except Exception as e:
         logger.error("query_cortex_agent failed: %s", e)
         msg = str(e)
         lowered = msg.lower()
-        if any(token in lowered for token in ("auth", "token", "permission", "forbidden", "unauthorized")):
+        if any(token in lowered for token in ("auth", "token", "permission", "forbidden", "unauthorized", "not authorized")):
             return _tool_error(
                 "query_cortex_agent",
                 msg,
                 error_type="auth",
+                retryable=True,
+            )
+        if any(token in lowered for token in ("timeout", "timed out")):
+            return _tool_error(
+                "query_cortex_agent",
+                msg,
+                error_type="timeout",
                 retryable=True,
             )
         return _tool_error(
@@ -1031,6 +1349,8 @@ def validate_semantic_view_yaml(yaml_content: str, target_schema: str) -> str:
         yaml_content: The complete semantic view YAML specification.
         target_schema: Fully qualified schema (DATABASE.SCHEMA) for context.
     """
+    # Auto-fix target schema if LLM passed UUID or invalid identifier
+    target_schema = _auto_fix_target_schema(target_schema)
     schema_parts = target_schema.split(".")
     if len(schema_parts) != 2:
         return _tool_error("validate_semantic_view_yaml", f"target_schema must be DATABASE.SCHEMA, got: '{target_schema}'")
@@ -1397,6 +1717,266 @@ async def verify_yaml_against_brd(data_product_id: str) -> str:
             "missing_mappings": [str(e)],
             "invalid_columns": [],
         })
+
+
+@tool
+def create_document_search_service(target_schema: str, data_product_name: str) -> str:
+    """Create a Cortex Search Service over uploaded document chunks.
+
+    Builds a Cortex Search Service on the DOC_CHUNKS table so that a Cortex
+    Agent can search document content using natural language.
+
+    Args:
+        target_schema: EKAIX.{dp_name}_DOCS schema where DOC_CHUNKS lives.
+        data_product_name: Human-readable data product name (for logging).
+    """
+    from tools.naming import sanitize_dp_name, EKAIX_DATABASE, ensure_schema
+
+    # Publish gate
+    if not _publish_approved.get():
+        return _tool_error(
+            "create_document_search_service",
+            "Publishing is blocked: explicit user approval is required before deployment.",
+        )
+
+    # Always derive correct schema from the CONTEXT variable (set by the router
+    # from the database). The LLM-provided data_product_name is unreliable.
+    from tools.postgres_tools import get_data_product_name
+    ctx_name = get_data_product_name()
+    dp_name_for_schema = ctx_name or data_product_name
+    if dp_name_for_schema:
+        sanitized = sanitize_dp_name(dp_name_for_schema)
+        correct_schema = f"{EKAIX_DATABASE}.{sanitized}_DOCS"
+        if target_schema != correct_schema:
+            logger.warning(
+                "create_document_search_service: corrected target_schema from '%s' to '%s' (dp_name='%s')",
+                target_schema, correct_schema, dp_name_for_schema,
+            )
+        target_schema = correct_schema
+    else:
+        target_schema = _auto_fix_target_schema(target_schema)
+
+    schema_parts = target_schema.split(".")
+    if len(schema_parts) != 2:
+        return _tool_error(
+            "create_document_search_service",
+            f"target_schema must be DATABASE.SCHEMA, got: '{target_schema}'",
+        )
+    for part, label in zip(schema_parts, ["database", "schema"]):
+        err = _validate_identifier(part, label)
+        if err:
+            return _tool_error("create_document_search_service", err)
+
+    # Ensure EKAIX database + docs schema exist
+    try:
+        ensure_schema(schema_parts[1])
+    except Exception as e:
+        logger.warning("create_document_search_service: could not ensure schema: %s", e)
+
+    quoted_schema = f'"{schema_parts[0]}"."{schema_parts[1]}"'
+    service_fqn = f"{quoted_schema}.EKAIX_DOCUMENT_SEARCH"
+
+    # Resolve warehouse
+    warehouse = get_settings().snowflake_warehouse
+
+    try:
+        # Verify DOC_CHUNKS table exists and has rows
+        count_rows = execute_query_sync(
+            f"SELECT COUNT(*) AS cnt FROM {quoted_schema}.DOC_CHUNKS"
+        )
+        chunk_count = int((count_rows[0].get("CNT") or count_rows[0].get("cnt") or 0)) if count_rows else 0
+        if chunk_count == 0:
+            return _tool_error(
+                "create_document_search_service",
+                "DOC_CHUNKS table is empty — upload documents first.",
+            )
+
+        # Increase statement timeout for Cortex Search Service creation (can take minutes)
+        try:
+            execute_query_sync("ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 300")
+        except Exception:
+            pass  # best-effort; some accounts may not allow ALTER SESSION
+
+        # Create the Cortex Search Service
+        create_sql = f"""CREATE OR REPLACE CORTEX SEARCH SERVICE {service_fqn}
+  ON chunk_text
+  ATTRIBUTES document_id, filename, doc_kind, page_no, section_path
+  WAREHOUSE = {warehouse}
+  TARGET_LAG = '1 hour'
+AS
+  SELECT chunk_id, document_id, filename, doc_kind, page_no,
+         section_path, chunk_seq, chunk_text
+  FROM {quoted_schema}.DOC_CHUNKS"""
+
+        execute_query_sync(create_sql)
+
+        # Reset statement timeout to default
+        try:
+            execute_query_sync("ALTER SESSION UNSET STATEMENT_TIMEOUT_IN_SECONDS")
+        except Exception:
+            pass
+        display_fqn = f"{target_schema}.EKAIX_DOCUMENT_SEARCH"
+        logger.info(
+            "create_document_search_service: created %s with %d chunks",
+            display_fqn, chunk_count,
+        )
+        return json.dumps({
+            "status": "success",
+            "search_service_fqn": display_fqn,
+            "chunk_count": chunk_count,
+            "message": f"Cortex Search Service {display_fqn} created successfully over {chunk_count} document chunks",
+        })
+
+    except Exception as e:
+        logger.error("create_document_search_service failed: %s", e)
+        return _tool_error("create_document_search_service", str(e))
+
+
+@tool
+def extract_structured_from_documents(
+    target_schema: str,
+    extraction_schema: str,
+    data_product_id: str,
+) -> str:
+    """Extract structured data from documents into real Snowflake tables.
+
+    Uses AI_EXTRACT with a JSON response format derived from the BRD to pull
+    typed data from each document. Creates real tables in the target schema
+    that semantic views can reference.
+
+    Args:
+        target_schema: EKAIX.{dp_name}_MARTS schema for extracted tables.
+        extraction_schema: JSON string defining tables and extraction prompts.
+            Format: {"tables": [{"name": "TABLE_NAME", "description": "...",
+            "columns": {"col_name": "extraction prompt"}}]}
+        data_product_id: Data product ID to find source documents.
+    """
+    from tools.naming import ensure_schema
+    from tools.postgres_tools import _resolve_dp_id
+
+    # Publish gate
+    if not _publish_approved.get():
+        return _tool_error(
+            "extract_structured_from_documents",
+            "Publishing is blocked: explicit user approval is required before deployment.",
+        )
+
+    # Auto-fix and validate target schema
+    target_schema = _auto_fix_target_schema(target_schema)
+    schema_parts = target_schema.split(".")
+    if len(schema_parts) != 2:
+        return _tool_error(
+            "extract_structured_from_documents",
+            f"target_schema must be DATABASE.SCHEMA, got: '{target_schema}'",
+        )
+    for part, label in zip(schema_parts, ["database", "schema"]):
+        err = _validate_identifier(part, label)
+        if err:
+            return _tool_error("extract_structured_from_documents", err)
+
+    # Ensure schema
+    try:
+        ensure_schema(schema_parts[1])
+    except Exception as e:
+        logger.warning("extract_structured_from_documents: could not ensure schema: %s", e)
+
+    # Parse extraction schema
+    try:
+        schema_def = json.loads(extraction_schema) if isinstance(extraction_schema, str) else extraction_schema
+    except json.JSONDecodeError as e:
+        return _tool_error("extract_structured_from_documents", f"Invalid extraction_schema JSON: {e}")
+
+    tables_def = schema_def.get("tables", [])
+    if not tables_def:
+        return _tool_error("extract_structured_from_documents", "extraction_schema must contain at least one table definition")
+
+    # Resolve data product ID and find the docs schema
+    data_product_id = _resolve_dp_id(data_product_id)
+    from tools.naming import sanitize_dp_name
+    from tools.postgres_tools import get_data_product_name
+    dp_name = get_data_product_name()
+    if not dp_name:
+        return _tool_error("extract_structured_from_documents", "Could not resolve data product name")
+
+    docs_schema = f'"{schema_parts[0]}"."{sanitize_dp_name(dp_name)}_DOCS"'
+    quoted_target = f'"{schema_parts[0]}"."{schema_parts[1]}"'
+
+    results: list[dict[str, Any]] = []
+
+    for table_def in tables_def:
+        table_name = table_def.get("name", "").strip().upper()
+        if not table_name:
+            continue
+        err = _validate_identifier(table_name, "table_name")
+        if err:
+            results.append({"table": table_name, "status": "error", "error": err})
+            continue
+
+        columns = table_def.get("columns", {})
+        if not columns:
+            results.append({"table": table_name, "status": "error", "error": "No columns defined"})
+            continue
+
+        try:
+            # Build AI_EXTRACT responseFormat from column definitions
+            response_format_parts = []
+            for col_name, extraction_prompt in columns.items():
+                safe_col = col_name.replace("'", "''")
+                safe_prompt = str(extraction_prompt).replace("'", "''")
+                response_format_parts.append(f"'{safe_col}', '{safe_prompt}'")
+
+            response_format = f"OBJECT_CONSTRUCT({', '.join(response_format_parts)})"
+
+            # Extract from each document chunk and create table
+            extract_sql = f"""CREATE OR REPLACE TABLE {quoted_target}."{table_name}" AS
+SELECT
+  doc.document_id,
+  doc.filename,
+  ext.*
+FROM {docs_schema}.DOC_CHUNKS doc,
+LATERAL (
+  SELECT AI_EXTRACT(
+    doc.chunk_text,
+    {response_format}
+  ) AS extracted
+) raw,
+LATERAL FLATTEN(INPUT => ARRAY_CONSTRUCT(raw.extracted)) ext_flat,
+LATERAL (
+  SELECT
+    {', '.join(f'ext_flat.value:"{col}"::VARCHAR AS "{col.upper()}"' for col in columns)}
+) ext
+WHERE doc.chunk_text IS NOT NULL AND LENGTH(TRIM(doc.chunk_text)) > 50"""
+
+            execute_query_sync(extract_sql)
+
+            # Get row count
+            count_rows = execute_query_sync(
+                f'SELECT COUNT(*) AS cnt FROM {quoted_target}."{table_name}"'
+            )
+            row_count = int((count_rows[0].get("CNT") or count_rows[0].get("cnt") or 0)) if count_rows else 0
+
+            results.append({
+                "table": table_name,
+                "fqn": f"{target_schema}.{table_name}",
+                "status": "success",
+                "row_count": row_count,
+            })
+            logger.info(
+                "extract_structured_from_documents: created %s.%s with %d rows",
+                target_schema, table_name, row_count,
+            )
+
+        except Exception as e:
+            logger.error("extract_structured_from_documents: table %s failed: %s", table_name, e)
+            results.append({"table": table_name, "status": "error", "error": str(e)})
+
+    success_count = sum(1 for r in results if r["status"] == "success")
+    return json.dumps({
+        "status": "success" if success_count > 0 else "error",
+        "tables_created": success_count,
+        "tables_failed": len(results) - success_count,
+        "results": results,
+    })
 
 
 def _fuzzy_match(brd_item: str, yaml_item: str) -> bool:

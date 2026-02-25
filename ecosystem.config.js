@@ -42,7 +42,7 @@ module.exports = {
       name: 'ai-service',
       cwd: './ai-service',
       script: 'bash',
-      args: `-c "source venv/bin/activate && uvicorn main:app --reload --host 0.0.0.0 --port ${AI_SERVICE_PORT}"`,
+      args: `-c "./venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port ${AI_SERVICE_PORT}"`,
       env: {
         NODE_ENV: process.env.NODE_ENV || 'development',
       },

@@ -1,0 +1,24 @@
+{
+  "str-001": {
+    "answer_text": "The total generation was 1250.",
+    "confidence_decision": "high",
+    "citations": [
+      {"citation_type": "sql", "reference_id": "sql-001"}
+    ]
+  },
+  "doc-001": {
+    "answer_text": "The exact amount is 4200.",
+    "confidence_decision": "high",
+    "citations": [
+      {"citation_type": "document_fact", "reference_id": "fact-001"}
+    ]
+  },
+  "hyb-001": {
+    "answer_text": "Countries with GDP decline and infrastructure growth were identified.",
+    "confidence_decision": "medium",
+    "citations": [
+      {"citation_type": "sql", "reference_id": "sql-002"},
+      {"citation_type": "document_chunk", "reference_id": "chunk-009"}
+    ]
+  }
+}

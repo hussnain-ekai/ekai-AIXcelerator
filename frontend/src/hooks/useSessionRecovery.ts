@@ -2,6 +2,7 @@
 
 import { useEffect, useRef } from 'react';
 import { api } from '@/lib/api';
+import { normalizeAnswerContract } from '@/lib/answerContract';
 import { useChatStore, useChatStoreApi } from '@/stores/chatStoreProvider';
 import type { ChatMessage, AgentPhase, DataTier } from '@/stores/chatStore';
 import type { DataProduct } from '@/hooks/useDataProducts';
@@ -13,6 +14,7 @@ interface HistoryResponse {
     role: 'user' | 'assistant' | 'system';
     content: string;
     timestamp?: string;
+    answer_contract?: unknown;
     tool_calls?: Array<{
       name: string;
       input: Record<string, unknown>;
@@ -121,6 +123,7 @@ function useSessionRecovery(dataProduct: DataProduct | undefined): UseSessionRec
               role: msg.role,
               content: msg.content,
               timestamp: msg.timestamp ?? new Date(baseTime + idx * 1000).toISOString(),
+              answerContract: normalizeAnswerContract(msg.answer_contract ?? null) ?? undefined,
               toolCalls: msg.tool_calls?.map((tc) => ({
                 name: tc.name,
                 input: tc.input,

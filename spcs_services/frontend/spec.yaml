@@ -1,0 +1,20 @@
+spec:
+  container:
+    - name: frontend
+      image: /ekaix/app/image_repo/frontend:latest
+      resources:
+        requests:
+          cpu: 0.5
+          memory: 512Mi
+        limits:
+          cpu: 1
+          memory: 1Gi
+      env:
+        NEXT_PUBLIC_API_URL: /api
+      readinessProbe:
+        port: 3000
+        path: /
+  endpoint:
+    - name: frontend
+      port: 3000
+      public: true

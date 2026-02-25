@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -12,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
 
@@ -35,6 +36,7 @@ from services.supervisor_guardrails import (
 logger = logging.getLogger(__name__)
 _settings = get_settings()
 
+
 def _sanitize_error_for_user(exc: Exception) -> str:
     """Convert internal errors to user-friendly messages.
 
@@ -54,7 +56,9 @@ def _sanitize_error_for_user(exc: Exception) -> str:
         return "The data warehouse is temporarily unavailable. Please try again."
 
     # Generic fallback — never expose raw exception text
-    return "Something went wrong while processing your request. Please try again or contact support."
+    return (
+        "Something went wrong while processing your request. Please try again or contact support."
+    )
 
 
 def _compose_failure_recovery_plan(
@@ -77,6 +81,58 @@ def _compose_failure_recovery_plan(
         reason=safe_reason,
         last_tool=last_tool,
     )
+
+
+_PUBLISH_DEPLOYMENT_TOOLS: frozenset[str] = frozenset(
+    {"create_semantic_view", "create_cortex_agent", "grant_agent_access", "log_agent_action"},
+)
+_NON_FATAL_PUBLISH_ERROR_MARKERS: tuple[str, ...] = (
+    "explicit user approval is required before deployment",
+    "publishing is blocked",
+)
+
+
+def _coerce_tool_result_payload(output: Any) -> dict[str, Any] | None:
+    """Best-effort parse for JSON-like tool outputs."""
+    candidate = output.content if hasattr(output, "content") else output
+
+    if isinstance(candidate, dict):
+        return candidate
+    if not isinstance(candidate, str):
+        return None
+
+    text = candidate.strip()
+    if not text or text[0] not in ("{", "["):
+        return None
+
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return None
+
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _extract_tool_error_from_payload(payload: dict[str, Any]) -> str | None:
+    """Extract an error string from a structured tool payload if present."""
+    raw_error = payload.get("error")
+    if isinstance(raw_error, str) and raw_error.strip():
+        return raw_error.strip()
+
+    status = str(payload.get("status") or "").strip().lower()
+    if status in {"error", "failed", "failure"}:
+        for key in ("message", "detail", "reason"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return "The tool reported a failure status."
+    return None
+
+
+def _is_tool_payload_success(payload: dict[str, Any]) -> bool:
+    """Return True for successful structured tool results."""
+    status = str(payload.get("status") or "").strip().lower()
+    return status in {"success", "ok", "completed"}
 
 
 def _infer_source_mode_from_text(text: str, phase: str) -> str:
@@ -143,12 +199,235 @@ def _extract_citations_from_text(text: str) -> list[CitationReference]:
     return citations
 
 
+def _coerce_citation_reference(value: Any) -> CitationReference | None:
+    """Best-effort conversion of citation-like dict payloads."""
+    if not isinstance(value, dict):
+        return None
+
+    citation_type = str(value.get("citation_type") or "").strip().lower()
+    if citation_type not in {"sql", "document_chunk", "document_fact"}:
+        return None
+
+    reference_id = str(value.get("reference_id") or "").strip()
+    if not reference_id:
+        return None
+
+    page_value = value.get("page")
+    page: int | None = None
+    if isinstance(page_value, int):
+        page = page_value
+    elif isinstance(page_value, str) and page_value.isdigit():
+        page = int(page_value)
+
+    score_value = value.get("score")
+    score: float | None = None
+    if score_value is not None:
+        try:
+            score = float(score_value)
+        except (TypeError, ValueError):
+            score = None
+
+    metadata = value.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    try:
+        return CitationReference(
+            citation_type=citation_type,  # type: ignore[arg-type]
+            reference_id=reference_id,
+            label=(str(value.get("label")) if value.get("label") is not None else None),
+            page=page,
+            score=score,
+            metadata=metadata,
+        )
+    except Exception:
+        return None
+
+
+def _coerce_recovery_action(value: Any) -> RecoveryAction | None:
+    """Best-effort conversion of recovery action dict payloads."""
+    if not isinstance(value, dict):
+        return None
+    action = str(value.get("action") or "").strip()
+    description = str(value.get("description") or "").strip()
+    if not action or not description:
+        return None
+    metadata = value.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    try:
+        return RecoveryAction(action=action, description=description, metadata=metadata)
+    except Exception:
+        return None
+
+
+def _dedupe_citations(citations: list[CitationReference]) -> list[CitationReference]:
+    """Deduplicate citations preserving original order."""
+    seen: set[tuple[str, str, int | None]] = set()
+    result: list[CitationReference] = []
+    for citation in citations:
+        key = (citation.citation_type, citation.reference_id, citation.page)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(citation)
+    return result
+
+
+def _merge_answer_contract_hints(
+    hints: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Merge tool-emitted contract hints into a single contract-ready structure."""
+    if not hints:
+        return None
+
+    source_modes: set[str] = set()
+    exactness_values: set[str] = set()
+    confidence_values: set[str] = set()
+    trust_values: set[str] = set()
+    evidence_summaries: list[str] = []
+    conflict_notes: list[str] = []
+    citations: list[CitationReference] = []
+    recovery_actions: list[RecoveryAction] = []
+    merged_metadata: dict[str, Any] = {}
+
+    for hint in hints:
+        if not isinstance(hint, dict):
+            continue
+
+        mode = str(hint.get("source_mode") or "").strip().lower()
+        if mode in {"structured", "document", "hybrid", "unknown"}:
+            source_modes.add(mode)
+
+        exactness = str(hint.get("exactness_state") or "").strip().lower()
+        if exactness in {"validated_exact", "estimated", "insufficient_evidence", "not_applicable"}:
+            exactness_values.add(exactness)
+
+        confidence = str(hint.get("confidence_decision") or "").strip().lower()
+        if confidence in {"high", "medium", "abstain"}:
+            confidence_values.add(confidence)
+
+        trust = str(hint.get("trust_state") or "").strip().lower()
+        if trust in {
+            "answer_ready",
+            "answer_with_warnings",
+            "abstained_missing_evidence",
+            "abstained_conflicting_evidence",
+            "blocked_access",
+            "failed_recoverable",
+            "failed_admin",
+        }:
+            trust_values.add(trust)
+
+        summary = str(hint.get("evidence_summary") or "").strip()
+        if summary:
+            evidence_summaries.append(summary)
+
+        for note in (
+            hint.get("conflict_notes", []) if isinstance(hint.get("conflict_notes"), list) else []
+        ):
+            note_text = str(note).strip()
+            if note_text:
+                conflict_notes.append(note_text)
+
+        raw_citations = hint.get("citations")
+        if isinstance(raw_citations, list):
+            for raw_citation in raw_citations:
+                parsed = _coerce_citation_reference(raw_citation)
+                if parsed:
+                    citations.append(parsed)
+
+        raw_actions = hint.get("recovery_actions")
+        if isinstance(raw_actions, list):
+            for raw_action in raw_actions:
+                parsed = _coerce_recovery_action(raw_action)
+                if parsed:
+                    recovery_actions.append(parsed)
+
+        metadata = hint.get("metadata")
+        if isinstance(metadata, dict):
+            merged_metadata.update(metadata)
+
+    if not source_modes:
+        source_mode = "unknown"
+    elif len(source_modes) == 1:
+        source_mode = next(iter(source_modes))
+    else:
+        source_mode = "hybrid"
+
+    if "insufficient_evidence" in exactness_values:
+        exactness_state = "insufficient_evidence"
+    elif "validated_exact" in exactness_values:
+        exactness_state = "validated_exact"
+    elif "estimated" in exactness_values:
+        exactness_state = "estimated"
+    else:
+        exactness_state = "not_applicable"
+
+    if "blocked_access" in trust_values:
+        confidence_decision = "abstain"
+        trust_state = "blocked_access"
+    elif "failed_admin" in trust_values:
+        confidence_decision = "abstain"
+        trust_state = "failed_admin"
+    elif "failed_recoverable" in trust_values:
+        confidence_decision = "abstain"
+        trust_state = "failed_recoverable"
+    elif (
+        "abstain" in confidence_values
+        or "abstained_conflicting_evidence" in trust_values
+        or "abstained_missing_evidence" in trust_values
+    ):
+        confidence_decision = "abstain"
+        trust_state = (
+            "abstained_conflicting_evidence"
+            if ("abstained_conflicting_evidence" in trust_values or conflict_notes)
+            else "abstained_missing_evidence"
+        )
+    elif "answer_with_warnings" in trust_values or "medium" in confidence_values:
+        confidence_decision = "medium"
+        trust_state = (
+            "answer_with_warnings" if "answer_with_warnings" in trust_values else "answer_ready"
+        )
+    else:
+        confidence_decision = "high"
+        trust_state = "answer_ready"
+
+    deduped_citations = _dedupe_citations(citations)
+    evidence_summary = evidence_summaries[0] if evidence_summaries else None
+    if len(evidence_summaries) > 1:
+        evidence_summary = " ".join(dict.fromkeys(evidence_summaries))[:320]
+
+    if confidence_decision == "abstain" and not recovery_actions:
+        recovery_actions.append(
+            RecoveryAction(
+                action="provide_more_evidence",
+                description="Upload or activate additional evidence relevant to this question.",
+                metadata={},
+            )
+        )
+
+    return {
+        "source_mode": source_mode,
+        "exactness_state": exactness_state,
+        "confidence_decision": confidence_decision,
+        "trust_state": trust_state,
+        "evidence_summary": evidence_summary,
+        "conflict_notes": list(dict.fromkeys(conflict_notes))[:8],
+        "citations": deduped_citations,
+        "recovery_actions": recovery_actions,
+        "metadata": merged_metadata,
+    }
+
+
 def _build_answer_contract_payload(
     *,
     phase: str,
     assistant_text: str,
     failure_message: str | None,
     last_tool: str | None,
+    tool_contract_hints: list[dict[str, Any]] | None = None,
+    query_route_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create a normalized answer contract payload for UI trust rendering."""
     text = (assistant_text or "").strip()
@@ -169,7 +448,32 @@ def _build_answer_contract_payload(
             ],
             metadata={"phase": phase, "last_tool": last_tool},
         )
-        return contract.model_dump(mode="json")
+        payload = contract.model_dump(mode="json")
+        return _apply_exactness_guardrail(payload, query_route_plan=query_route_plan)
+
+    merged_hint = _merge_answer_contract_hints(tool_contract_hints or [])
+    if merged_hint is not None:
+        contract = HybridAnswerContract(
+            source_mode=merged_hint["source_mode"],  # type: ignore[arg-type]
+            exactness_state=merged_hint["exactness_state"],  # type: ignore[arg-type]
+            confidence_decision=merged_hint["confidence_decision"],  # type: ignore[arg-type]
+            trust_state=merged_hint["trust_state"],  # type: ignore[arg-type]
+            evidence_summary=merged_hint.get("evidence_summary") or (text[:320] if text else None),
+            conflict_notes=merged_hint.get("conflict_notes") or [],
+            citations=merged_hint.get("citations") or [],
+            recovery_actions=merged_hint.get("recovery_actions") or [],
+            metadata={
+                "phase": phase,
+                "last_tool": last_tool,
+                **(
+                    merged_hint.get("metadata")
+                    if isinstance(merged_hint.get("metadata"), dict)
+                    else {}
+                ),
+            },
+        )
+        payload = contract.model_dump(mode="json")
+        return _apply_exactness_guardrail(payload, query_route_plan=query_route_plan)
 
     source_mode = _infer_source_mode_from_text(text, phase)
     exactness_state = _infer_exactness_state(text)
@@ -196,23 +500,120 @@ def _build_answer_contract_payload(
         recovery_actions=recovery_actions,
         metadata={"phase": phase, "last_tool": last_tool},
     )
-    return contract.model_dump(mode="json")
+    payload = contract.model_dump(mode="json")
+    return _apply_exactness_guardrail(payload, query_route_plan=query_route_plan)
+
+
+def _route_plan_requires_exact_evidence(query_route_plan: dict[str, Any] | None) -> bool:
+    """True when planner classified the question as exactness-sensitive."""
+    if not isinstance(query_route_plan, dict):
+        return False
+    if bool(query_route_plan.get("requires_exact_evidence")):
+        return True
+    intent = str(query_route_plan.get("intent") or "").strip().lower()
+    return intent == "transaction_lookup"
+
+
+def _has_deterministic_exact_citation(citations: list[dict[str, Any]]) -> bool:
+    """True only when evidence includes deterministic SQL or fact-row citations."""
+    for citation in citations:
+        if not isinstance(citation, dict):
+            continue
+        ctype = str(citation.get("citation_type") or "").strip().lower()
+        if ctype in {"sql", "document_fact"}:
+            return True
+    return False
+
+
+def _apply_exactness_guardrail(
+    payload: dict[str, Any],
+    *,
+    query_route_plan: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Enforce deterministic exactness policy for exact-number asks.
+
+    HYB-AI-004 policy:
+    - Exactness-sensitive asks MUST have SQL/document_fact citations.
+    - Never emit ``validated_exact`` from chunk similarity or free-form text.
+    - If deterministic evidence is missing, abstain with a recovery path.
+    """
+    if not isinstance(payload, dict):
+        return payload
+
+    try:
+        from config import get_effective_settings as _get_effective_settings
+
+        if not _get_effective_settings().feature_exactness_guardrail:
+            return payload
+    except Exception:
+        # Fail open to avoid breaking answer delivery if config loading fails.
+        pass
+
+    citations_raw = payload.get("citations")
+    citations = citations_raw if isinstance(citations_raw, list) else []
+    citation_dicts = [c for c in citations if isinstance(c, dict)]
+    has_deterministic = _has_deterministic_exact_citation(citation_dicts)
+
+    exactness_state = str(payload.get("exactness_state") or "not_applicable")
+    requires_exact = _route_plan_requires_exact_evidence(query_route_plan)
+    should_enforce = requires_exact or exactness_state == "validated_exact"
+
+    if not should_enforce or has_deterministic:
+        return payload
+
+    payload["exactness_state"] = "insufficient_evidence"
+    payload["confidence_decision"] = "abstain"
+    if str(payload.get("trust_state") or "") != "abstained_conflicting_evidence":
+        payload["trust_state"] = "abstained_missing_evidence"
+
+    fallback_summary = (
+        "Exact value requested but deterministic SQL/fact evidence was not available."
+    )
+    summary = str(payload.get("evidence_summary") or "").strip()
+    if not summary:
+        payload["evidence_summary"] = fallback_summary
+    elif "deterministic" not in summary.lower():
+        payload["evidence_summary"] = f"{summary} {fallback_summary}".strip()
+
+    actions = payload.get("recovery_actions")
+    recovery_actions = actions if isinstance(actions, list) else []
+    if not any(
+        isinstance(action, dict)
+        and str(action.get("action") or "") == "provide_deterministic_source"
+        for action in recovery_actions
+    ):
+        recovery_actions.append(
+            {
+                "action": "provide_deterministic_source",
+                "description": "Provide or activate SQL rows/document fact evidence for an exact value.",
+                "metadata": {
+                    "requires_exact_evidence": True,
+                    "route_intent": (
+                        str(query_route_plan.get("intent") or "unknown")
+                        if isinstance(query_route_plan, dict)
+                        else "unknown"
+                    ),
+                },
+            }
+        )
+    payload["recovery_actions"] = recovery_actions
+    return payload
 
 
 def _extract_yaml_from_text(text: str) -> str | None:
     """Extract YAML content from LLM text output (safety net helper)."""
     # Try markdown yaml block
-    match = re.search(r'```ya?ml\s*\n(.*?)\n\s*```', text, re.DOTALL)
+    match = re.search(r"```ya?ml\s*\n(.*?)\n\s*```", text, re.DOTALL)
     if match:
         return match.group(1).strip()
     # Try generic code block with YAML content
-    match = re.search(r'```\s*\n(.*?)\n\s*```', text, re.DOTALL)
+    match = re.search(r"```\s*\n(.*?)\n\s*```", text, re.DOTALL)
     if match:
         content = match.group(1).strip()
         if "tables:" in content and "base_table:" in content:
             return content
     # Try raw YAML (look for name: + tables: pattern)
-    match = re.search(r'(name:\s+\S+.*?tables:.*)', text, re.DOTALL)
+    match = re.search(r"(name:\s+\S+.*?tables:.*)", text, re.DOTALL)
     if match:
         candidate = match.group(1).strip()
         if "base_table:" in candidate:
@@ -268,7 +669,7 @@ def _map_phase_to_status(phase: str) -> str | None:
         "prepare": "discovery",
         "transformation": "discovery",
         "requirements": "requirements",
-        "modeling": "generation",   # internal phase folded into external generation status
+        "modeling": "generation",  # internal phase folded into external generation status
         "generation": "generation",
         "validation": "validation",
         "publishing": "validation",  # closest pre-publish status in current enum
@@ -326,6 +727,42 @@ _GENERIC_PROCEED_WORDS: set[str] = {
     "lets proceed",
 }
 
+_AUTOPILOT_MARKERS: tuple[str, ...] = (
+    "end to end",
+    "end-to-end",
+    "all remaining stages",
+    "proceed automatically",
+    "automatically",
+    "without pause",
+    "no pause",
+    "no pauses",
+    "do not pause",
+    "don't pause",
+    "do not stop",
+    "don't stop",
+    "without confirmation",
+    "do not stop for confirmation",
+    "dont stop for confirmation",
+    "autopilot",
+)
+
+_AUTOPILOT_ACTION_PATTERN = re.compile(
+    r"\b(proceed|continue|run|complete|finish|build|generate|validate|publish|deploy|test)\b"
+)
+
+_ANALYSIS_ONLY_NO_PUBLISH_MARKERS: tuple[str, ...] = (
+    "skip publishing",
+    "skip publish",
+    "without publishing",
+    "do not publish",
+    "don't publish",
+    "do not deploy",
+    "don't deploy",
+    "skip deployment",
+    "analysis mode only",
+    "stay in analysis mode",
+)
+
 
 _AGENT_INSTRUCTION_PATTERNS: tuple[str, ...] = (
     r"\b(update|change|modify|revise|rewrite|adjust|tune|improve)\b.*\b(agent|ai agent|cortex agent)\b.*\b(instruction|instructions|prompt|behavior|behaviour|tone|response|disclaimer|guardrail)\b",
@@ -350,6 +787,183 @@ def _normalize_user_text(message: str) -> str:
     return re.sub(r"\s+", " ", (message or "").strip().lower())
 
 
+def _classify_query_intent(message: str) -> tuple[str, str]:
+    """Classify question intent for hybrid routing decisions."""
+    text = _normalize_user_text(message)
+    if not text:
+        return "unknown", "No user query content was provided."
+
+    has_metric = any(
+        token in text
+        for token in (
+            "kpi",
+            "metric",
+            "measure",
+            "trend",
+            "growth",
+            "decline",
+            "count",
+            "average",
+            "sum",
+            "total",
+            "compare",
+            "comparison",
+            "top ",
+            "bottom ",
+        )
+    )
+    has_transaction = any(
+        token in text
+        for token in (
+            "invoice",
+            "purchase order",
+            "po ",
+            "order id",
+            "transaction",
+            "receipt",
+            "part ",
+            "spare",
+            "serial",
+            "sku",
+            "line item",
+            "how much",
+            "exact amount",
+            "exact value",
+            "exact number",
+        )
+    )
+    has_policy = any(
+        token in text
+        for token in (
+            "policy",
+            "manual",
+            "guideline",
+            "procedure",
+            "requirement",
+            "compliance",
+            "contract",
+            "overview report",
+            "outlook report",
+            "document says",
+            "report says",
+        )
+    )
+    has_document_signal = any(
+        token in text for token in ("document", "pdf", "file", "report", "notes", "memo")
+    )
+
+    if has_metric and (has_transaction or has_policy or has_document_signal):
+        return "hybrid", "Question combines numerical metrics with document/business context."
+    if has_transaction:
+        return (
+            "transaction_lookup",
+            "Question requests exact transactional or identifier-level values.",
+        )
+    if has_policy or has_document_signal:
+        return "policy", "Question is primarily about document policy/context interpretation."
+    if has_metric:
+        return "metric", "Question focuses on structured metric/KPI analysis."
+    return "unknown", "Could not confidently infer a specific query intent class."
+
+
+def _build_query_route_plan(
+    message: str,
+    *,
+    current_phase: str,
+    already_published: bool,
+) -> dict[str, Any]:
+    """Build a planner object persisted for hybrid-routing auditability."""
+    intent, rationale = _classify_query_intent(message)
+
+    if intent == "transaction_lookup":
+        lanes = ["document_facts", "structured_sql"]
+        if already_published:
+            lanes.insert(1, "structured_agent")
+        requires_exact = True
+    elif intent == "policy":
+        lanes = ["document_chunks"]
+        requires_exact = False
+    elif intent == "metric":
+        lanes = ["structured_agent" if already_published else "structured_sql"]
+        requires_exact = False
+    elif intent == "hybrid":
+        lanes = ["document_facts", "document_chunks"]
+        lanes.append("structured_agent" if already_published else "structured_sql")
+        requires_exact = any(
+            token in _normalize_user_text(message)
+            for token in ("exact", "exactly", "precise", "specific number", "how much")
+        )
+    else:
+        lanes = ["structured_sql", "document_chunks"]
+        requires_exact = False
+
+    return {
+        "version": "hyb-ai-003-v1",
+        "intent": intent,
+        "rationale": rationale,
+        "current_phase": current_phase,
+        "lanes": lanes,
+        "requires_exact_evidence": requires_exact,
+        "conflict_policy": "abstain_on_conflict",
+    }
+
+
+def _summarize_tool_input_for_trace(tool_name: str, tool_input: Any) -> dict[str, Any]:
+    """Create compact, non-sensitive tool-input summary for audit logs."""
+    summary: dict[str, Any] = {"tool": tool_name}
+    if not isinstance(tool_input, dict):
+        return summary
+
+    if tool_name == "execute_rcr_query":
+        sql_text = str(tool_input.get("sql") or "").strip()
+        if sql_text:
+            summary["sql_hash"] = hashlib.sha1(sql_text.encode("utf-8")).hexdigest()[:12]
+            summary["has_where"] = " where " in sql_text.lower()
+            summary["has_join"] = " join " in sql_text.lower()
+    elif tool_name == "query_document_facts":
+        question = str(tool_input.get("question") or "").strip()
+        if question:
+            summary["question_hash"] = hashlib.sha1(question.encode("utf-8")).hexdigest()[:12]
+        summary["limit"] = tool_input.get("limit")
+    elif tool_name == "search_document_chunks":
+        query_text = str(tool_input.get("query_text") or "").strip()
+        if query_text:
+            summary["query_hash"] = hashlib.sha1(query_text.encode("utf-8")).hexdigest()[:12]
+        summary["limit"] = tool_input.get("limit")
+    elif tool_name == "query_cortex_agent":
+        summary["agent"] = str(tool_input.get("agent_fqn") or "")[:120]
+        question = str(tool_input.get("question") or "").strip()
+        if question:
+            summary["question_hash"] = hashlib.sha1(question.encode("utf-8")).hexdigest()[:12]
+    else:
+        summary["input_keys"] = sorted(str(key) for key in tool_input.keys())[:10]
+
+    return summary
+
+
+def _resolve_llm_signature_for_audit(settings_obj: Any) -> dict[str, str]:
+    """Return provider/model signature with a stable short hash for audit traces."""
+    provider = str(getattr(settings_obj, "llm_provider", "") or "unknown").strip() or "unknown"
+
+    model = ""
+    if provider == "snowflake-cortex":
+        model = str(getattr(settings_obj, "cortex_model", "") or "").strip()
+    elif provider == "vertex-ai":
+        model = str(getattr(settings_obj, "vertex_model", "") or "").strip()
+    elif provider == "openai":
+        model = str(getattr(settings_obj, "openai_model", "") or "").strip()
+    elif provider == "anthropic":
+        model = str(getattr(settings_obj, "anthropic_model", "") or "").strip()
+    elif provider == "azure-openai":
+        model = str(getattr(settings_obj, "azure_openai_deployment", "") or "").strip()
+
+    if not model:
+        model = "unknown"
+
+    model_hash = hashlib.sha256(f"{provider}:{model}".encode("utf-8")).hexdigest()[:16]
+    return {"provider": provider, "model": model, "model_hash": model_hash}
+
+
 def _is_requirements_transition_intent(message: str) -> bool:
     """Detect explicit user intent to move from discovery to requirements."""
     text = _normalize_user_text(message)
@@ -358,6 +972,44 @@ def _is_requirements_transition_intent(message: str) -> bool:
     if text in _GENERIC_PROCEED_WORDS:
         return True
     return any(re.search(p, text) for p in _REQ_MOVE_PATTERNS)
+
+
+def _is_end_to_end_autopilot_intent(message: str) -> bool:
+    """Detect explicit user intent to continue the full pipeline without pauses."""
+    text = _normalize_user_text(message)
+    if not text:
+        return False
+
+    has_marker = any(marker in text for marker in _AUTOPILOT_MARKERS)
+    if not has_marker:
+        return False
+
+    return bool(_AUTOPILOT_ACTION_PATTERN.search(text))
+
+
+def _is_analysis_only_no_publish_intent(message: str) -> bool:
+    """Detect explicit user intent to answer now without publishing/deployment."""
+    text = _normalize_user_text(message)
+    if not text:
+        return False
+
+    has_no_publish = any(marker in text for marker in _ANALYSIS_ONLY_NO_PUBLISH_MARKERS)
+    if not has_no_publish:
+        return False
+
+    asks_to_answer = any(
+        token in text
+        for token in (
+            "answer",
+            "question",
+            "analyze",
+            "analysis",
+            "directly",
+            "from available tables",
+            "with citations",
+        )
+    )
+    return asks_to_answer
 
 
 def _is_agent_instruction_update_intent(message: str) -> bool:
@@ -385,12 +1037,12 @@ def _is_post_publish_agent_instruction_only_intent(message: str) -> bool:
 
 def _requirements_entry_ready(snapshot: dict[str, Any]) -> tuple[bool, str]:
     """Return whether moving to requirements is valid based on workflow state."""
-    has_data_description = bool(snapshot.get("data_description_exists"))
+    has_quality_report = bool(snapshot.get("quality_report_exists"))
     data_tier = (snapshot.get("data_tier") or "").lower()
     transformation_done = bool(snapshot.get("transformation_done"))
 
-    if not has_data_description:
-        return False, "Data description not available yet."
+    if not has_quality_report:
+        return False, "Discovery profiling is not complete yet."
 
     if data_tier in {"silver", "bronze"} and not transformation_done:
         return False, "Data cleanup is required before requirements."
@@ -432,7 +1084,10 @@ def _build_supervisor_contract(
     already_published: bool,
     forced_subagent: str | None = None,
     forced_intent: str | None = None,
+    run_mode: str | None = None,
+    publish_preapproved: bool = False,
     document_context: dict[str, Any] | None = None,
+    query_route_plan: dict[str, Any] | None = None,
 ) -> str:
     """Build a compact supervisor contract injected into orchestrator input."""
     current_phase = snapshot.get("current_phase") or "discovery"
@@ -445,6 +1100,8 @@ def _build_supervisor_contract(
         f"data_product_id={data_product_id}",
         f"already_published={already_published}",
         f"data_tier={data_tier}",
+        f"product_type={snapshot.get('product_type') or 'structured'}",
+        f"has_documents={bool(snapshot.get('has_documents'))}",
         f"data_description_exists={bool(snapshot.get('data_description_exists'))}",
         f"transformation_done={bool(snapshot.get('transformation_done'))}",
         f"brd_exists={bool(snapshot.get('brd_exists'))}",
@@ -510,6 +1167,22 @@ def _build_supervisor_contract(
         lines.append(f"forced_transition={current_phase}->{transition_target}")
     if transition_reason:
         lines.append(f"transition_reason={transition_reason}")
+    if run_mode:
+        lines.append(f"run_mode={run_mode}")
+        if run_mode == "autopilot_end_to_end":
+            lines.append("pause_policy=skip_optional_review_pauses")
+    if query_route_plan:
+        intent = str(query_route_plan.get("intent") or "unknown")
+        lines.append(f"query_intent={intent}")
+        try:
+            route_plan_json = json.dumps(query_route_plan, separators=(",", ":"), ensure_ascii=True)
+        except Exception:
+            route_plan_json = "{}"
+        lines.append(f"query_route_plan={route_plan_json[:1000]}")
+        lines.append(
+            "planner_policy=follow query_route_plan lanes and rationale unless a hard error requires fallback"
+        )
+    lines.append(f"publish_approval={'preapproved' if publish_preapproved else 'required'}")
     if forced_subagent:
         lines.append(f"forced_subagent={forced_subagent}")
     if forced_intent:
@@ -518,6 +1191,31 @@ def _build_supervisor_contract(
     lines.append("[END SUPERVISOR CONTEXT CONTRACT]")
     lines.append(f"[USER MESSAGE]\n{user_message}")
     return "\n".join(lines)
+
+
+def _is_non_fatal_publish_tool_error(
+    *,
+    tool_name: str,
+    error_text: str,
+    publish_completed: bool,
+) -> bool:
+    """Return True when a publishing tool error should not hard-abort the stream."""
+    normalized_error = (error_text or "").lower()
+
+    if any(marker in normalized_error for marker in _NON_FATAL_PUBLISH_ERROR_MARKERS):
+        return True
+
+    # Access grants are helpful but not required to complete semantic view/agent deployment
+    # in the same user role context. Do not abort the workflow on grant-only issues.
+    if tool_name == "grant_agent_access":
+        return True
+
+    # If the agent already exists, subsequent deployment sub-steps may fail due to
+    # idempotency/race conditions. Keep stream alive and let the turn finish.
+    if publish_completed and tool_name in {"log_agent_action", "upload_artifact"}:
+        return True
+
+    return False
 
 
 def _is_internal_reasoning_leak(text: str) -> bool:
@@ -536,48 +1234,36 @@ def _is_internal_reasoning_leak(text: str) -> bool:
         "i need to make sure i don't forget",
         "system prompt says",
         "[internal",
+        "orchestration events",
+        "execution status from orchestration",
+        "chain-of-thought",
     )
     return any(p in lower for p in leak_patterns)
 
 
 def _sanitize_assistant_text(text: str) -> str:
-    """Supervisor-level output sanitizer for persona-safe chat rendering."""
+    """Supervisor-level output sanitizer for persona-safe chat rendering.
+
+    Delegates to the shared sanitizer in supervisor_guardrails and adds
+    router-specific rules (e.g. data_product_id line stripping).
+    """
+    from services.supervisor_guardrails import sanitize_assistant_text as _shared_sanitize
+
     if not text:
         return ""
 
-    # Strip common markdown that occasionally leaks through.
-    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
-    text = re.sub(r"\*(.*?)\*", r"\1", text)
-    text = re.sub(r"`([^`]*)`", r"\1", text)
-    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    # Apply shared sanitizer (markdown stripping, jargon replacement, leak detection).
+    text = _shared_sanitize(text)
 
-    # Drop lines that expose orchestration internals.
+    # Router-specific: also drop lines exposing IDs.
     cleaned_lines: list[str] = []
     for line in text.splitlines():
-        if _is_internal_reasoning_leak(line):
-            continue
-        if re.search(r"\b(data[_ ]product[_ ]id|session[_ ]id|uuid)\b", line, flags=re.IGNORECASE):
+        if re.search(r"\b(data[_ ]product[_ ]id|session[_ ]id)\b", line, flags=re.IGNORECASE):
             continue
         cleaned_lines.append(line)
     text = "\n".join(cleaned_lines)
 
-    replacements: tuple[tuple[str, str], ...] = (
-        (r"\bUUID\b", "internal ID"),
-        (r"\bFQN\b", "table reference"),
-        (r"\bDDL\b", "schema instruction"),
-        (r"\bSQL\b", "query logic"),
-        (r"\bVARCHAR\b", "text"),
-        (r"\bTIMESTAMP_NTZ\b", "timestamp"),
-        (r"\bTABLESAMPLE\b", "sampling"),
-        (r"\bINFORMATION_SCHEMA\b", "metadata catalog"),
-    )
-    for pattern, replacement in replacements:
-        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
-
-    # Collapse pathological "Wait..." loops.
-    text = re.sub(r"(\bWait\b[^\n]*\n?){2,}", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    return text
+    return text.strip()
 
 
 def _sanitize_token_chunk(chunk: str) -> str:
@@ -635,12 +1321,13 @@ def _append_reasoning_buffer(current: str, new_text: str, *, max_chars: int = 20
     window = merged[-max_chars:]
     first_space = window.find(" ")
     if 0 < first_space < 80:
-        window = window[first_space + 1:]
+        window = window[first_space + 1 :]
     return window.lstrip(" -•\t\r\n")
 
 
 def _extract_reasoning_sidechannel(value: Any) -> str:
     """Extract reasoning text from provider side-channel fields."""
+
     def _coerce(candidate: Any) -> str:
         return _flatten_text_payload(candidate).strip()
 
@@ -666,7 +1353,13 @@ def _extract_reasoning_sidechannel(value: Any) -> str:
             if isinstance(first, dict):
                 delta = first.get("delta")
                 if isinstance(delta, dict):
-                    for key in ("reasoning_content", "reasoning", "thinking", "thoughts", "analysis"):
+                    for key in (
+                        "reasoning_content",
+                        "reasoning",
+                        "thinking",
+                        "thoughts",
+                        "analysis",
+                    ):
                         candidate = _coerce(delta.get(key))
                         if candidate:
                             return candidate
@@ -755,7 +1448,9 @@ def _extract_stream_payloads(chunk: Any) -> tuple[str, str]:
                     text_value = _flatten_text_payload(block)
                 if not text_value:
                     continue
-                if any(marker in block_type for marker in ("reason", "think", "analysis", "thought")):
+                if any(
+                    marker in block_type for marker in ("reason", "think", "analysis", "thought")
+                ):
                     reasoning_parts.append(text_value)
                 else:
                     token_parts.append(text_value)
@@ -852,7 +1547,7 @@ def _extract_user_message_from_supervisor_contract(content: str) -> str | None:
     if idx == -1:
         return None
 
-    recovered = content[idx + len(marker):].strip()
+    recovered = content[idx + len(marker) :].strip()
     return recovered or None
 
 
@@ -861,7 +1556,14 @@ def _phase_to_context_step(phase: str | None) -> str:
     normalized = (phase or "").lower().strip()
     if normalized in {"prepare", "transformation", "idle", ""}:
         return "discovery"
-    if normalized in {"discovery", "requirements", "modeling", "generation", "validation", "publishing"}:
+    if normalized in {
+        "discovery",
+        "requirements",
+        "modeling",
+        "generation",
+        "validation",
+        "publishing",
+    }:
         return normalized
     if normalized == "explorer":
         return "publishing"
@@ -896,9 +1598,11 @@ async def _get_document_context_contract(
         active_rows = await _q(
             _pool,
             """SELECT
+                   ud.id AS document_id,
                    ud.filename,
                    ud.doc_kind,
                    ud.summary,
+                   de.id AS evidence_id,
                    de.evidence_type,
                    de.payload
                FROM context_step_selections cs
@@ -942,6 +1646,8 @@ async def _get_document_context_contract(
 
             active_items.append(
                 {
+                    "document_id": row.get("document_id"),
+                    "evidence_id": row.get("evidence_id"),
                     "filename": row.get("filename"),
                     "doc_kind": row.get("doc_kind"),
                     "summary": row.get("summary"),
@@ -962,12 +1668,156 @@ async def _get_document_context_contract(
         return None
 
 
+async def _persist_artifact_context_snapshot(
+    *,
+    data_product_id: str,
+    artifact_type: str,
+    created_by: str,
+    phase: str,
+    document_context_contract: dict[str, Any] | None,
+    artifact_id: str | None = None,
+    artifact_version: int | None = None,
+    snapshot_extra: dict[str, Any] | None = None,
+) -> None:
+    """Best-effort trace of context inputs used to produce an artifact."""
+    if not document_context_contract:
+        return
+
+    context_version_raw = document_context_contract.get("context_version")
+    if context_version_raw is None:
+        return
+
+    try:
+        context_version = int(context_version_raw)
+    except Exception:
+        return
+
+    step = str(document_context_contract.get("step") or _phase_to_context_step(phase))
+    active_items = (
+        document_context_contract.get("active_items")
+        if isinstance(document_context_contract.get("active_items"), list)
+        else []
+    )
+    active_document_ids = [
+        str(item.get("document_id"))
+        for item in active_items
+        if isinstance(item, dict) and item.get("document_id")
+    ]
+    active_evidence_ids = [
+        str(item.get("evidence_id"))
+        for item in active_items
+        if isinstance(item, dict) and item.get("evidence_id")
+    ]
+
+    try:
+        from config import get_effective_settings
+        from services.postgres import execute as _execute
+        from services.postgres import get_pool as _gp
+        from services.postgres import query as _query
+
+        _settings = get_effective_settings()
+        _pool = await _gp(_settings.database_url)
+
+        version_rows = await _query(
+            _pool,
+            """SELECT id
+               FROM context_versions
+               WHERE data_product_id = $1::uuid
+                 AND version = $2
+               LIMIT 1""",
+            data_product_id,
+            context_version,
+        )
+        context_version_id = (
+            str(version_rows[0]["id"])
+            if version_rows and isinstance(version_rows[0].get("id"), str)
+            else None
+        )
+        if not context_version_id:
+            return
+
+        resolved_version = artifact_version
+        if resolved_version is None:
+            if artifact_type == "brd":
+                brd_rows = await _query(
+                    _pool,
+                    """SELECT MAX(version) AS version
+                       FROM business_requirements
+                       WHERE data_product_id = $1::uuid""",
+                    data_product_id,
+                )
+                resolved_version = (
+                    int(brd_rows[0]["version"])
+                    if brd_rows and brd_rows[0].get("version") is not None
+                    else None
+                )
+            elif artifact_type in {"yaml", "semantic_view"}:
+                sv_rows = await _query(
+                    _pool,
+                    """SELECT MAX(version) AS version
+                       FROM semantic_views
+                       WHERE data_product_id = $1::uuid""",
+                    data_product_id,
+                )
+                resolved_version = (
+                    int(sv_rows[0]["version"])
+                    if sv_rows and sv_rows[0].get("version") is not None
+                    else None
+                )
+
+        snapshot_payload: dict[str, Any] = {
+            "phase": phase,
+            "step": step,
+            "context_version": context_version,
+            "active_document_ids": active_document_ids[:24],
+            "active_evidence_ids": active_evidence_ids[:48],
+        }
+        if snapshot_extra and isinstance(snapshot_extra, dict):
+            snapshot_payload.update(snapshot_extra)
+
+        await _execute(
+            _pool,
+            """INSERT INTO artifact_context_snapshots
+                 (id, data_product_id, artifact_id, artifact_type, artifact_version,
+                  context_version_id, snapshot, created_by, created_at)
+               VALUES
+                 ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6::uuid, $7::jsonb, $8, NOW())""",
+            str(uuid4()),
+            data_product_id,
+            artifact_id,
+            artifact_type,
+            resolved_version,
+            context_version_id,
+            json.dumps(snapshot_payload),
+            created_by,
+        )
+    except Exception as e:
+        code = getattr(e, "code", None)
+        if code in {"42P01", "42703", "23503"}:
+            logger.info(
+                "artifact_context_snapshots unavailable for %s (%s): %s",
+                data_product_id,
+                artifact_type,
+                e,
+            )
+            return
+        logger.warning(
+            "Failed to persist artifact context snapshot for %s (%s): %s",
+            data_product_id,
+            artifact_type,
+            e,
+        )
+
+
 async def _get_workflow_snapshot(data_product_id: str) -> dict[str, Any]:
     """Load workflow state used by supervisor guards and context contract."""
     snapshot: dict[str, Any] = {
         "current_phase": "discovery",
         "data_tier": None,
+        "product_type": "structured",
+        "has_documents": False,
         "transformation_done": False,
+        "quality_report_exists": False,
         "data_description_exists": False,
         "brd_exists": False,
         "semantic_view_exists": False,
@@ -983,9 +1833,11 @@ async def _get_workflow_snapshot(data_product_id: str) -> dict[str, Any]:
         dp_rows = await _q(
             _pool,
             """SELECT
+                   name,
                    state->>'current_phase' AS current_phase,
                    state->>'data_tier' AS data_tier,
-                   state->'working_layer' AS working_layer
+                   state->'working_layer' AS working_layer,
+                   product_type
                FROM data_products
                WHERE id = $1::uuid""",
             data_product_id,
@@ -994,13 +1846,23 @@ async def _get_workflow_snapshot(data_product_id: str) -> dict[str, Any]:
             row = dp_rows[0]
             snapshot["current_phase"] = row.get("current_phase") or "discovery"
             snapshot["data_tier"] = row.get("data_tier")
+            snapshot["product_type"] = row.get("product_type") or "structured"
+            dp_name = row.get("name") or ""
+            snapshot["data_product_name"] = dp_name
+            if dp_name:
+                from tools.naming import sanitize_dp_name
+                sanitized = sanitize_dp_name(dp_name)
+                snapshot["target_schema_marts"] = f"EKAIX.{sanitized}_MARTS"
+                snapshot["target_schema_docs"] = f"EKAIX.{sanitized}_DOCS"
             working_layer = row.get("working_layer")
             if isinstance(working_layer, str):
                 try:
                     working_layer = json.loads(working_layer)
                 except Exception:
                     working_layer = None
-            snapshot["transformation_done"] = isinstance(working_layer, dict) and len(working_layer) > 0
+            snapshot["transformation_done"] = (
+                isinstance(working_layer, dict) and len(working_layer) > 0
+            )
 
         dd_rows = await _q(
             _pool,
@@ -1009,12 +1871,26 @@ async def _get_workflow_snapshot(data_product_id: str) -> dict[str, Any]:
         )
         snapshot["data_description_exists"] = bool(dd_rows)
 
+        quality_rows = await _q(
+            _pool,
+            "SELECT 1 FROM data_quality_checks WHERE data_product_id = $1::uuid LIMIT 1",
+            data_product_id,
+        )
+        snapshot["quality_report_exists"] = bool(quality_rows)
+
         brd_rows = await _q(
             _pool,
             "SELECT 1 FROM business_requirements WHERE data_product_id = $1::uuid LIMIT 1",
             data_product_id,
         )
         snapshot["brd_exists"] = bool(brd_rows)
+
+        doc_rows = await _q(
+            _pool,
+            "SELECT 1 FROM uploaded_documents WHERE data_product_id = $1::uuid LIMIT 1",
+            data_product_id,
+        )
+        snapshot["has_documents"] = bool(doc_rows)
 
         sv_rows = await _q(
             _pool,
@@ -1090,8 +1966,13 @@ async def send_message(request: InvokeRequest) -> InvokeResponse:
 
     # Launch the agent invocation in the background
     asyncio.create_task(
-        _run_agent(session_id, request.message, str(request.data_product_id), queue,
-                   file_contents=request.file_contents)
+        _run_agent(
+            session_id,
+            request.message,
+            str(request.data_product_id),
+            queue,
+            file_contents=request.file_contents,
+        )
     )
 
     return InvokeResponse(
@@ -1114,7 +1995,7 @@ async def _get_data_product_info(data_product_id: str) -> dict | None:
     pool = await get_pool(settings.database_url)
     rows = await query(
         pool,
-        """SELECT name, description, database_reference, schemas, tables
+        """SELECT name, description, product_type, database_reference, schemas, tables
            FROM data_products WHERE id = $1""",
         data_product_id,
     )
@@ -1125,6 +2006,7 @@ async def _get_data_product_info(data_product_id: str) -> dict | None:
     return {
         "name": r["name"],
         "description": r["description"] or "No description provided",
+        "product_type": r.get("product_type") or "structured",
         "database": r["database_reference"],
         "schemas": r["schemas"] or [],
         "tables": r["tables"] or [],
@@ -1134,14 +2016,31 @@ async def _get_data_product_info(data_product_id: str) -> dict | None:
 def _simplify_type(data_type: str) -> str:
     """Simplify Snowflake data type to business-friendly category."""
     dt = data_type.upper().strip()
-    if dt in ("NUMBER", "FLOAT", "DECIMAL", "INTEGER", "INT", "BIGINT",
-              "SMALLINT", "TINYINT", "DOUBLE", "REAL", "NUMERIC"):
+    if dt in (
+        "NUMBER",
+        "FLOAT",
+        "DECIMAL",
+        "INTEGER",
+        "INT",
+        "BIGINT",
+        "SMALLINT",
+        "TINYINT",
+        "DOUBLE",
+        "REAL",
+        "NUMERIC",
+    ):
         return "numeric"
-    if dt in ("VARCHAR", "TEXT", "STRING", "CHAR", "NCHAR", "NVARCHAR",
-              "CLOB", "NCLOB"):
+    if dt in ("VARCHAR", "TEXT", "STRING", "CHAR", "NCHAR", "NVARCHAR", "CLOB", "NCLOB"):
         return "text"
-    if dt in ("TIMESTAMP_NTZ", "TIMESTAMP_LTZ", "TIMESTAMP_TZ",
-              "TIMESTAMP", "DATE", "DATETIME", "TIME"):
+    if dt in (
+        "TIMESTAMP_NTZ",
+        "TIMESTAMP_LTZ",
+        "TIMESTAMP_TZ",
+        "TIMESTAMP",
+        "DATE",
+        "DATETIME",
+        "TIME",
+    ):
         return "date/time"
     if dt == "BOOLEAN":
         return "boolean"
@@ -1150,9 +2049,13 @@ def _simplify_type(data_type: str) -> str:
     return "text"
 
 
-def _suggest_field_role(col_name: str, simplified_type: str,
-                        is_pk: bool, distinct_count: int | None,
-                        null_pct: float | None) -> str:
+def _suggest_field_role(
+    col_name: str,
+    simplified_type: str,
+    is_pk: bool,
+    distinct_count: int | None,
+    null_pct: float | None,
+) -> str:
     """Suggest the analytical role of a field based on name and type."""
     name_lower = col_name.lower()
 
@@ -1183,8 +2086,10 @@ def _suggest_field_role(col_name: str, simplified_type: str,
         return "potential dimension"
 
     # Descriptive text fields
-    if any(kw in name_lower for kw in ("description", "comment", "note",
-                                        "text", "body", "message", "remark")):
+    if any(
+        kw in name_lower
+        for kw in ("description", "comment", "note", "text", "body", "message", "remark")
+    ):
         return "descriptive"
 
     return ""
@@ -1196,7 +2101,9 @@ def _build_maturity_section(
 ) -> str:
     """Build a human-readable maturity classification section for the LLM context."""
     if not maturity:
-        return "Not available (pipeline may be cached from before maturity classification was added)."
+        return (
+            "Not available (pipeline may be cached from before maturity classification was added)."
+        )
 
     lines: list[str] = []
     # Map FQN to short name
@@ -1232,6 +2139,7 @@ async def _persist_phase(data_product_id: str, phase: str) -> None:
     try:
         from services.postgres import get_pool as _gp, execute as _ex
         from config import get_effective_settings
+
         _settings = get_effective_settings()
         _pool = await _gp(_settings.database_url)
         _status = _map_phase_to_status(phase)
@@ -1455,14 +2363,18 @@ RULES:
     if len(summary) > _MAX_SUMMARY_CHARS:
         logger.warning(
             "Discovery summary too large (%d chars, %d tables). Truncating to %d chars.",
-            len(summary), len(metadata), _MAX_SUMMARY_CHARS,
+            len(summary),
+            len(metadata),
+            _MAX_SUMMARY_CHARS,
         )
         # Find where table sections end and truncate
         marker = "═══════════════════════════════════════════════════════\nDATA QUALITY"
         marker_pos = summary.find(marker)
         if marker_pos > 0:
             # Get prefix (before tables) and suffix (quality + task sections)
-            prefix_end = summary.find("═══════════════════════════════════════════════════════\nTABLE DETAILS")
+            prefix_end = summary.find(
+                "═══════════════════════════════════════════════════════\nTABLE DETAILS"
+            )
             suffix = summary[marker_pos:]
             prefix = summary[:prefix_end] if prefix_end > 0 else ""
             # Available space for table sections
@@ -1470,7 +2382,10 @@ RULES:
             table_text = chr(10).join(table_sections)
             if len(table_text) > available:
                 # Truncate table text and add note
-                table_text = table_text[:available] + f"\n\n  ... ({len(metadata)} tables total — showing key columns only)"
+                table_text = (
+                    table_text[:available]
+                    + f"\n\n  ... ({len(metadata)} tables total — showing key columns only)"
+                )
             summary = f"""{prefix}═══════════════════════════════════════════════════════
 TABLE DETAILS & FIELD ANALYSIS
 ═══════════════════════════════════════════════════════
@@ -1520,11 +2435,17 @@ def _extract_pbix_text_summary(filename: str, base64_data: str) -> str | None:
                 f"- Package members: {len(members)}",
             ]
             if tables_sample:
-                summary_lines.append(f"- Referenced tables ({len(table_names)}): {', '.join(tables_sample)}")
+                summary_lines.append(
+                    f"- Referenced tables ({len(table_names)}): {', '.join(tables_sample)}"
+                )
             if ref_sample:
-                summary_lines.append(f"- Referenced fields/measures ({len(query_refs)}): {', '.join(ref_sample)}")
+                summary_lines.append(
+                    f"- Referenced fields/measures ({len(query_refs)}): {', '.join(ref_sample)}"
+                )
             if visuals_sample:
-                summary_lines.append(f"- Visual types ({len(visual_types)}): {', '.join(visuals_sample)}")
+                summary_lines.append(
+                    f"- Visual types ({len(visual_types)}): {', '.join(visuals_sample)}"
+                )
             if not query_refs and not visual_types:
                 summary_lines.append(
                     "- No usable model references were extracted from layout; use this as a weak hint only."
@@ -1593,8 +2514,12 @@ def _build_multimodal_content(
     logger.info("Building multimodal content: %d file(s) attached", len(file_contents))
     for fc in file_contents:
         if isinstance(fc, FileContent):
-            logger.info("  File: %s (%s, %d bytes base64)",
-                        fc.filename, fc.content_type, len(fc.base64_data))
+            logger.info(
+                "  File: %s (%s, %d bytes base64)",
+                fc.filename,
+                fc.content_type,
+                len(fc.base64_data),
+            )
 
     # Separate text-decodable files from binary files
     text_parts: list[str] = []
@@ -1620,24 +2545,30 @@ def _build_multimodal_content(
 
         # --- Images: image_url with base64 data URI ---
         if mime.startswith("image/"):
-            binary_blocks.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{fc.base64_data}"},
-            })
+            binary_blocks.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{fc.base64_data}"},
+                }
+            )
 
         # --- Audio: use input_audio only for known supported formats ---
         elif mime.startswith("audio/"):
             audio_subtype = mime.split("/", 1)[1].lower() if "/" in mime else ""
             if audio_subtype in {"wav", "x-wav"}:
-                binary_blocks.append({
-                    "type": "input_audio",
-                    "input_audio": {"data": fc.base64_data, "format": "wav"},
-                })
+                binary_blocks.append(
+                    {
+                        "type": "input_audio",
+                        "input_audio": {"data": fc.base64_data, "format": "wav"},
+                    }
+                )
             elif audio_subtype in {"mp3", "mpeg"}:
-                binary_blocks.append({
-                    "type": "input_audio",
-                    "input_audio": {"data": fc.base64_data, "format": "mp3"},
-                })
+                binary_blocks.append(
+                    {
+                        "type": "input_audio",
+                        "input_audio": {"data": fc.base64_data, "format": "mp3"},
+                    }
+                )
             else:
                 binary_blocks.append(_as_file_block(fc.filename, mime, fc.base64_data))
 
@@ -1665,7 +2596,9 @@ def _build_multimodal_content(
                 decoded = base64.b64decode(fc.base64_data).decode("utf-8")
                 text_parts.append(f"[Attached file: {fc.filename}]\n{decoded[:50000]}")
             except Exception:
-                pbix_summary = _extract_pbix_text_summary(fc.filename or "attachment.pbix", fc.base64_data)
+                pbix_summary = _extract_pbix_text_summary(
+                    fc.filename or "attachment.pbix", fc.base64_data
+                )
                 if pbix_summary:
                     text_parts.append(pbix_summary)
                 else:
@@ -1686,8 +2619,7 @@ def _build_multimodal_content(
     for tp in text_parts:
         blocks.append({"type": "text", "text": tp})
     blocks.extend(binary_blocks)
-    logger.info("Multimodal content: %d blocks (%s)",
-                len(blocks), [b["type"] for b in blocks])
+    logger.info("Multimodal content: %d blocks (%s)", len(blocks), [b["type"] for b in blocks])
     return blocks
 
 
@@ -1719,15 +2651,19 @@ def _sanitize_checkpoint_user_content_blocks(content: Any) -> tuple[Any, bool]:
                 if pbix_summary:
                     normalized.append({"type": "text", "text": pbix_summary})
                 else:
-                    normalized.append({
-                        "type": "text",
-                        "text": "[Legacy PBIX attachment omitted due incompatible history format.]",
-                    })
+                    normalized.append(
+                        {
+                            "type": "text",
+                            "text": "[Legacy PBIX attachment omitted due incompatible history format.]",
+                        }
+                    )
             else:
-                normalized.append({
-                    "type": "text",
-                    "text": "[Legacy binary attachment omitted due incompatible format.]",
-                })
+                normalized.append(
+                    {
+                        "type": "text",
+                        "text": "[Legacy binary attachment omitted due incompatible format.]",
+                    }
+                )
             changed = True
             continue
 
@@ -1752,23 +2688,29 @@ def _sanitize_checkpoint_user_content_blocks(content: Any) -> tuple[Any, bool]:
             if _looks_like_pbix(filename, mime) or (
                 mime == "application/octet-stream" and _is_base64_zip_payload(base64_data)
             ):
-                pbix_summary = _extract_pbix_text_summary(filename or "attachment.pbix", base64_data)
+                pbix_summary = _extract_pbix_text_summary(
+                    filename or "attachment.pbix", base64_data
+                )
                 if pbix_summary:
                     normalized.append({"type": "text", "text": pbix_summary})
                 else:
-                    normalized.append({
-                        "type": "text",
-                        "text": f"[Attached file: {filename or 'attachment.pbix'}] PBIX content unavailable.",
-                    })
+                    normalized.append(
+                        {
+                            "type": "text",
+                            "text": f"[Attached file: {filename or 'attachment.pbix'}] PBIX content unavailable.",
+                        }
+                    )
                 changed = True
                 continue
 
             if mime == "application/octet-stream":
-                normalized.append({
-                    "type": "text",
-                    "text": f"[Attached file: {filename or 'attachment'}] Binary attachment omitted "
-                            "from history due unsupported format.",
-                })
+                normalized.append(
+                    {
+                        "type": "text",
+                        "text": f"[Attached file: {filename or 'attachment'}] Binary attachment omitted "
+                        "from history due unsupported format.",
+                    }
+                )
                 changed = True
                 continue
 
@@ -1793,6 +2735,7 @@ async def _run_agent(
         score_safety_net,
         score_yaml_quality,
     )
+
     _pipeline_timer = PipelineTimer()
     _pipeline_timer.start()
     _trace_id = session_id  # Use session_id as trace_id for Langfuse
@@ -1812,7 +2755,9 @@ async def _run_agent(
     # All user-facing text comes from subagents; orchestrator text is suppressed.
     # Discovery runs inline (no task call) — orchestrator output IS the user-facing output.
     # For all other phases, only subagent output (inside task) is shown.
-    _inside_task: bool = False  # Set to True for discovery below; toggled by task tool for other phases
+    _inside_task: bool = (
+        False  # Set to True for discovery below; toggled by task tool for other phases
+    )
     _subagent_completed: bool = False  # True after a `task` tool returns
     _previous_run_content: str = ""  # Last subagent run's text (for safety net)
     # Per-run dedup: buffer initial tokens to detect duplicate LLM runs within a task
@@ -1838,22 +2783,30 @@ async def _run_agent(
     # Diagnostic counters for stream events
     _stream_event_count: int = 0
     _stream_token_count: int = 0
-    _stream_llm_calls: int = 0          # on_chat_model_start count
-    _stream_llm_completions: int = 0    # on_chat_model_end count
-    _stream_raw_chunks: int = 0         # on_chat_model_stream with content (before gating)
-    _stream_gated_out: int = 0          # tokens filtered by _inside_task / _subagent_completed
-    _stream_dedup_suppressed: int = 0   # tokens suppressed by dedup
-    _stream_task_calls: int = 0         # task tool invocations
-    _stream_firewall_blocks: int = 0    # tokens/runs blocked by supervisor firewall
+    _stream_llm_calls: int = 0  # on_chat_model_start count
+    _stream_llm_completions: int = 0  # on_chat_model_end count
+    _stream_raw_chunks: int = 0  # on_chat_model_stream with content (before gating)
+    _stream_gated_out: int = 0  # tokens filtered by _inside_task / _subagent_completed
+    _stream_dedup_suppressed: int = 0  # tokens suppressed by dedup
+    _stream_task_calls: int = 0  # task tool invocations
+    _stream_firewall_blocks: int = 0  # tokens/runs blocked by supervisor firewall
     _last_tool_name: str | None = None
     _failure_plan_message: str | None = None
+    _publish_completed: bool = False
+    _publish_tool_error_name: str | None = None
+    _publish_tool_error_reason: str | None = None
+    _abort_stream_due_publish_error: bool = False
+    _tool_contract_hints: list[dict[str, Any]] = []
+    _last_tool_inputs: dict[str, Any] = {}
+    _tool_call_trace: list[dict[str, Any]] = []
+    _query_route_plan: dict[str, Any] | None = None
     _last_model_end_output_text: str = ""
     # Phase tracking: detect subagent transitions
     _SUBAGENT_PHASE_MAP: dict[str, str] = {
         "discovery-agent": "discovery",
-        "transformation-agent": "prepare",      # between discovery and requirements
-        "modeling-agent": "generation",         # internal — maps to generation phase
-        "model-builder": "requirements",        # default; refined by tool detection
+        "transformation-agent": "prepare",  # between discovery and requirements
+        "modeling-agent": "generation",  # internal — maps to generation phase
+        "model-builder": "requirements",  # default; refined by tool detection
         "publishing-agent": "publishing",
         "explorer-agent": "explorer",
     }
@@ -1877,10 +2830,12 @@ async def _run_agent(
         if now_ts - _last_reasoning_emit_at < _reasoning_min_interval_sec:
             return
 
-        await queue.put({
-            "type": "reasoning_update",
-            "data": {"message": snippet, "source": source},
-        })
+        await queue.put(
+            {
+                "type": "reasoning_update",
+                "data": {"message": snippet, "source": source},
+            }
+        )
         _last_reasoning_update = snippet
         _last_reasoning_emit_at = now_ts
 
@@ -1903,22 +2858,38 @@ async def _run_agent(
             and already_published
             and _is_post_publish_agent_instruction_only_intent(message)
         )
+        analysis_only_no_publish_intent = not is_discovery and _is_analysis_only_no_publish_intent(
+            message
+        )
+        end_to_end_autopilot_intent = (
+            not is_discovery
+            and not post_publish_agent_instruction_update_intent
+            and not analysis_only_no_publish_intent
+            and _is_end_to_end_autopilot_intent(message)
+        )
         dp_info: dict | None = None  # Set inside discovery block, used for timeout check
         if is_discovery:
             _inside_task = True  # Discovery: orchestrator interprets summary directly
-            logger.info("Discovery trigger detected for session %s (force=%s), running pipeline...", session_id, force_rerun)
+            logger.info(
+                "Discovery trigger detected for session %s (force=%s), running pipeline...",
+                session_id,
+                force_rerun,
+            )
             # Emit phase change to discovery
             _current_phase = "discovery"
-            await queue.put({
-                "type": "phase_change",
-                "data": {"from": "idle", "to": "discovery"},
-            })
+            await queue.put(
+                {
+                    "type": "phase_change",
+                    "data": {"from": "idle", "to": "discovery"},
+                }
+            )
 
             # 0. Invalidate stale artifacts from prior phases when re-running discovery.
             # A new discovery means old BRD, YAML, Data Description, and ERD are no longer valid.
             if force_rerun:
                 try:
                     from services.postgres import get_pool, execute as pg_execute
+
                     _pool = await get_pool(_settings.database_url)
                     # Delete artifacts (erd, yaml, brd, data_description) — keep data_quality (re-generated by pipeline)
                     await pg_execute(
@@ -1927,9 +2898,21 @@ async def _run_agent(
                         data_product_id,
                     )
                     # Delete related table rows
-                    await pg_execute(_pool, "DELETE FROM business_requirements WHERE data_product_id = $1::uuid", data_product_id)
-                    await pg_execute(_pool, "DELETE FROM semantic_views WHERE data_product_id = $1::uuid", data_product_id)
-                    await pg_execute(_pool, "DELETE FROM data_descriptions WHERE data_product_id = $1::uuid", data_product_id)
+                    await pg_execute(
+                        _pool,
+                        "DELETE FROM business_requirements WHERE data_product_id = $1::uuid",
+                        data_product_id,
+                    )
+                    await pg_execute(
+                        _pool,
+                        "DELETE FROM semantic_views WHERE data_product_id = $1::uuid",
+                        data_product_id,
+                    )
+                    await pg_execute(
+                        _pool,
+                        "DELETE FROM data_descriptions WHERE data_product_id = $1::uuid",
+                        data_product_id,
+                    )
                     # Reset published markers so the new run behaves like an active in-progress lifecycle.
                     await pg_execute(
                         _pool,
@@ -1946,7 +2929,9 @@ async def _run_agent(
                            WHERE id = $1::uuid""",
                         data_product_id,
                     )
-                    logger.info("Invalidated prior-phase artifacts for data product %s", data_product_id)
+                    logger.info(
+                        "Invalidated prior-phase artifacts for data product %s", data_product_id
+                    )
                 except Exception as e:
                     logger.warning("Failed to invalidate prior artifacts: %s", e)
 
@@ -1987,18 +2972,22 @@ async def _run_agent(
                         _ART_TYPE_MAP = {"quality_report": "data_quality"}
                         for art_type, art_id in artifact_ids.items():
                             if art_id and art_type == "quality_report":
-                                await queue.put({
-                                    "type": "artifact",
-                                    "data": {
-                                        "artifact_id": art_id,
-                                        "artifact_type": _ART_TYPE_MAP.get(art_type, art_type),
-                                    },
-                                })
+                                await queue.put(
+                                    {
+                                        "type": "artifact",
+                                        "data": {
+                                            "artifact_id": art_id,
+                                            "artifact_type": _ART_TYPE_MAP.get(art_type, art_type),
+                                        },
+                                    }
+                                )
 
                     # Emit cached maturity tier for frontend phase stepper
                     _cached_maturity = pipeline_results.get("maturity_classifications", {})
                     if _cached_maturity:
-                        _cached_tiers = [info.get("maturity", "gold") for info in _cached_maturity.values()]
+                        _cached_tiers = [
+                            info.get("maturity", "gold") for info in _cached_maturity.values()
+                        ]
                         if "bronze" in _cached_tiers:
                             _cached_tier = "bronze"
                         elif "silver" in _cached_tiers:
@@ -2007,14 +2996,18 @@ async def _run_agent(
                             _cached_tier = "gold"
                     else:
                         _cached_tier = "gold"
-                    await queue.put({
-                        "type": "data_maturity",
-                        "data": {"tier": _cached_tier},
-                    })
+                    await queue.put(
+                        {
+                            "type": "data_maturity",
+                            "data": {"tier": _cached_tier},
+                        }
+                    )
 
                 # 3. Build human-readable summary for the LLM
                 actual_message = _build_discovery_summary(
-                    pipeline_results, dp_info["name"], data_product_id,
+                    pipeline_results,
+                    dp_info["name"],
+                    data_product_id,
                     dp_description=dp_info["description"],
                 )
                 logger.info("Pipeline complete, summary length: %d chars", len(actual_message))
@@ -2035,14 +3028,17 @@ async def _run_agent(
                     else:
                         _aggregate_tier = "gold"
 
-                    await queue.put({
-                        "type": "data_maturity",
-                        "data": {"tier": _aggregate_tier},
-                    })
+                    await queue.put(
+                        {
+                            "type": "data_maturity",
+                            "data": {"tier": _aggregate_tier},
+                        }
+                    )
 
                     # Persist to data_products.state JSONB for session recovery
                     try:
                         from services.postgres import get_pool as _gp, execute as _ex
+
                         _dp_pool = await _gp(_settings.database_url)
                         await _ex(
                             _dp_pool,
@@ -2054,6 +3050,43 @@ async def _run_agent(
                         )
                     except Exception as _e:
                         logger.warning("Failed to persist data_tier: %s", _e)
+
+                # Auto-advance from discovery to requirements when entry
+                # conditions are satisfied. This prevents workflow stalls where
+                # discovery completed but the phase stepper remains unchanged.
+                try:
+                    refreshed_snapshot = await _get_workflow_snapshot(data_product_id)
+                    is_ready, readiness_reason = _requirements_entry_ready(refreshed_snapshot)
+                    if is_ready and _current_phase != "requirements":
+                        old_phase = _current_phase
+                        _current_phase = "requirements"
+                        workflow_snapshot["current_phase"] = "requirements"
+                        _pipeline_timer.phase_started("requirements")
+                        await queue.put(
+                            {
+                                "type": "phase_change",
+                                "data": {"from": old_phase, "to": "requirements"},
+                            }
+                        )
+                        await _persist_phase(data_product_id, "requirements")
+                        logger.info(
+                            "Auto-transitioned phase after discovery: %s -> requirements (session=%s reason=%s)",
+                            old_phase,
+                            session_id,
+                            readiness_reason,
+                        )
+                    else:
+                        logger.info(
+                            "Requirements auto-transition deferred after discovery (session=%s reason=%s)",
+                            session_id,
+                            readiness_reason,
+                        )
+                except Exception as transition_err:
+                    logger.warning(
+                        "Failed to evaluate discovery -> requirements auto-transition for session %s: %s",
+                        session_id,
+                        transition_err,
+                    )
         else:
             # Deterministic supervisor transition gate (prevents stuck phase when
             # user asks to proceed and prerequisites are already satisfied).
@@ -2067,10 +3100,12 @@ async def _run_agent(
                 _current_phase = supervisor_forced_phase
                 workflow_snapshot["current_phase"] = supervisor_forced_phase
                 _pipeline_timer.phase_started(supervisor_forced_phase)
-                await queue.put({
-                    "type": "phase_change",
-                    "data": {"from": old_phase, "to": supervisor_forced_phase},
-                })
+                await queue.put(
+                    {
+                        "type": "phase_change",
+                        "data": {"from": old_phase, "to": supervisor_forced_phase},
+                    }
+                )
                 await _persist_phase(data_product_id, supervisor_forced_phase)
                 logger.info(
                     "Supervisor forced phase transition: %s -> %s (session=%s reason=%s)",
@@ -2123,17 +3158,22 @@ async def _run_agent(
         # Publish gate: deployment tools only run when user explicitly approved.
         # Approval is scoped to this invocation and reset every turn.
         is_publish_phase = publish_phase == "publishing"
-        publish_approved = (
-            is_publish_phase
-            and not already_published
-            and _is_explicit_publish_approval(message, allow_bare_ack=True)
+        # Explicit publish wording is valid even for re-publish workflows where
+        # the data product already has a published artifact history.
+        explicit_publish_preapproval = _is_explicit_publish_approval(
+            message,
+            allow_bare_ack=False,
         )
+        publish_approved = explicit_publish_preapproval
+        if not publish_approved:
+            publish_approved = is_publish_phase and _is_explicit_publish_approval(
+                message, allow_bare_ack=True
+            )
         # Allow a direct "publish now" style request from validation, but require
         # explicit publish wording (bare "yes" is not enough before publishing phase).
         if (
             not publish_approved
             and publish_phase == "validation"
-            and not already_published
             and _is_explicit_publish_approval(message, allow_bare_ack=False)
         ):
             publish_approved = True
@@ -2141,15 +3181,21 @@ async def _run_agent(
         # explicit redeploy intents; allow publishing tools for this turn.
         if not publish_approved and post_publish_agent_instruction_update_intent:
             publish_approved = True
+        if analysis_only_no_publish_intent:
+            publish_approved = False
+            explicit_publish_preapproval = False
 
         set_publish_approval_context(publish_approved)
         logger.info(
-            "Publish approval gate for session %s: phase=%s published=%s approved=%s instruction_update_intent=%s",
+            "Publish approval gate for session %s: phase=%s published=%s approved=%s preapproved=%s autopilot=%s instruction_update_intent=%s analysis_only_no_publish=%s",
             session_id,
             publish_phase,
             already_published,
             publish_approved,
+            explicit_publish_preapproval,
+            end_to_end_autopilot_intent,
             post_publish_agent_instruction_update_intent,
+            analysis_only_no_publish_intent,
         )
 
         agent = await get_orchestrator()
@@ -2164,18 +3210,19 @@ async def _run_agent(
         from langchain_core.messages import RemoveMessage as _RM
 
         _chk_state = await agent.aget_state(config)
-        _chk_msgs = (_chk_state.values.get("messages", [])
-                     if _chk_state and _chk_state.values else [])
+        _chk_msgs = (
+            _chk_state.values.get("messages", []) if _chk_state and _chk_state.values else []
+        )
         _patches: list = []
         for _m in _chk_msgs:
             if _m.type == "ai":
                 _c = _m.content
-                _is_empty = (not _c or _c == [] or _c == "" or
-                             (isinstance(_c, list) and len(_c) == 0))
+                _is_empty = (
+                    not _c or _c == [] or _c == "" or (isinstance(_c, list) and len(_c) == 0)
+                )
                 if _is_empty:
                     if getattr(_m, "tool_calls", None):
-                        _patches.append(AIMessage(content=".", id=_m.id,
-                                                  tool_calls=_m.tool_calls))
+                        _patches.append(AIMessage(content=".", id=_m.id, tool_calls=_m.tool_calls))
                     else:
                         _patches.append(_RM(id=_m.id))
             elif _m.type == "human":
@@ -2191,8 +3238,11 @@ async def _run_agent(
         if _patches:
             try:
                 await agent.aupdate_state(config, {"messages": _patches})
-                logger.info("Patched %d checkpoint messages (empty AI and/or legacy media) for session %s",
-                            len(_patches), session_id)
+                logger.info(
+                    "Patched %d checkpoint messages (empty AI and/or legacy media) for session %s",
+                    len(_patches),
+                    session_id,
+                )
             except (UnboundLocalError, Exception) as patch_err:
                 # LangGraph may fail internally when patching certain checkpoint states
                 # (e.g. last_ai_index UnboundLocalError). Log and continue — the agent
@@ -2200,11 +3250,13 @@ async def _run_agent(
                 # the fallback/safety nets will handle it.
                 logger.warning(
                     "Failed to patch checkpoint messages for session %s: %s. Continuing without patch.",
-                    session_id, patch_err,
+                    session_id,
+                    patch_err,
                 )
 
         # Wire the SSE queue contextvar so build_erd_from_description can emit artifact events
         from tools.discovery_tools import _sse_queue
+
         _sse_queue.set(queue)
 
         # With PostgreSQL checkpointer, LangGraph automatically restores
@@ -2218,8 +3270,41 @@ async def _run_agent(
                 data_product_id=data_product_id,
                 phase=effective_phase,
             )
+            if settings.feature_hybrid_planner:
+                _query_route_plan = _build_query_route_plan(
+                    message,
+                    current_phase=effective_phase,
+                    already_published=already_published,
+                )
+                logger.info(
+                    "Hybrid route plan (session=%s): intent=%s lanes=%s exact_required=%s",
+                    session_id,
+                    _query_route_plan.get("intent"),
+                    _query_route_plan.get("lanes"),
+                    _query_route_plan.get("requires_exact_evidence"),
+                )
+            else:
+                _query_route_plan = None
+                logger.info(
+                    "Hybrid route planner disabled by feature flag for session=%s",
+                    session_id,
+                )
 
         if not is_discovery:
+            forced_intent_value: str | None = None
+            if post_publish_agent_instruction_update_intent:
+                forced_intent_value = "post_publish_agent_instruction_update"
+            elif analysis_only_no_publish_intent:
+                forced_intent_value = "analysis_only_no_publish"
+            elif end_to_end_autopilot_intent:
+                forced_intent_value = "autopilot_end_to_end"
+
+            forced_subagent_name: str | None = None
+            if post_publish_agent_instruction_update_intent:
+                forced_subagent_name = "publishing-agent"
+            elif analysis_only_no_publish_intent:
+                forced_subagent_name = "explorer-agent"
+
             actual_message = _build_supervisor_contract(
                 snapshot=workflow_snapshot,
                 user_message=actual_message,
@@ -2227,13 +3312,12 @@ async def _run_agent(
                 transition_reason=supervisor_transition_reason,
                 data_product_id=data_product_id,
                 already_published=already_published,
-                forced_subagent="publishing-agent" if post_publish_agent_instruction_update_intent else None,
-                forced_intent=(
-                    "post_publish_agent_instruction_update"
-                    if post_publish_agent_instruction_update_intent
-                    else None
-                ),
+                forced_subagent=forced_subagent_name,
+                forced_intent=forced_intent_value,
+                run_mode="autopilot_end_to_end" if end_to_end_autopilot_intent else None,
+                publish_preapproved=bool(explicit_publish_preapproval),
                 document_context=document_context_contract,
+                query_route_plan=_query_route_plan,
             )
 
         content = _build_multimodal_content(actual_message, file_contents)
@@ -2245,10 +3329,16 @@ async def _run_agent(
         # Timeout for large discovery: use table count (available from dp_info), not
         # summary length (already truncated by this point).
         _dp_table_count = len(dp_info.get("tables", [])) if is_discovery and dp_info else 0
-        _agent_timeout = 180 if is_discovery and _dp_table_count > 15 else None  # 3 min for large datasets
+        _agent_timeout = (
+            180 if is_discovery and _dp_table_count > 15 else None
+        )  # 3 min for large datasets
         _agent_stream = agent.astream_events(input_messages, config=config, version="v2")
         if _agent_timeout:
-            logger.info("Applying %ds timeout for large discovery summary (%d chars)", _agent_timeout, len(actual_message))
+            logger.info(
+                "Applying %ds timeout for large discovery summary (%d chars)",
+                _agent_timeout,
+                len(actual_message),
+            )
 
         # Use wait_for on each iteration to enforce timeout on blocked LLM calls.
         # A simple `async for` blocks if the LLM never responds.
@@ -2264,7 +3354,10 @@ async def _run_agent(
             except (asyncio.TimeoutError, TimeoutError):
                 logger.warning(
                     "Agent stream timed out after %ds for session %s (events=%d, tokens=%d)",
-                    _agent_timeout, session_id, _stream_event_count, _stream_token_count,
+                    _agent_timeout,
+                    session_id,
+                    _stream_event_count,
+                    _stream_token_count,
                 )
                 break
 
@@ -2276,8 +3369,14 @@ async def _run_agent(
             if kind == "on_chat_model_start":
                 _stream_llm_calls += 1
                 _llm_model = event.get("name", "unknown")
-                logger.info("LLM call #%d started (model=%s, session=%s, inside_task=%s, subagent_completed=%s)",
-                            _stream_llm_calls, _llm_model, session_id, _inside_task, _subagent_completed)
+                logger.info(
+                    "LLM call #%d started (model=%s, session=%s, inside_task=%s, subagent_completed=%s)",
+                    _stream_llm_calls,
+                    _llm_model,
+                    session_id,
+                    _inside_task,
+                    _subagent_completed,
+                )
             elif kind == "on_chat_model_end":
                 _stream_llm_completions += 1
                 # Log output summary
@@ -2290,8 +3389,13 @@ async def _run_agent(
                         _end_content_len = len(_c) if isinstance(_c, str) else len(str(_c))
                     if hasattr(_end_output, "tool_calls"):
                         _end_tool_calls = len(_end_output.tool_calls or [])
-                logger.info("LLM call #%d completed (content_len=%d, tool_calls=%d, session=%s)",
-                            _stream_llm_completions, _end_content_len, _end_tool_calls, session_id)
+                logger.info(
+                    "LLM call #%d completed (content_len=%d, tool_calls=%d, session=%s)",
+                    _stream_llm_completions,
+                    _end_content_len,
+                    _end_tool_calls,
+                    session_id,
+                )
                 if _end_output:
                     _end_text, _end_reasoning = _extract_stream_payloads(_end_output)
                     if _end_text and len(_end_text) > len(_last_model_end_output_text):
@@ -2327,22 +3431,31 @@ async def _run_agent(
                     if _run_token_buffer and not _run_suppressed:
                         buffered_text = "".join(_run_token_buffer)
                         # Short message that didn't reach threshold — check if duplicate
-                        if _previous_run_content and _previous_run_content.startswith(buffered_text.strip()):
+                        if _previous_run_content and _previous_run_content.startswith(
+                            buffered_text.strip()
+                        ):
                             _run_suppressed = True
                             logger.info("Suppressing short duplicate subagent run")
                         elif _is_internal_reasoning_leak(buffered_text):
                             _run_suppressed = True
                             _stream_firewall_blocks += 1
-                            logger.warning("Supervisor firewall blocked short internal run for session %s", session_id)
+                            logger.warning(
+                                "Supervisor firewall blocked short internal run for session %s",
+                                session_id,
+                            )
                         else:
                             current_assistant_content = buffered_text
                             if not _current_run_has_llm_reasoning:
-                                await _emit_reasoning_update(current_assistant_content, source="fallback")
+                                await _emit_reasoning_update(
+                                    current_assistant_content, source="fallback"
+                                )
                             for tok in _run_token_buffer:
-                                await queue.put({
-                                    "type": "token",
-                                    "data": {"content": tok},
-                                })
+                                await queue.put(
+                                    {
+                                        "type": "token",
+                                        "data": {"content": tok},
+                                    }
+                                )
                         _run_token_buffer = []
 
                     if _current_run_id is not None and current_assistant_content.strip():
@@ -2351,10 +3464,12 @@ async def _run_agent(
                             _previous_run_content = _finalized
                             _assistant_texts.append(_finalized)
                         current_assistant_content = ""
-                        await queue.put({
-                            "type": "message_done",
-                            "data": {"content": _finalized},
-                        })
+                        await queue.put(
+                            {
+                                "type": "message_done",
+                                "data": {"content": _finalized},
+                            }
+                        )
                     _current_run_id = run_id
                     # Reset per-run dedup state
                     _run_token_buffer = []
@@ -2392,21 +3507,30 @@ async def _run_agent(
                         _run_dedup_resolved = True
                         if _previous_run_content.startswith(buffered_text.strip()):
                             _run_suppressed = True
-                            logger.info("Suppressing duplicate subagent run (prefix matches previous)")
+                            logger.info(
+                                "Suppressing duplicate subagent run (prefix matches previous)"
+                            )
                         elif _is_internal_reasoning_leak(buffered_text):
                             _run_suppressed = True
                             _stream_firewall_blocks += 1
-                            logger.warning("Supervisor firewall blocked buffered internal run for session %s", session_id)
+                            logger.warning(
+                                "Supervisor firewall blocked buffered internal run for session %s",
+                                session_id,
+                            )
                         else:
                             # Not a duplicate — flush buffered tokens
                             current_assistant_content = buffered_text
                             if not _current_run_has_llm_reasoning:
-                                await _emit_reasoning_update(current_assistant_content, source="fallback")
+                                await _emit_reasoning_update(
+                                    current_assistant_content, source="fallback"
+                                )
                             for tok in _run_token_buffer:
-                                await queue.put({
-                                    "type": "token",
-                                    "data": {"content": tok},
-                                })
+                                await queue.put(
+                                    {
+                                        "type": "token",
+                                        "data": {"content": tok},
+                                    }
+                                )
                             _run_token_buffer = []
                     continue
 
@@ -2423,15 +3547,31 @@ async def _run_agent(
                 if not _current_run_has_llm_reasoning:
                     await _emit_reasoning_update(current_assistant_content, source="fallback")
                 _stream_token_count += 1
-                await queue.put({
-                    "type": "token",
-                    "data": {"content": content},
-                })
+                await queue.put(
+                    {
+                        "type": "token",
+                        "data": {"content": content},
+                    }
+                )
 
             elif kind == "on_tool_start":
                 tool_name = event.get("name", "unknown")
                 tool_input = data.get("input", {})
                 _last_tool_name = tool_name
+                _last_tool_inputs[tool_name] = (
+                    tool_input if isinstance(tool_input, dict) else str(tool_input)
+                )
+                if tool_name != "task":
+                    _tool_call_trace.append(
+                        {
+                            "event": "start",
+                            "tool": tool_name,
+                            "phase": _current_phase,
+                            "input": _summarize_tool_input_for_trace(tool_name, tool_input),
+                        }
+                    )
+                    if len(_tool_call_trace) > 120:
+                        _tool_call_trace = _tool_call_trace[-120:]
 
                 # Track upload_artifact calls and emit artifact event from input
                 # (more reliable than parsing output — subagent tool output may not propagate cleanly)
@@ -2439,7 +3579,10 @@ async def _run_agent(
                     art_type = tool_input.get("artifact_type", "")
                     art_filename = tool_input.get("filename", "")
                     # Guard: correct type if filename contradicts it
-                    if "data-description" in art_filename.lower() and art_type != "data_description":
+                    if (
+                        "data-description" in art_filename.lower()
+                        and art_type != "data_description"
+                    ):
                         art_type = "data_description"
                     if art_type == "brd":
                         _brd_artifact_uploaded = True
@@ -2447,13 +3590,15 @@ async def _run_agent(
                         # Map backend artifact types to frontend types
                         _ARTIFACT_TYPE_MAP = {"quality_report": "data_quality"}
                         mapped_type = _ARTIFACT_TYPE_MAP.get(art_type, art_type)
-                        await queue.put({
-                            "type": "artifact",
-                            "data": {
-                                "artifact_id": str(uuid4()),
-                                "artifact_type": mapped_type,
-                            },
-                        })
+                        await queue.put(
+                            {
+                                "type": "artifact",
+                                "data": {
+                                    "artifact_id": str(uuid4()),
+                                    "artifact_type": mapped_type,
+                                },
+                            }
+                        )
                         logger.info("Emitted artifact event from tool_start: type=%s", mapped_type)
 
                 # Detect subagent delegation via the `task` tool and emit phase_change
@@ -2489,14 +3634,36 @@ async def _run_agent(
                         elif phase_hint == "requirements":
                             phase_name = "requirements"
                     if phase_name and phase_name != _current_phase:
+                        # Prevent noisy phase regressions from delegated discovery
+                        # calls after we already advanced into requirements+.
+                        # Recovery loops across generation/validation are handled
+                        # by tool-level transitions below; this guard targets only
+                        # subagent delegation regressions to discovery/prepare.
+                        if (
+                            _current_phase in {"requirements", "modeling", "generation", "validation", "publishing", "explorer"}
+                            and phase_name in {"discovery", "prepare"}
+                        ):
+                            logger.info(
+                                "Phase regression suppressed: %s -> %s (session %s, subagent=%s)",
+                                _current_phase,
+                                phase_name,
+                                session_id,
+                                subagent_type,
+                            )
+                            phase_name = None
+                    if phase_name and phase_name != _current_phase:
                         old_phase = _current_phase
                         _current_phase = phase_name
                         _pipeline_timer.phase_started(phase_name)
-                        await queue.put({
-                            "type": "phase_change",
-                            "data": {"from": old_phase, "to": phase_name},
-                        })
-                        logger.info("Phase change: %s → %s (session %s)", old_phase, phase_name, session_id)
+                        await queue.put(
+                            {
+                                "type": "phase_change",
+                                "data": {"from": old_phase, "to": phase_name},
+                            }
+                        )
+                        logger.info(
+                            "Phase change: %s → %s (session %s)", old_phase, phase_name, session_id
+                        )
                         # Persist current_phase to data_products.state
                         await _persist_phase(data_product_id, phase_name)
 
@@ -2506,7 +3673,9 @@ async def _run_agent(
                     old_phase = _current_phase
                     _current_phase = "requirements"
                     _pipeline_timer.phase_started("requirements")
-                    await queue.put({"type": "phase_change", "data": {"from": old_phase, "to": "requirements"}})
+                    await queue.put(
+                        {"type": "phase_change", "data": {"from": old_phase, "to": "requirements"}}
+                    )
                     await _persist_phase(data_product_id, "requirements")
                 # Only persisted semantic-view writes should advance to generation.
                 # fetch_documentation may run during requirements refinement and
@@ -2516,24 +3685,32 @@ async def _run_agent(
                     _current_phase = "generation"
                     _generation_phase_ran = True
                     _pipeline_timer.phase_started("generation")
-                    await queue.put({"type": "phase_change", "data": {"from": old_phase, "to": "generation"}})
+                    await queue.put(
+                        {"type": "phase_change", "data": {"from": old_phase, "to": "generation"}}
+                    )
                     await _persist_phase(data_product_id, "generation")
                 elif tool_name == "validate_semantic_view_yaml" and _current_phase != "validation":
                     old_phase = _current_phase
                     _current_phase = "validation"
                     _pipeline_timer.phase_started("validation")
-                    await queue.put({"type": "phase_change", "data": {"from": old_phase, "to": "validation"}})
+                    await queue.put(
+                        {"type": "phase_change", "data": {"from": old_phase, "to": "validation"}}
+                    )
                     await _persist_phase(data_product_id, "validation")
 
                 # Skip tool_call event for internal `task` tool — phase_change events handle this
                 if tool_name != "task":
-                    await queue.put({
-                        "type": "tool_call",
-                        "data": {
-                            "tool": tool_name,
-                            "input": tool_input if isinstance(tool_input, dict) else str(tool_input),
-                        },
-                    })
+                    await queue.put(
+                        {
+                            "type": "tool_call",
+                            "data": {
+                                "tool": tool_name,
+                                "input": (
+                                    tool_input if isinstance(tool_input, dict) else str(tool_input)
+                                ),
+                            },
+                        }
+                    )
 
             elif kind == "on_tool_end":
                 tool_name = event.get("name", "unknown")
@@ -2541,9 +3718,141 @@ async def _run_agent(
                 # Extract content from ToolMessage objects (LangChain may return these)
                 if hasattr(output, "content"):
                     output = output.content
+                output_payload = _coerce_tool_result_payload(output)
+                output_error = (
+                    _extract_tool_error_from_payload(output_payload)
+                    if isinstance(output_payload, dict)
+                    else None
+                )
                 # Truncate long outputs
                 truncate_len = _settings.tool_output_truncate_length
                 output_str = str(output)[:truncate_len] if output else ""
+                if tool_name != "task":
+                    end_trace: dict[str, Any] = {
+                        "event": "end",
+                        "tool": tool_name,
+                        "phase": _current_phase,
+                        "status": "error" if output_error else "ok",
+                    }
+                    if isinstance(output_payload, dict):
+                        for key in ("status", "row_count", "match_count", "error_type"):
+                            if key in output_payload:
+                                end_trace[key] = output_payload.get(key)
+                    _tool_call_trace.append(end_trace)
+                    if len(_tool_call_trace) > 120:
+                        _tool_call_trace = _tool_call_trace[-120:]
+
+                if isinstance(output_payload, dict):
+                    hint_payload = output_payload.get("answer_contract_hint")
+                    if isinstance(hint_payload, dict):
+                        _tool_contract_hints.append(hint_payload)
+
+                    payload_citations = output_payload.get("citations")
+                    if isinstance(payload_citations, list) and not isinstance(hint_payload, dict):
+                        raw_citations = [c for c in payload_citations if isinstance(c, dict)]
+                        if raw_citations:
+                            _tool_contract_hints.append(
+                                {
+                                    "source_mode": (
+                                        "document"
+                                        if tool_name
+                                        in {"query_document_facts", "search_document_chunks"}
+                                        else "structured"
+                                    ),
+                                    "exactness_state": "not_applicable",
+                                    "confidence_decision": "medium",
+                                    "trust_state": "answer_ready",
+                                    "evidence_summary": f"{tool_name} returned {len(raw_citations)} citation(s).",
+                                    "citations": raw_citations,
+                                    "metadata": {"tool": tool_name},
+                                }
+                            )
+
+                if (
+                    tool_name == "execute_rcr_query"
+                    and isinstance(output_payload, dict)
+                    and not output_error
+                ):
+                    row_count = 0
+                    try:
+                        row_count = int(output_payload.get("row_count") or 0)
+                    except Exception:
+                        row_count = 0
+
+                    raw_sql_input = _last_tool_inputs.get("execute_rcr_query")
+                    if isinstance(raw_sql_input, dict):
+                        sql_text = str(raw_sql_input.get("sql") or "").strip()
+                    else:
+                        sql_text = str(raw_sql_input or "").strip()
+                    query_hash = (
+                        hashlib.sha1(sql_text.encode("utf-8")).hexdigest()[:12]
+                        if sql_text
+                        else str(uuid4())
+                    )
+                    sql_citation: dict[str, Any] = {
+                        "citation_type": "sql",
+                        "reference_id": f"sql-{query_hash}",
+                        "label": "Structured query result",
+                        "metadata": {
+                            "tool": "execute_rcr_query",
+                            "row_count": row_count,
+                            "query_hash": query_hash,
+                        },
+                    }
+                    if output_payload.get("autocorrected_from") and output_payload.get(
+                        "autocorrected_to"
+                    ):
+                        sql_citation["metadata"].update(
+                            {
+                                "autocorrected_from": output_payload.get("autocorrected_from"),
+                                "autocorrected_to": output_payload.get("autocorrected_to"),
+                            }
+                        )
+
+                    _tool_contract_hints.append(
+                        {
+                            "source_mode": "structured",
+                            "exactness_state": "not_applicable",
+                            "confidence_decision": "medium",
+                            "trust_state": "answer_ready",
+                            "evidence_summary": f"Structured query returned {row_count} row(s).",
+                            "citations": [sql_citation],
+                            "metadata": {"tool": "execute_rcr_query", "row_count": row_count},
+                        }
+                    )
+
+                if tool_name == "query_cortex_agent" and isinstance(output_payload, dict):
+                    if _is_tool_payload_success(output_payload):
+                        _tool_contract_hints.append(
+                            {
+                                "source_mode": "structured",
+                                "exactness_state": "not_applicable",
+                                "confidence_decision": "medium",
+                                "trust_state": "answer_ready",
+                                "evidence_summary": "Structured answer path completed via the published AI agent.",
+                                "citations": [],
+                                "metadata": {"tool": "query_cortex_agent"},
+                            }
+                        )
+                    elif str(output_payload.get("error_type") or "").lower() == "auth":
+                        _tool_contract_hints.append(
+                            {
+                                "source_mode": "structured",
+                                "exactness_state": "not_applicable",
+                                "confidence_decision": "abstain",
+                                "trust_state": "blocked_access",
+                                "evidence_summary": "The published AI agent could not be reached due to access or session constraints.",
+                                "citations": [],
+                                "recovery_actions": [
+                                    {
+                                        "action": "refresh_access_session",
+                                        "description": "Retry with an active Snowflake session and role access to the published AI agent.",
+                                        "metadata": {},
+                                    }
+                                ],
+                                "metadata": {"tool": "query_cortex_agent"},
+                            }
+                        )
 
                 # Track save_data_description for safety net
                 if tool_name == "save_data_description":
@@ -2561,6 +3870,15 @@ async def _run_agent(
                     logger.info("save_brd completed for session %s", session_id)
                     # Score BRD quality
                     asyncio.create_task(score_brd_quality(_trace_id, data_product_id))
+                    if not output_error:
+                        await _persist_artifact_context_snapshot(
+                            data_product_id=data_product_id,
+                            artifact_type="brd",
+                            created_by="ekai-agent",
+                            phase=_current_phase,
+                            document_context_contract=document_context_contract,
+                            snapshot_extra={"tool": "save_brd"},
+                        )
 
                 # Track register_gold_layer for modeling phase + emit lineage artifact
                 if tool_name == "register_gold_layer":
@@ -2568,14 +3886,25 @@ async def _run_agent(
                     logger.info("register_gold_layer completed for session %s", session_id)
                     # Lineage is written to Neo4j inside register_gold_layer —
                     # emit the lineage artifact event so frontend shows it
-                    await queue.put({
-                        "type": "artifact",
-                        "data": {
-                            "artifact_id": str(uuid4()),
-                            "artifact_type": "lineage",
-                        },
-                    })
+                    await queue.put(
+                        {
+                            "type": "artifact",
+                            "data": {
+                                "artifact_id": str(uuid4()),
+                                "artifact_type": "lineage",
+                            },
+                        }
+                    )
                     logger.info("Emitted lineage artifact event for session %s", session_id)
+                    if not output_error:
+                        await _persist_artifact_context_snapshot(
+                            data_product_id=data_product_id,
+                            artifact_type="lineage",
+                            created_by="ekai-agent",
+                            phase=_current_phase,
+                            document_context_contract=document_context_contract,
+                            snapshot_extra={"tool": "register_gold_layer"},
+                        )
 
                 # Emit artifact events for modeling save tools
                 _MODELING_TOOL_ARTIFACT_MAP = {
@@ -2586,19 +3915,34 @@ async def _run_agent(
                     "save_openlineage_artifact": "lineage",
                 }
                 if tool_name in _MODELING_TOOL_ARTIFACT_MAP:
-                    await queue.put({
-                        "type": "artifact",
-                        "data": {
-                            "artifact_id": str(uuid4()),
-                            "artifact_type": _MODELING_TOOL_ARTIFACT_MAP[tool_name],
-                        },
-                    })
-                    logger.info("Emitted %s artifact event for session %s", _MODELING_TOOL_ARTIFACT_MAP[tool_name], session_id)
+                    await queue.put(
+                        {
+                            "type": "artifact",
+                            "data": {
+                                "artifact_id": str(uuid4()),
+                                "artifact_type": _MODELING_TOOL_ARTIFACT_MAP[tool_name],
+                            },
+                        }
+                    )
+                    logger.info(
+                        "Emitted %s artifact event for session %s",
+                        _MODELING_TOOL_ARTIFACT_MAP[tool_name],
+                        session_id,
+                    )
 
                 # Track save_semantic_view for generation safety net
                 if tool_name == "save_semantic_view":
                     _yaml_tool_called = True
                     logger.info("save_semantic_view completed for session %s", session_id)
+                    if not output_error:
+                        await _persist_artifact_context_snapshot(
+                            data_product_id=data_product_id,
+                            artifact_type="yaml",
+                            created_by="ekai-agent",
+                            phase=_current_phase,
+                            document_context_contract=document_context_contract,
+                            snapshot_extra={"tool": "save_semantic_view"},
+                        )
 
                 # Mark when a subagent completes and close the task gate
                 if tool_name == "task":
@@ -2609,15 +3953,101 @@ async def _run_agent(
                 # Artifact event already emitted from on_tool_start (more reliable).
                 # Log the output for debugging but don't emit a second artifact event.
                 if tool_name == "upload_artifact" and output_str:
-                    logger.info("upload_artifact output (type=%s): %s", type(output).__name__, output_str[:200])
+                    logger.info(
+                        "upload_artifact output (type=%s): %s",
+                        type(output).__name__,
+                        output_str[:200],
+                    )
 
-                await queue.put({
-                    "type": "tool_result",
-                    "data": {
-                        "tool": tool_name,
-                        "output": output_str,
-                    },
-                })
+                if tool_name in _PUBLISH_DEPLOYMENT_TOOLS:
+                    if isinstance(output_payload, dict) and _is_tool_payload_success(
+                        output_payload
+                    ):
+                        if tool_name == "create_semantic_view":
+                            await _persist_artifact_context_snapshot(
+                                data_product_id=data_product_id,
+                                artifact_type="semantic_view",
+                                created_by="ekai-agent",
+                                phase="publishing",
+                                document_context_contract=document_context_contract,
+                                snapshot_extra={"tool": "create_semantic_view"},
+                            )
+                        if tool_name == "create_cortex_agent":
+                            _publish_completed = True
+                            logger.info(
+                                "Publish completed for session %s (create_cortex_agent succeeded)",
+                                session_id,
+                            )
+                            await _persist_artifact_context_snapshot(
+                                data_product_id=data_product_id,
+                                artifact_type="published_agent",
+                                created_by="ekai-agent",
+                                phase="publishing",
+                                document_context_contract=document_context_contract,
+                                snapshot_extra={"tool": "create_cortex_agent"},
+                            )
+                        _publish_tool_error_name = None
+                        _publish_tool_error_reason = None
+                        _abort_stream_due_publish_error = False
+
+                    if output_error:
+                        if _is_non_fatal_publish_tool_error(
+                            tool_name=tool_name,
+                            error_text=output_error,
+                            publish_completed=_publish_completed,
+                        ):
+                            logger.info(
+                                "Non-fatal publish tool error for session %s: tool=%s error=%s",
+                                session_id,
+                                tool_name,
+                                output_error[:200],
+                            )
+                        else:
+                            _publish_tool_error_name = tool_name
+                            _publish_tool_error_reason = output_error
+                            if _current_phase != "publishing":
+                                old_phase = _current_phase
+                                _current_phase = "publishing"
+                                _pipeline_timer.phase_started("publishing")
+                                await queue.put(
+                                    {
+                                        "type": "phase_change",
+                                        "data": {"from": old_phase, "to": "publishing"},
+                                    }
+                                )
+                                await _persist_phase(data_product_id, "publishing")
+                            if not _failure_plan_message:
+                                _failure_plan_message = _compose_failure_recovery_plan(
+                                    phase="publishing",
+                                    reason=output_error,
+                                    timed_out=False,
+                                    last_tool=tool_name,
+                                )
+                            _abort_stream_due_publish_error = True
+                            logger.warning(
+                                "Fatal publishing tool failure for session %s: tool=%s error=%s",
+                                session_id,
+                                tool_name,
+                                output_error[:300],
+                            )
+
+                await queue.put(
+                    {
+                        "type": "tool_result",
+                        "data": {
+                            "tool": tool_name,
+                            "output": output_str,
+                        },
+                    }
+                )
+
+                if _abort_stream_due_publish_error:
+                    logger.warning(
+                        "Stopping agent stream early after publishing failure (session=%s tool=%s)",
+                        session_id,
+                        _publish_tool_error_name or tool_name,
+                    )
+                    break
 
             elif kind == "on_chain_end" and event.get("name") == "ekaix-orchestrator":
                 # Final orchestrator response — suppress entirely.
@@ -2628,7 +4058,9 @@ async def _run_agent(
         logger.warning(
             "Agent timed out for session %s after streaming %d events, %d tokens. "
             "Large discovery summary may have caused the LLM to hang.",
-            session_id, _stream_event_count, _stream_token_count,
+            session_id,
+            _stream_event_count,
+            _stream_token_count,
         )
         _failure_plan_message = _compose_failure_recovery_plan(
             phase=_current_phase,
@@ -2643,10 +4075,16 @@ async def _run_agent(
         # This is benign — the subagent already delivered content.
         if "no generations" in str(e).lower():
             if is_discovery and _stream_token_count == 0:
-                logger.warning("Agent %s: no generations during discovery (summary_len=%d) — fallback will fire in finally",
-                               session_id, len(actual_message))
+                logger.warning(
+                    "Agent %s: no generations during discovery (summary_len=%d) — fallback will fire in finally",
+                    session_id,
+                    len(actual_message),
+                )
             elif _stream_token_count == 0 and not _subagent_completed and not _assistant_texts:
-                logger.warning("Agent %s: no generations and no visible output; emitting recovery plan", session_id)
+                logger.warning(
+                    "Agent %s: no generations and no visible output; emitting recovery plan",
+                    session_id,
+                )
                 _failure_plan_message = _compose_failure_recovery_plan(
                     phase=_current_phase,
                     reason=str(e),
@@ -2654,7 +4092,10 @@ async def _run_agent(
                     last_tool=_last_tool_name,
                 )
             else:
-                logger.info("Agent %s produced empty response (expected after subagent delegation)", session_id)
+                logger.info(
+                    "Agent %s produced empty response (expected after subagent delegation)",
+                    session_id,
+                )
         else:
             logger.exception("Agent execution failed for session %s: %s", session_id, e)
             _failure_plan_message = _compose_failure_recovery_plan(
@@ -2692,14 +4133,18 @@ async def _run_agent(
             recovered_text = _sanitize_assistant_text(_last_model_end_output_text)
             if recovered_text and not _is_internal_reasoning_leak(recovered_text):
                 current_assistant_content = recovered_text
-                await queue.put({
-                    "type": "token",
-                    "data": {"content": recovered_text},
-                })
-                await queue.put({
-                    "type": "message_done",
-                    "data": {"content": recovered_text},
-                })
+                await queue.put(
+                    {
+                        "type": "token",
+                        "data": {"content": recovered_text},
+                    }
+                )
+                await queue.put(
+                    {
+                        "type": "message_done",
+                        "data": {"content": recovered_text},
+                    }
+                )
                 _stream_token_count += 1
                 logger.warning(
                     "Recovered direct model answer for session %s (no task delegation, %d chars)",
@@ -2712,9 +4157,17 @@ async def _run_agent(
             "Agent stream completed for session %s: events=%d, llm_calls=%d, llm_completions=%d, "
             "raw_chunks=%d, gated_out=%d, dedup_suppressed=%d, firewall_blocks=%d, tokens_emitted=%d, "
             "task_calls=%d, assistant_texts=%d",
-            session_id, _stream_event_count, _stream_llm_calls, _stream_llm_completions,
-            _stream_raw_chunks, _stream_gated_out, _stream_dedup_suppressed, _stream_firewall_blocks, _stream_token_count,
-            _stream_task_calls, len(_assistant_texts) + (1 if current_assistant_content.strip() else 0),
+            session_id,
+            _stream_event_count,
+            _stream_llm_calls,
+            _stream_llm_completions,
+            _stream_raw_chunks,
+            _stream_gated_out,
+            _stream_dedup_suppressed,
+            _stream_firewall_blocks,
+            _stream_token_count,
+            _stream_task_calls,
+            len(_assistant_texts) + (1 if current_assistant_content.strip() else 0),
         )
 
         # --- Zero-output fallback for discovery ---
@@ -2729,7 +4182,9 @@ async def _run_agent(
             logger.warning(
                 "ZERO-OUTPUT FALLBACK: Discovery agent produced no tokens for session %s "
                 "(events=%d, summary_len=%d). Sending fallback message.",
-                session_id, _stream_event_count, len(actual_message),
+                session_id,
+                _stream_event_count,
+                len(actual_message),
             )
             fallback_msg = (
                 "I've analyzed your data and completed the initial profiling. "
@@ -2739,30 +4194,65 @@ async def _run_agent(
             )
             current_assistant_content = _sanitize_assistant_text(fallback_msg)
             for token_chunk in [fallback_msg]:
-                await queue.put({
-                    "type": "token",
-                    "data": {"content": _sanitize_assistant_text(token_chunk)},
-                })
-            await queue.put({
-                "type": "message_done",
-                "data": {"content": _sanitize_assistant_text(fallback_msg)},
-            })
+                await queue.put(
+                    {
+                        "type": "token",
+                        "data": {"content": _sanitize_assistant_text(token_chunk)},
+                    }
+                )
+            await queue.put(
+                {
+                    "type": "message_done",
+                    "data": {"content": _sanitize_assistant_text(fallback_msg)},
+                }
+            )
+
+        if not _failure_plan_message and _publish_tool_error_reason and not _publish_completed:
+            _failure_plan_message = _compose_failure_recovery_plan(
+                phase="publishing",
+                reason=_publish_tool_error_reason,
+                timed_out=False,
+                last_tool=_publish_tool_error_name or _last_tool_name,
+            )
 
         status_contract_payload = _build_answer_contract_payload(
             phase=_current_phase,
-            assistant_text=current_assistant_content or (_assistant_texts[-1] if _assistant_texts else ""),
+            assistant_text=current_assistant_content
+            or (_assistant_texts[-1] if _assistant_texts else ""),
             failure_message=_failure_plan_message,
             last_tool=_last_tool_name,
+            tool_contract_hints=_tool_contract_hints,
+            query_route_plan=_query_route_plan,
         )
+        _trust_contract_enabled = True
+        try:
+            from config import get_effective_settings as _get_effective_settings
+
+            _trust_contract_enabled = _get_effective_settings().feature_trust_ux_contract
+        except Exception:
+            _trust_contract_enabled = True
+        if _query_route_plan:
+            metadata = status_contract_payload.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata["route_plan"] = _query_route_plan
+            metadata["tool_trace_count"] = len(_tool_call_trace)
+            status_contract_payload["metadata"] = metadata
 
         if _failure_plan_message:
-            await queue.put({
-                "type": "status",
-                "data": {
-                    "message": _failure_plan_message,
-                    "answer_contract": status_contract_payload,
-                },
-            })
+            await queue.put(
+                {
+                    "type": "status",
+                    "data": {
+                        "message": _failure_plan_message,
+                        **(
+                            {"answer_contract": status_contract_payload}
+                            if _trust_contract_enabled
+                            else {}
+                        ),
+                    },
+                }
+            )
 
         # Non-discovery fallback when supervisor firewall blocked leaked internals.
         if (
@@ -2777,14 +4267,18 @@ async def _run_agent(
                 "Please review the latest artifacts and tell me to continue."
             )
             current_assistant_content = fallback_msg
-            await queue.put({
-                "type": "token",
-                "data": {"content": fallback_msg},
-            })
-            await queue.put({
-                "type": "message_done",
-                "data": {"content": _sanitize_assistant_text(fallback_msg)},
-            })
+            await queue.put(
+                {
+                    "type": "token",
+                    "data": {"content": fallback_msg},
+                }
+            )
+            await queue.put(
+                {
+                    "type": "message_done",
+                    "data": {"content": _sanitize_assistant_text(fallback_msg)},
+                }
+            )
 
         # Add final assistant content to local buffer for safety net
         if current_assistant_content.strip():
@@ -2793,14 +4287,16 @@ async def _run_agent(
                 _assistant_texts.append(safe_final)
 
         # Emit a final trust contract for the UI even when no explicit failure occurred.
-        if not _failure_plan_message:
-            await queue.put({
-                "type": "status",
-                "data": {
-                    "message": "",
-                    "answer_contract": status_contract_payload,
-                },
-            })
+        if not _failure_plan_message and _trust_contract_enabled:
+            await queue.put(
+                {
+                    "type": "status",
+                    "data": {
+                        "message": "",
+                        "answer_contract": status_contract_payload,
+                    },
+                }
+            )
 
         # --- Safety net: save Data Description if discovery agent produced text but didn't call save_data_description ---
         if _discovery_conversation_ran and not _dd_tool_called:
@@ -2808,8 +4304,12 @@ async def _run_agent(
             for text in _assistant_texts:
                 if len(text) > len(dd_content):
                     dd_content = text
-            _DD_MARKERS = ("[1] System Architecture", "[2] Business Context",
-                           "---BEGIN DATA DESCRIPTION---", "[6] Data Map")
+            _DD_MARKERS = (
+                "[1] System Architecture",
+                "[2] Business Context",
+                "---BEGIN DATA DESCRIPTION---",
+                "[6] Data Map",
+            )
             has_dd_markers = any(marker in dd_content for marker in _DD_MARKERS)
             if len(dd_content) > 1000 and has_dd_markers:
                 logger.warning(
@@ -2835,34 +4335,42 @@ async def _run_agent(
 
                     # Upload artifact
                     from tools.minio_tools import upload_artifact_programmatic
+
                     await upload_artifact_programmatic(
                         data_product_id=data_product_id,
                         artifact_type="data_description",
                         filename="data-description.json",
                         content=dd_content,
                     )
-                    await queue.put({
-                        "type": "artifact",
-                        "data": {
-                            "artifact_id": dd_id,
-                            "artifact_type": "data_description",
-                        },
-                    })
+                    await queue.put(
+                        {
+                            "type": "artifact",
+                            "data": {
+                                "artifact_id": dd_id,
+                                "artifact_type": "data_description",
+                            },
+                        }
+                    )
 
                     # Trigger ERD build if not already done
                     if not _erd_build_called:
                         try:
                             from services.discovery_pipeline import run_erd_pipeline
-                            erd_result = await run_erd_pipeline(data_product_id, {"document": dd_content})
+
+                            erd_result = await run_erd_pipeline(
+                                data_product_id, {"document": dd_content}
+                            )
                             erd_artifact_id = erd_result.get("erd_artifact_id")
                             if erd_artifact_id:
-                                await queue.put({
-                                    "type": "artifact",
-                                    "data": {
-                                        "artifact_id": erd_artifact_id,
-                                        "artifact_type": "erd",
-                                    },
-                                })
+                                await queue.put(
+                                    {
+                                        "type": "artifact",
+                                        "data": {
+                                            "artifact_id": erd_artifact_id,
+                                            "artifact_type": "erd",
+                                        },
+                                    }
+                                )
                             logger.info("Safety net: ERD built from Data Description")
                         except Exception as erd_err:
                             logger.error("Safety net: failed to build ERD: %s", erd_err)
@@ -2882,7 +4390,9 @@ async def _run_agent(
 
         # --- Langfuse: score YAML quality and pipeline duration ---
         if _generation_phase_ran:
-            score_yaml_quality(_trace_id, _yaml_passed_first, _yaml_retry_count, _verification_issues)
+            score_yaml_quality(
+                _trace_id, _yaml_passed_first, _yaml_retry_count, _verification_issues
+            )
         _pipeline_timer.finish()
 
         # Update data product state with session_id so frontend knows which thread to recover.
@@ -2908,69 +4418,164 @@ async def _run_agent(
         # Transition to explorer phase ONLY when the full pipeline completed
         # (i.e. publishing was the last active phase). Otherwise the stepper
         # incorrectly shows all phases as completed when pausing mid-pipeline.
-        if _current_phase == "publishing":
-            await queue.put({
-                "type": "phase_change",
-                "data": {"from": _current_phase, "to": "explorer"},
-            })
-            logger.info("Phase change: %s → explorer (session %s, stream end)", _current_phase, session_id)
+        if _current_phase == "publishing" and _publish_completed and not _failure_plan_message:
+            await queue.put(
+                {
+                    "type": "phase_change",
+                    "data": {"from": _current_phase, "to": "explorer"},
+                }
+            )
+            logger.info(
+                "Phase change: %s → explorer (session %s, stream end)", _current_phase, session_id
+            )
             await _persist_phase(data_product_id, "explorer")
+        elif _current_phase == "publishing" and not _publish_completed:
+            logger.info(
+                "Skipping explorer transition for session %s because publishing did not complete",
+                session_id,
+            )
 
         # Persist answer evidence packet for auditability and trust UX playback.
         try:
+            from config import get_effective_settings as _get_effective_settings
             from services.postgres import execute as _pg_execute
             from services.postgres import get_pool as _pg_get_pool
+            from services.postgres import query as _pg_query
 
             _pool = await _pg_get_pool(_settings.database_url)
-            _citations = status_contract_payload.get("citations", [])
-            _sql_refs = [
-                c for c in _citations
-                if isinstance(c, dict) and c.get("citation_type") == "sql"
-            ]
-            _fact_refs = [
-                c for c in _citations
-                if isinstance(c, dict) and c.get("citation_type") == "document_fact"
-            ]
-            _chunk_refs = [
-                c for c in _citations
-                if isinstance(c, dict) and c.get("citation_type") == "document_chunk"
-            ]
-            _recovery_actions = status_contract_payload.get("recovery_actions", [])
-            _trust_state = str(status_contract_payload.get("trust_state") or "answer_ready")
-
-            await _pg_execute(
+            _effective_settings = _get_effective_settings()
+            _model_signature = _resolve_llm_signature_for_audit(_effective_settings)
+            _exists_rows = await _pg_query(
                 _pool,
-                """INSERT INTO qa_evidence
-                   (id, data_product_id, query_id, source_mode, confidence, exactness_state,
-                    tool_calls, sql_refs, fact_refs, chunk_refs, conflicts, recovery_plan,
-                    final_decision, created_by)
-                   VALUES
-                   ($1::uuid, $2::uuid, $3, $4, $5, $6,
-                    $7::jsonb, $8::jsonb, $9::jsonb, $10::jsonb, $11::jsonb, $12::jsonb,
-                    $13, $14)""",
-                str(uuid4()),
-                data_product_id,
-                f"{session_id}:{uuid4()}",
-                str(status_contract_payload.get("source_mode") or "unknown"),
-                str(status_contract_payload.get("confidence_decision") or "medium"),
-                str(status_contract_payload.get("exactness_state") or "not_applicable"),
-                json.dumps([]),
-                json.dumps(_sql_refs),
-                json.dumps(_fact_refs),
-                json.dumps(_chunk_refs),
-                json.dumps(status_contract_payload.get("conflict_notes", [])),
-                json.dumps({"actions": _recovery_actions}),
-                _trust_state[:32],
-                "ekaix-agent",
+                "SELECT to_regclass('public.qa_evidence') AS rel",
             )
+            _qa_evidence_rel = (
+                (_exists_rows[0].get("rel") if _exists_rows else None)
+                if isinstance(_exists_rows, list)
+                else None
+            )
+            _ops_alert_exists_rows = await _pg_query(
+                _pool,
+                "SELECT to_regclass('public.ops_alert_events') AS rel",
+            )
+            _ops_alert_rel = (
+                (_ops_alert_exists_rows[0].get("rel") if _ops_alert_exists_rows else None)
+                if isinstance(_ops_alert_exists_rows, list)
+                else None
+            )
+            if not _qa_evidence_rel:
+                logger.info(
+                    "Skipping qa_evidence persistence for session %s: table missing",
+                    session_id,
+                )
+            else:
+                _citations = status_contract_payload.get("citations", [])
+                _sql_refs = [
+                    c for c in _citations if isinstance(c, dict) and c.get("citation_type") == "sql"
+                ]
+                _fact_refs = [
+                    c
+                    for c in _citations
+                    if isinstance(c, dict) and c.get("citation_type") == "document_fact"
+                ]
+                _chunk_refs = [
+                    c
+                    for c in _citations
+                    if isinstance(c, dict) and c.get("citation_type") == "document_chunk"
+                ]
+                _recovery_actions = status_contract_payload.get("recovery_actions", [])
+                _trust_state = str(status_contract_payload.get("trust_state") or "answer_ready")
+                _tool_calls_payload: list[dict[str, Any]] = []
+                _tool_calls_payload.append(
+                    {
+                        "type": "model",
+                        "provider": _model_signature["provider"],
+                        "model": _model_signature["model"],
+                        "model_hash": _model_signature["model_hash"],
+                    }
+                )
+                if _query_route_plan:
+                    _tool_calls_payload.append({"type": "route_plan", "plan": _query_route_plan})
+                _tool_calls_payload.extend(_tool_call_trace[-80:])
+
+                if _trust_state in {"answer_ready", "answer_with_warnings"} and not (
+                    _sql_refs or _fact_refs or _chunk_refs
+                ):
+                    logger.warning(
+                        "OPS_ALERT[citation_missing] session=%s source_mode=%s trust_state=%s",
+                        session_id,
+                        status_contract_payload.get("source_mode"),
+                        _trust_state,
+                    )
+                    if _ops_alert_rel:
+                        try:
+                            await _pg_execute(
+                                _pool,
+                                """INSERT INTO ops_alert_events
+                                   (id, data_product_id, signal, severity, message, source_service,
+                                    source_route, session_id, metadata, created_by)
+                                   VALUES
+                                   ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8, $9::jsonb, $10)""",
+                                str(uuid4()),
+                                data_product_id,
+                                "citation_missing_answers",
+                                "high",
+                                "Answer marked ready/review without citations",
+                                "ai-service",
+                                "/agent/stream",
+                                session_id,
+                                json.dumps(
+                                    {
+                                        "source_mode": str(
+                                            status_contract_payload.get("source_mode") or "unknown"
+                                        ),
+                                        "trust_state": _trust_state,
+                                    }
+                                ),
+                                "ekaix-agent",
+                            )
+                        except Exception as alert_err:
+                            logger.debug(
+                                "Failed to persist ops_alert_events citation_missing for session %s: %s",
+                                session_id,
+                                alert_err,
+                            )
+
+                await _pg_execute(
+                    _pool,
+                    """INSERT INTO qa_evidence
+                       (id, data_product_id, query_id, source_mode, confidence, exactness_state,
+                        tool_calls, sql_refs, fact_refs, chunk_refs, conflicts, recovery_plan,
+                        final_decision, created_by)
+                       VALUES
+                       ($1::uuid, $2::uuid, $3, $4, $5, $6,
+                        $7::jsonb, $8::jsonb, $9::jsonb, $10::jsonb, $11::jsonb, $12::jsonb,
+                        $13, $14)""",
+                    str(uuid4()),
+                    data_product_id,
+                    f"{session_id}:{uuid4()}",
+                    str(status_contract_payload.get("source_mode") or "unknown"),
+                    str(status_contract_payload.get("confidence_decision") or "medium"),
+                    str(status_contract_payload.get("exactness_state") or "not_applicable"),
+                    json.dumps(_tool_calls_payload),
+                    json.dumps(_sql_refs),
+                    json.dumps(_fact_refs),
+                    json.dumps(_chunk_refs),
+                    json.dumps(status_contract_payload.get("conflict_notes", [])),
+                    json.dumps({"actions": _recovery_actions}),
+                    _trust_state[:32],
+                    "ekaix-agent",
+                )
         except Exception as e:
             logger.warning("Failed to persist qa_evidence for session %s: %s", session_id, e)
 
         # Signal stream end
-        await queue.put({
-            "type": "done",
-            "data": {"message": "Agent processing complete"},
-        })
+        await queue.put(
+            {
+                "type": "done",
+                "data": {"message": "Agent processing complete"},
+            }
+        )
         await queue.put(None)  # Sentinel to close the generator
 
 
@@ -3042,14 +4647,18 @@ async def interrupt_agent(session_id: str) -> dict[str, str]:
     # Push an error event and close the stream
     queue = _active_streams.get(session_id)
     if queue:
-        await queue.put({
-            "type": "error",
-            "data": {"message": "Interrupted by user"},
-        })
-        await queue.put({
-            "type": "done",
-            "data": {"message": "Session interrupted by user"},
-        })
+        await queue.put(
+            {
+                "type": "error",
+                "data": {"message": "Interrupted by user"},
+            }
+        )
+        await queue.put(
+            {
+                "type": "done",
+                "data": {"message": "Session interrupted by user"},
+            }
+        )
         await queue.put(None)
 
     return {"status": "interrupted", "session_id": session_id}
@@ -3068,10 +4677,12 @@ async def approve_action(request: ApproveRequest) -> dict[str, str]:
     queue = _active_streams.get(request.session_id)
     if queue:
         status = "approved" if request.approved else "rejected"
-        await queue.put({
-            "type": "approval_response",
-            "data": {"approved": request.approved, "status": status},
-        })
+        await queue.put(
+            {
+                "type": "approval_response",
+                "data": {"approved": request.approved, "status": status},
+            }
+        )
 
     status = "approved" if request.approved else "rejected"
     return {"status": status, "session_id": request.session_id}
@@ -3158,14 +4769,19 @@ async def _run_agent_from_checkpoint(
 
         # Get current state
         current_state = await agent.aget_state(config)
-        all_messages = (current_state.values.get("messages", [])
-                        if current_state and current_state.values else [])
+        all_messages = (
+            current_state.values.get("messages", [])
+            if current_state and current_state.values
+            else []
+        )
 
         if not all_messages:
-            await queue.put({
-                "type": "error",
-                "data": {"message": "No messages found to retry."},
-            })
+            await queue.put(
+                {
+                    "type": "error",
+                    "data": {"message": "No messages found to retry."},
+                }
+            )
             await queue.put({"type": "done", "data": {"message": "Retry failed"}})
             await queue.put(None)
             return
@@ -3243,10 +4859,12 @@ async def _run_agent_from_checkpoint(
                     break
 
         if replay_content is None or cut_index is None:
-            await queue.put({
-                "type": "error",
-                "data": {"message": "Could not find the message to retry."},
-            })
+            await queue.put(
+                {
+                    "type": "error",
+                    "data": {"message": "Could not find the message to retry."},
+                }
+            )
             await queue.put({"type": "done", "data": {"message": "Retry failed"}})
             await queue.put(None)
             return
@@ -3261,30 +4879,38 @@ async def _run_agent_from_checkpoint(
         # Fix empty-content AI messages — Gemini rejects messages with empty parts.
         # These occur when the orchestrator calls tools (e.g. task) with no text content.
         refreshed_state = await agent.aget_state(config)
-        remaining_msgs = (refreshed_state.values.get("messages", [])
-                          if refreshed_state and refreshed_state.values else [])
+        remaining_msgs = (
+            refreshed_state.values.get("messages", [])
+            if refreshed_state and refreshed_state.values
+            else []
+        )
         patches = []
         extra_removes = []
         for m in remaining_msgs:
             if m.type == "ai":
                 c = m.content
-                is_empty = (not c or c == [] or c == "" or
-                            (isinstance(c, list) and len(c) == 0))
+                is_empty = not c or c == [] or c == "" or (isinstance(c, list) and len(c) == 0)
                 if is_empty:
                     if getattr(m, "tool_calls", None):
                         # Has tool calls — patch content with placeholder
-                        patches.append(AIMessage(
-                            content=".",
-                            id=m.id,
-                            tool_calls=m.tool_calls,
-                        ))
+                        patches.append(
+                            AIMessage(
+                                content=".",
+                                id=m.id,
+                                tool_calls=m.tool_calls,
+                            )
+                        )
                     else:
                         # No content AND no tool calls — remove entirely
                         extra_removes.append(RemoveMessage(id=m.id))
         updates = patches + extra_removes
         if updates:
             await agent.aupdate_state(config, {"messages": updates})
-            logger.info("Retry: fixed %d patched + %d removed empty AI messages", len(patches), len(extra_removes))
+            logger.info(
+                "Retry: fixed %d patched + %d removed empty AI messages",
+                len(patches),
+                len(extra_removes),
+            )
 
         logger.info("Retry: replaying %d chars for session %s", len(replay_content), session_id)
 
@@ -3298,10 +4924,12 @@ async def _run_agent_from_checkpoint(
 
     except Exception as e:
         logger.exception("Retry failed for session %s: %s", session_id, e)
-        await queue.put({
-            "type": "error",
-            "data": {"message": _sanitize_error_for_user(e)},
-        })
+        await queue.put(
+            {
+                "type": "error",
+                "data": {"message": _sanitize_error_for_user(e)},
+            }
+        )
         await queue.put({"type": "done", "data": {"message": "Retry failed"}})
         await queue.put(None)
 
@@ -3318,17 +4946,69 @@ async def list_checkpoints(session_id: str) -> dict:
         async for state in agent.aget_state_history(config, limit=50):
             messages = state.values.get("messages", [])
             last_msg_id = messages[-1].id if messages else None
-            checkpoints.append({
-                "checkpoint_id": state.config["configurable"].get("checkpoint_id"),
-                "message_count": len(messages),
-                "last_message_id": last_msg_id,
-                "created_at": state.created_at,
-                "next": list(state.next) if state.next else [],
-            })
+            checkpoints.append(
+                {
+                    "checkpoint_id": state.config["configurable"].get("checkpoint_id"),
+                    "message_count": len(messages),
+                    "last_message_id": last_msg_id,
+                    "created_at": state.created_at,
+                    "next": list(state.next) if state.next else [],
+                }
+            )
         return {"session_id": session_id, "checkpoints": checkpoints}
     except Exception as e:
         logger.error("Failed to list checkpoints for session %s: %s", session_id, e)
         return {"session_id": session_id, "checkpoints": [], "error": str(e)}
+
+
+@router.post("/rollback/{checkpoint_id}")
+async def rollback_to_checkpoint(checkpoint_id: str, session_id: str = Query(...)) -> dict:
+    """Rollback conversation to a specific checkpoint.
+
+    Restores the agent state to the given checkpoint, trimming all
+    messages that came after it.
+    """
+    try:
+        from agents.orchestrator import get_orchestrator
+
+        agent = await get_orchestrator()
+        config = {"configurable": {"thread_id": session_id}}
+
+        # Find the target checkpoint in history
+        target_state = None
+        async for state in agent.aget_state_history(config, limit=100):
+            cp_id = state.config["configurable"].get("checkpoint_id")
+            if cp_id == checkpoint_id:
+                target_state = state
+                break
+
+        if target_state is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Checkpoint {checkpoint_id} not found for session {session_id}",
+            )
+
+        # Restore by updating state to the checkpoint's values
+        target_config = target_state.config
+        messages = target_state.values.get("messages", [])
+
+        await agent.aupdate_state(
+            config,
+            values=target_state.values,
+            as_node="__start__",
+        )
+
+        return {
+            "status": "restored",
+            "checkpoint_id": checkpoint_id,
+            "session_id": session_id,
+            "message_count": len(messages),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Rollback failed for session %s checkpoint %s: %s", session_id, checkpoint_id, e)
+        raise HTTPException(status_code=500, detail=f"Rollback failed: {e}")
 
 
 async def _infer_phase(session_id: str, all_messages: list) -> str:
@@ -3379,6 +5059,7 @@ async def _infer_phase(session_id: str, all_messages: list) -> str:
     dp_published = False
     try:
         from services import postgres as pg_service
+
         pool = pg_service._pool
         dp_rows = await pg_service.query(
             pool,
@@ -3413,6 +5094,7 @@ async def _infer_phase(session_id: str, all_messages: list) -> str:
     if best_rank < phase_rank["explorer"]:
         try:
             from services import postgres as pg_service
+
             pool = pg_service._pool
 
             if not dp_id:
@@ -3481,6 +5163,94 @@ async def _infer_phase(session_id: str, all_messages: list) -> str:
     return best_phase
 
 
+def _parse_jsonish(value: Any, fallback: Any) -> Any:
+    """Parse JSON-ish values from Postgres JSON/JSONB columns safely."""
+    if value is None:
+        return fallback
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return fallback
+    return fallback
+
+
+def _normalize_history_citations(raw_value: Any, default_type: str) -> list[dict[str, Any]]:
+    """Convert citation JSON payload into UI-ready citation objects."""
+    parsed = _parse_jsonish(raw_value, [])
+    if not isinstance(parsed, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for idx, item in enumerate(parsed):
+        if not isinstance(item, dict):
+            continue
+        reference_id = str(item.get("reference_id") or item.get("id") or "").strip()
+        if not reference_id:
+            reference_id = f"{default_type}-{idx + 1}"
+        citation_type = str(item.get("citation_type") or default_type).strip() or default_type
+
+        entry: dict[str, Any] = {**item}
+        entry["citation_type"] = citation_type
+        entry["reference_id"] = reference_id
+        normalized.append(entry)
+    return normalized
+
+
+def _build_history_answer_contract(row: dict[str, Any]) -> dict[str, Any]:
+    """Build an answer contract object from qa_evidence rows for chat history replay."""
+    citations: list[dict[str, Any]] = []
+    citations.extend(_normalize_history_citations(row.get("sql_refs"), "sql"))
+    citations.extend(_normalize_history_citations(row.get("fact_refs"), "document_fact"))
+    citations.extend(_normalize_history_citations(row.get("chunk_refs"), "document_chunk"))
+
+    conflicts = _parse_jsonish(row.get("conflicts"), [])
+    if not isinstance(conflicts, list):
+        conflicts = []
+
+    recovery_plan = _parse_jsonish(row.get("recovery_plan"), {})
+    if not isinstance(recovery_plan, dict):
+        recovery_plan = {}
+    raw_actions = recovery_plan.get("actions", [])
+    recovery_actions = raw_actions if isinstance(raw_actions, list) else []
+
+    created_at = row.get("created_at")
+    created_at_iso = (
+        created_at.isoformat()
+        if hasattr(created_at, "isoformat")
+        else (str(created_at) if created_at else None)
+    )
+
+    trust_state = str(row.get("final_decision") or "answer_ready").strip() or "answer_ready"
+    source_mode = str(row.get("source_mode") or "unknown").strip() or "unknown"
+    confidence = str(row.get("confidence") or "medium").strip() or "medium"
+    exactness = str(row.get("exactness_state") or "not_applicable").strip() or "not_applicable"
+
+    evidence_summary = "Evidence replayed from persisted audit trace."
+    if trust_state.startswith("abstained"):
+        evidence_summary = "The answer was abstained due to missing or conflicting evidence."
+    elif trust_state.startswith("failed") or trust_state == "blocked_access":
+        evidence_summary = "The answer required recovery actions based on execution status."
+
+    return {
+        "source_mode": source_mode,
+        "exactness_state": exactness,
+        "confidence_decision": confidence,
+        "trust_state": trust_state,
+        "evidence_summary": evidence_summary,
+        "conflict_notes": [str(item) for item in conflicts if isinstance(item, str)],
+        "citations": citations,
+        "recovery_actions": [item for item in recovery_actions if isinstance(item, dict)],
+        "metadata": {
+            "query_id": str(row.get("query_id") or ""),
+            "evidence_created_at": created_at_iso,
+            "history_replay": True,
+        },
+    }
+
+
 @router.get("/history/{session_id}")
 async def get_history(session_id: str) -> dict:
     """Get conversation history from LangGraph's PostgreSQL checkpointer."""
@@ -3547,6 +5317,7 @@ async def get_history(session_id: str) -> dict:
                 sentences = [s.strip() for s in c.split("\n") if s.strip()]
                 if len(sentences) >= 3:
                     from collections import Counter
+
                     counts = Counter(sentences)
                     if counts.most_common(1)[0][1] >= 3:
                         return True
@@ -3568,6 +5339,69 @@ async def get_history(session_id: str) -> dict:
 
             # Infer the pipeline phase from tool calls + database state
             phase = await _infer_phase(session_id, raw_messages)
+
+            # Replay persisted trust contracts so history answers keep
+            # source/confidence/exactness signals after page reload.
+            replay_contracts: list[dict[str, Any]] = []
+            try:
+                from services.postgres import get_pool as _pg_get_pool
+                from services.postgres import query as _pg_query
+
+                _pool = await _pg_get_pool(_settings.database_url)
+                evidence_rows = await _pg_query(
+                    _pool,
+                    """SELECT query_id, source_mode, confidence, exactness_state, final_decision,
+                              sql_refs, fact_refs, chunk_refs, conflicts, recovery_plan, created_at
+                       FROM qa_evidence
+                       WHERE query_id LIKE $1
+                       ORDER BY created_at ASC""",
+                    f"{session_id}:%",
+                )
+                if isinstance(evidence_rows, list):
+                    for row in evidence_rows:
+                        candidate: dict[str, Any] | None = None
+                        if isinstance(row, dict):
+                            candidate = row
+                        else:
+                            try:
+                                candidate = dict(row)
+                            except Exception:
+                                candidate = None
+                        if candidate is not None:
+                            replay_contracts.append(_build_history_answer_contract(candidate))
+            except Exception as replay_err:
+                logger.debug(
+                    "History trust replay unavailable for session %s: %s",
+                    session_id,
+                    replay_err,
+                )
+
+            assistant_indexes = [
+                idx for idx, message in enumerate(deduped) if message.get("role") == "assistant"
+            ]
+            contract_idx = len(replay_contracts) - 1
+            for message_idx in reversed(assistant_indexes):
+                if contract_idx < 0:
+                    break
+                deduped[message_idx]["answer_contract"] = replay_contracts[contract_idx]
+                contract_idx -= 1
+
+            # Ensure all assistant messages have a lightweight contract fallback.
+            # This guarantees consistent trust badges in history replay UX.
+            for message_idx in assistant_indexes:
+                if "answer_contract" in deduped[message_idx]:
+                    continue
+                deduped[message_idx]["answer_contract"] = {
+                    "source_mode": "unknown",
+                    "exactness_state": "not_applicable",
+                    "confidence_decision": "medium",
+                    "trust_state": "answer_with_warnings",
+                    "evidence_summary": "No persisted evidence envelope found for this historical answer.",
+                    "conflict_notes": [],
+                    "citations": [],
+                    "recovery_actions": [],
+                    "metadata": {"history_replay": True, "fallback_contract": True},
+                }
 
             return {"session_id": session_id, "messages": deduped, "phase": phase}
     except Exception as e:

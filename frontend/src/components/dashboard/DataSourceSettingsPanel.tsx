@@ -53,7 +53,7 @@ export function DataSourceSettingsPanel({
   dataProduct,
 }: DataSourceSettingsPanelProps): React.ReactNode {
   const [selectedDatabase, setSelectedDatabase] = useState(
-    dataProduct.database_reference,
+    dataProduct.database_reference ?? '',
   );
   const [selectedSchemas, setSelectedSchemas] = useState<string[]>(
     dataProduct.schemas ?? [],
@@ -97,7 +97,7 @@ export function DataSourceSettingsPanel({
 
   // Sync state when dataProduct changes
   useEffect(() => {
-    setSelectedDatabase(dataProduct.database_reference);
+    setSelectedDatabase(dataProduct.database_reference ?? '');
     setSelectedSchemas(dataProduct.schemas ?? []);
     setSelectedTables(dataProduct.tables ?? []);
   }, [dataProduct]);

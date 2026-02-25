@@ -20,11 +20,16 @@ import {
   ListItemIcon,
   ListItemText,
   MenuItem,
+  Radio,
+  RadioGroup,
   Select,
   TextField,
   Typography,
 } from '@mui/material';
 import type { SelectChangeEvent } from '@mui/material';
+import StorageOutlinedIcon from '@mui/icons-material/StorageOutlined';
+import DescriptionOutlinedIcon from '@mui/icons-material/DescriptionOutlined';
+import MergeTypeOutlinedIcon from '@mui/icons-material/MergeTypeOutlined';
 import TableChartOutlinedIcon from '@mui/icons-material/TableChartOutlined';
 import { useDatabases, useSchemas } from '@/hooks/useDatabases';
 import type { TableSummary } from '@/hooks/useDatabases';
@@ -41,12 +46,13 @@ type Step = 0 | 1 | 2;
 
 const GOLD = '#D4A843';
 const GRAY = '#616161';
-const STEPS: Step[] = [0, 1, 2];
+const ALL_STEPS: Step[] = [0, 1, 2];
 
-function StepIndicator({ currentStep }: { currentStep: Step }): React.ReactNode {
+function StepIndicator({ currentStep, totalSteps }: { currentStep: Step; totalSteps: number }): React.ReactNode {
+  const steps = ALL_STEPS.slice(0, totalSteps);
   return (
     <Box sx={{ display: 'flex', gap: 1, justifyContent: 'center', mb: 2 }}>
-      {STEPS.map((s) => (
+      {steps.map((s) => (
         <Box
           key={s}
           sx={{
@@ -79,6 +85,7 @@ export function CreateDataProductModal({
   const [step, setStep] = useState<Step>(0);
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
+  const [productType, setProductType] = useState<'structured' | 'document' | 'hybrid'>('structured');
   const [selectedDatabase, setSelectedDatabase] = useState('');
   const [selectedSchemas, setSelectedSchemas] = useState<string[]>([]);
   const [selectedTables, setSelectedTables] = useState<string[]>([]);
@@ -155,6 +162,7 @@ export function CreateDataProductModal({
     setStep(0);
     setName('');
     setDescription('');
+    setProductType('structured');
     setSelectedDatabase('');
     setSelectedSchemas([]);
     setSelectedTables([]);
@@ -163,7 +171,12 @@ export function CreateDataProductModal({
 
   function handleNextToStep1(): void {
     if (name.trim().length > 0) {
-      setStep(1);
+      if (productType === 'document') {
+        // Document-only products skip database/table selection
+        void handleCreate();
+      } else {
+        setStep(1);
+      }
     }
   }
 
@@ -185,9 +198,10 @@ export function CreateDataProductModal({
     const result = await createMutation.mutateAsync({
       name: name.trim(),
       description: description.trim() || undefined,
-      database_reference: selectedDatabase,
-      schemas: selectedSchemas,
-      tables: selectedTables,
+      product_type: productType,
+      ...(selectedDatabase.length > 0 ? { database_reference: selectedDatabase } : {}),
+      ...(selectedSchemas.length > 0 ? { schemas: selectedSchemas } : {}),
+      ...(selectedTables.length > 0 ? { tables: selectedTables } : {}),
     });
     handleClose();
     router.push(`/data-products/${result.id}`);
@@ -197,6 +211,7 @@ export function CreateDataProductModal({
   const isStep2Valid =
     selectedDatabase.length > 0 && selectedSchemas.length > 0;
   const isStep3Valid = selectedTables.length > 0;
+  const needsDatabase = productType === 'structured' || productType === 'hybrid';
 
   const stepTitles: Record<Step, string> = {
     0: 'Create Data Product',
@@ -228,7 +243,7 @@ export function CreateDataProductModal({
         <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
           {stepSubtitles[step]}
         </Typography>
-        <StepIndicator currentStep={step} />
+        <StepIndicator currentStep={step} totalSteps={productType === 'document' ? 1 : 3} />
       </DialogTitle>
 
       <DialogContent>
@@ -253,6 +268,61 @@ export function CreateDataProductModal({
               rows={3}
               placeholder="Describe the purpose of this data product..."
             />
+            <Box>
+              <Typography variant="subtitle2" gutterBottom>
+                Source Type
+              </Typography>
+              <RadioGroup
+                value={productType}
+                onChange={(e) => setProductType(e.target.value as 'structured' | 'document' | 'hybrid')}
+              >
+                <FormControlLabel
+                  value="structured"
+                  control={<Radio sx={{ '&.Mui-checked': { color: GOLD } }} />}
+                  label={
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                      <StorageOutlinedIcon sx={{ fontSize: 18, color: GOLD }} />
+                      <Box>
+                        <Typography variant="body2">Structured</Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          Tables and databases from Snowflake
+                        </Typography>
+                      </Box>
+                    </Box>
+                  }
+                />
+                <FormControlLabel
+                  value="document"
+                  control={<Radio sx={{ '&.Mui-checked': { color: GOLD } }} />}
+                  label={
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                      <DescriptionOutlinedIcon sx={{ fontSize: 18, color: GOLD }} />
+                      <Box>
+                        <Typography variant="body2">Document</Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          PDFs, manuals, and unstructured content
+                        </Typography>
+                      </Box>
+                    </Box>
+                  }
+                />
+                <FormControlLabel
+                  value="hybrid"
+                  control={<Radio sx={{ '&.Mui-checked': { color: GOLD } }} />}
+                  label={
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                      <MergeTypeOutlinedIcon sx={{ fontSize: 18, color: GOLD }} />
+                      <Box>
+                        <Typography variant="body2">Hybrid</Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          Combine structured data with documents
+                        </Typography>
+                      </Box>
+                    </Box>
+                  }
+                />
+              </RadioGroup>
+            </Box>
           </Box>
         )}
 
@@ -472,9 +542,11 @@ export function CreateDataProductModal({
             <Button
               onClick={handleNextToStep1}
               variant="contained"
-              disabled={!isStep1Valid}
+              disabled={!isStep1Valid || createMutation.isPending}
             >
-              Next
+              {productType === 'document'
+                ? createMutation.isPending ? 'Creating...' : 'Create'
+                : 'Next'}
             </Button>
           </>
         )}
@@ -483,6 +555,15 @@ export function CreateDataProductModal({
             <Button onClick={handleBackToStep0} color="inherit">
               Back
             </Button>
+            {productType === 'hybrid' && (
+              <Button
+                onClick={() => void handleCreate()}
+                color="inherit"
+                disabled={createMutation.isPending}
+              >
+                Skip — Documents Only
+              </Button>
+            )}
             <Button
               onClick={handleNextToStep2}
               variant="contained"

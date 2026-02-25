@@ -119,7 +119,7 @@ class Settings(BaseSettings):
 
     # --- Snowflake Timeouts (seconds) ---
     snowflake_login_timeout: int = 30
-    snowflake_network_timeout: int = 60
+    snowflake_network_timeout: int = 180
 
     # --- Agent Configuration ---
     agent_recursion_limit: int = 1000
@@ -156,6 +156,11 @@ class Settings(BaseSettings):
     # --- Query Limits ---
     rcr_query_row_limit: int = 1000  # Max rows returned by RCR queries
     tool_output_truncate_length: int = 2000  # Max chars for tool output in SSE
+
+    # --- Hybrid intelligence feature flags (HYB-OPS-003) ---
+    feature_hybrid_planner: bool = True
+    feature_exactness_guardrail: bool = True
+    feature_trust_ux_contract: bool = True
 
 
 @lru_cache(maxsize=1)

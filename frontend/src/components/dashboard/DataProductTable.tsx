@@ -162,7 +162,7 @@ export function DataProductTable({
                     variant="body2"
                     sx={{ fontFamily: 'monospace', fontSize: '0.8rem' }}
                   >
-                    {product.database_reference}
+                    {product.database_reference ?? '—'}
                   </Typography>
                 </TableCell>
                 <TableCell>

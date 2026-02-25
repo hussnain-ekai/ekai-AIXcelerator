@@ -47,8 +47,10 @@ def _load_tools() -> None:
     from tools.snowflake_tools import (
         compute_quality_score,
         create_cortex_agent,
+        create_document_search_service,
         create_semantic_view,
         execute_rcr_query,
+        extract_structured_from_documents,
         grant_agent_access,
         profile_table,
         query_cortex_agent,
@@ -63,12 +65,22 @@ def _load_tools() -> None:
         query_erd_graph,
         update_erd,
     )
+    from tools.neo4j_document_tools import (
+        find_facts_for_entity,
+        link_fact_to_entity,
+        query_document_graph,
+        upsert_document_chunks,
+        upsert_document_facts,
+        upsert_document_node,
+    )
     from tools.postgres_tools import (
         get_latest_brd,
         get_latest_data_description,
         get_latest_semantic_view,
         load_workspace_state,
         log_agent_action,
+        query_document_facts,
+        search_document_chunks,
         save_brd,
         save_data_description,
         save_quality_report,
@@ -135,11 +147,15 @@ def _load_tools() -> None:
         upload_artifact,
         get_latest_data_description,
         query_erd_graph,
+        query_document_graph,
+        find_facts_for_entity,
+        search_document_chunks,
         fetch_documentation,
         validate_semantic_view_yaml,
         update_validation_status,
         verify_brd_completeness,
         verify_yaml_against_brd,
+        extract_structured_from_documents,
     ]
 
     # Modeling Agent tools — Gold layer star schema design and DDL
@@ -168,8 +184,10 @@ def _load_tools() -> None:
     # Publishing Agent tools
     _publishing_tools = [
         get_latest_semantic_view,
+        get_latest_brd,
         create_semantic_view,
         create_cortex_agent,
+        create_document_search_service,
         grant_agent_access,
         log_agent_action,
         upload_artifact,
@@ -179,8 +197,12 @@ def _load_tools() -> None:
     _explorer_tools = [
         execute_rcr_query,
         query_erd_graph,
+        query_document_graph,
+        find_facts_for_entity,
         profile_table,
         query_cortex_agent,
+        query_document_facts,
+        search_document_chunks,
         get_latest_semantic_view,
         get_latest_brd,
     ]
@@ -300,7 +322,7 @@ async def get_checkpointer() -> Any:
     # Both use the same scheme, but psycopg needs the conninfo format
     conn_string = settings.database_url
     if conn_string.startswith("postgres://"):
-        conn_string = "postgresql://" + conn_string[len("postgres://"):]
+        conn_string = "postgresql://" + conn_string[len("postgres://") :]
 
     _checkpointer_pool = AsyncConnectionPool(
         conninfo=conn_string,
@@ -366,7 +388,9 @@ async def get_orchestrator() -> CompiledStateGraph:
         needs_sanitize,
     )
 
-    orch_prompt = sanitize_prompt_for_azure(ORCHESTRATOR_PROMPT) if needs_sanitize else ORCHESTRATOR_PROMPT
+    orch_prompt = (
+        sanitize_prompt_for_azure(ORCHESTRATOR_PROMPT) if needs_sanitize else ORCHESTRATOR_PROMPT
+    )
     agent = create_deep_agent(
         model=model,
         system_prompt=orch_prompt,
@@ -400,8 +424,8 @@ def _is_azure_model(model: Any) -> bool:
     if model_cls == "AzureChatOpenAI":
         return True
     if model_cls == "ChatOpenAI":
-        base_url = str(getattr(model, "openai_api_base", "") or getattr(model, "base_url", "") or "")
+        base_url = str(
+            getattr(model, "openai_api_base", "") or getattr(model, "base_url", "") or ""
+        )
         return ".openai.azure.com" in base_url
     return False
-
-
