@@ -17,12 +17,13 @@ import {
 import CloseIcon from '@mui/icons-material/Close';
 import { ResizableDrawer } from './ResizableDrawer';
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
-import { PieChart, Pie, Cell } from 'recharts';
+import CheckCircleOutlineIcon from '@mui/icons-material/CheckCircleOutline';
+import WarningAmberIcon from '@mui/icons-material/WarningAmber';
+import ErrorOutlineIcon from '@mui/icons-material/ErrorOutline';
 
 const GOLD = '#D4A843';
 const GREEN = '#4CAF50';
 const RED = '#F44336';
-const GRAY = '#3A3A3E';
 const DRAWER_WIDTH = 500;
 
 /* ------------------------------------------------------------------ */
@@ -47,8 +48,12 @@ interface TableQualitySummary {
   score: number;
 }
 
+type QualityBand = 'good' | 'attention' | 'poor';
+
 interface QualityReport {
   overallScore: number;
+  qualityBand?: QualityBand;
+  qualityLabel?: string;
   totalTables: number;
   passingTables: number;
   checks: QualityCheckSection[];
@@ -65,50 +70,27 @@ interface DataQualityReportProps {
 /*  Helpers                                                            */
 /* ------------------------------------------------------------------ */
 
-function getScoreColor(score: number): string {
-  if (score >= 70) return GREEN;
-  if (score >= 40) return GOLD;
+function getBand(report: QualityReport): { band: QualityBand; label: string } {
+  if (report.qualityBand && report.qualityLabel) {
+    return { band: report.qualityBand, label: report.qualityLabel };
+  }
+  // Fallback for older reports without band info
+  if (report.overallScore >= 100) return { band: 'good', label: 'Good Quality' };
+  if (report.overallScore >= 60) return { band: 'attention', label: 'Needs Attention' };
+  return { band: 'poor', label: 'Poor Quality' };
+}
+
+function getBandColor(band: QualityBand): string {
+  if (band === 'good') return GREEN;
+  if (band === 'attention') return GOLD;
   return RED;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Donut chart center label (rendered as overlay)                     */
-/* ------------------------------------------------------------------ */
-
-interface CenterLabelProps {
-  score: number;
-  color: string;
-}
-
-function CenterLabel({ score, color }: CenterLabelProps): React.ReactNode {
-  return (
-    <Box
-      sx={{
-        position: 'absolute',
-        top: '50%',
-        left: '50%',
-        transform: 'translate(-50%, -50%)',
-        textAlign: 'center',
-      }}
-    >
-      <Typography
-        sx={{
-          fontSize: 36,
-          fontWeight: 700,
-          color: color,
-          lineHeight: 1,
-        }}
-      >
-        {score}
-      </Typography>
-      <Typography
-        variant="caption"
-        sx={{ color: 'text.secondary', fontSize: 11 }}
-      >
-        / 100
-      </Typography>
-    </Box>
-  );
+function getBandIcon(band: QualityBand): React.ReactNode {
+  const sx = { fontSize: 48 };
+  if (band === 'good') return <CheckCircleOutlineIcon sx={{ ...sx, color: GREEN }} />;
+  if (band === 'attention') return <WarningAmberIcon sx={{ ...sx, color: GOLD }} />;
+  return <ErrorOutlineIcon sx={{ ...sx, color: RED }} />;
 }
 
 /* ------------------------------------------------------------------ */
@@ -120,13 +102,8 @@ export function DataQualityReport({
   onClose,
   report,
 }: DataQualityReportProps): React.ReactNode {
-  const score = report?.overallScore ?? 0;
-  const color = getScoreColor(score);
-
-  const donutData = [
-    { name: 'score', value: score },
-    { name: 'remaining', value: 100 - score },
-  ];
+  const { band, label } = report ? getBand(report) : { band: 'good' as QualityBand, label: 'Good Quality' };
+  const color = getBandColor(band);
 
   return (
     <ResizableDrawer
@@ -163,37 +140,35 @@ export function DataQualityReport({
             </Typography>
           ) : (
             <>
-              {/* Donut chart with center score */}
-              <Box sx={{ display: 'flex', justifyContent: 'center', mb: 2 }}>
-                <Box sx={{ position: 'relative', width: 180, height: 180 }}>
-                  <PieChart width={180} height={180}>
-                    <Pie
-                      data={donutData}
-                      cx="50%"
-                      cy="50%"
-                      innerRadius={60}
-                      outerRadius={80}
-                      startAngle={90}
-                      endAngle={-270}
-                      dataKey="value"
-                      stroke="none"
-                    >
-                      <Cell fill={color} />
-                      <Cell fill={GRAY} />
-                    </Pie>
-                  </PieChart>
-                  <CenterLabel score={score} color={color} />
-                </Box>
-              </Box>
-
-              {/* Summary text */}
-              <Typography
-                variant="body2"
-                color="text.secondary"
-                sx={{ textAlign: 'center', mb: 3 }}
+              {/* Quality band indicator */}
+              <Box
+                sx={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  mb: 3,
+                  mt: 1,
+                }}
               >
-                {report.passingTables} of {report.totalTables} tables meet quality threshold
-              </Typography>
+                {getBandIcon(band)}
+                <Typography
+                  sx={{
+                    fontSize: 22,
+                    fontWeight: 700,
+                    color,
+                    mt: 1,
+                  }}
+                >
+                  {label}
+                </Typography>
+                <Typography
+                  variant="body2"
+                  color="text.secondary"
+                  sx={{ mt: 0.5 }}
+                >
+                  {report.totalTables} table{report.totalTables !== 1 ? 's' : ''} analyzed
+                </Typography>
+              </Box>
 
               {/* Collapsible check sections */}
               {report.checks?.map((section) => (
@@ -225,7 +200,9 @@ export function DataQualityReport({
                           fontWeight: 600,
                         }}
                       >
-                        {section.issues.length} issue{section.issues.length !== 1 ? 's' : ''}
+                        {section.issues.length === 0
+                          ? 'Passed'
+                          : `${section.issues.length} issue${section.issues.length !== 1 ? 's' : ''}`}
                       </Typography>
                     </Box>
                   </AccordionSummary>
@@ -280,7 +257,6 @@ export function DataQualityReport({
                           <TableCell sx={{ fontWeight: 700 }}>Table Name</TableCell>
                           <TableCell align="right" sx={{ fontWeight: 700 }}>Rows</TableCell>
                           <TableCell align="right" sx={{ fontWeight: 700 }}>Issues</TableCell>
-                          <TableCell align="right" sx={{ fontWeight: 700 }}>Score</TableCell>
                         </TableRow>
                       </TableHead>
                       <TableBody>
@@ -295,15 +271,12 @@ export function DataQualityReport({
                               </Typography>
                             </TableCell>
                             <TableCell align="right">
-                              <Typography variant="body2">{ts.issueCount}</Typography>
-                            </TableCell>
-                            <TableCell align="right">
                               <Typography
                                 variant="body2"
                                 fontWeight={600}
-                                sx={{ color: getScoreColor(ts.score) }}
+                                sx={{ color: ts.issueCount > 0 ? GOLD : GREEN }}
                               >
-                                {ts.score}%
+                                {ts.issueCount === 0 ? 'None' : ts.issueCount}
                               </Typography>
                             </TableCell>
                           </TableRow>
@@ -323,6 +296,7 @@ export function DataQualityReport({
 
 export type {
   QualityReport,
+  QualityBand,
   QualityIssue,
   QualityCheckSection,
   TableQualitySummary,

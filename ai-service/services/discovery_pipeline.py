@@ -808,8 +808,8 @@ async def _step_erd(
 
 
 def _step_quality(results: dict[str, Any]) -> dict[str, Any]:
-    """Step 4: Compute data quality health score (pure Python)."""
-    from agents.discovery import compute_health_score
+    """Step 4: Compute data quality band (Good / Needs Attention / Poor)."""
+    from agents.discovery import compute_quality_band
 
     profiles = results.get("profiles", [])
     classifications = results.get("classifications", {})
@@ -903,15 +903,21 @@ def _step_quality(results: dict[str, Any]) -> dict[str, Any]:
             })
 
     check_results["completeness_pcts"] = completeness_pcts
-    overall_score = compute_health_score(check_results)
+    band_result = compute_quality_band(check_results)
     avg_completeness = sum(completeness_pcts) / len(completeness_pcts) if completeness_pcts else 0
 
     return {
-        "overall_score": overall_score,
+        "overall_score": band_result["score"],
+        "quality_band": band_result["band"],
+        "quality_label": band_result["label"],
         "avg_completeness_pct": round(avg_completeness, 1),
         "table_count": len(profiles),
         "issues": issues,
-        "check_results": {k: v for k, v in check_results.items() if k != "completeness_pcts"},
+        "check_results": {
+            **{k: v for k, v in check_results.items() if k != "completeness_pcts"},
+            "quality_band": band_result["band"],
+            "quality_label": band_result["label"],
+        },
     }
 
 

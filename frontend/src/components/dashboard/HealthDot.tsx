@@ -7,15 +7,15 @@ interface HealthDotProps {
 }
 
 function getHealthColor(score: number): string {
-  if (score >= 70) return '#4CAF50';
-  if (score >= 40) return '#D4A843';
+  if (score >= 100) return '#4CAF50';
+  if (score >= 60) return '#D4A843';
   return '#F44336';
 }
 
 function getHealthLabel(score: number): string {
-  if (score >= 70) return 'Healthy';
-  if (score >= 40) return 'Needs Attention';
-  return 'Critical';
+  if (score >= 100) return 'Good Quality';
+  if (score >= 60) return 'Needs Attention';
+  return 'Poor Quality';
 }
 
 const DOT_SX = {
@@ -33,7 +33,7 @@ export function HealthDot({ score }: HealthDotProps): React.ReactNode {
   const label = getHealthLabel(score);
 
   return (
-    <Tooltip title={`${label} (${score}%)`}>
+    <Tooltip title={label}>
       <Box sx={{ ...DOT_SX, bgcolor: color }} />
     </Tooltip>
   );

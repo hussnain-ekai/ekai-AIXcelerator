@@ -715,11 +715,29 @@ export async function artifactRoutes(app: FastifyInstance): Promise<void> {
         );
       }
 
+      // Extract quality band from check_results (set by AI service)
+      // Fall back to score-based band for older reports
+      const qualityBand = (checkResults.quality_band ?? checkResults.qualityBand ?? (
+        report.overall_score >= 100 ? 'good' : report.overall_score >= 60 ? 'attention' : 'poor'
+      )) as string;
+      const qualityLabel = (checkResults.quality_label ?? checkResults.qualityLabel ?? (
+        qualityBand === 'good' ? 'Good Quality'
+          : qualityBand === 'attention' ? 'Needs Attention'
+          : 'Poor Quality'
+      )) as string;
+
       const transformedReport = {
         id: report.id,
         dataProductId: report.data_product_id,
         overallScore: report.overall_score,
-        totalTables: tableSummaries.length > 0 ? tableSummaries.length : 1,
+        qualityBand,
+        qualityLabel,
+        totalTables: tableSummaries.length > 0
+          ? tableSummaries.length
+          : Math.max(
+              (checkResults.missing_descriptions as unknown[] ?? []).length,
+              1,
+            ),
         passingTables: tableSummaries.length > 0 ? passingTables : (report.overall_score >= passingThreshold ? 1 : 0),
         tableSummaries: tableSummaries.map((t) => ({
           tableName: t.table_name ?? t.tableName ?? '',

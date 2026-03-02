@@ -42,54 +42,67 @@ def _get_deduction_missing_description() -> int:
     return get_settings().deduction_missing_description
 
 
-def compute_health_score(check_results: dict[str, list[dict[str, Any]]]) -> int:
-    """Compute overall data quality health score from check results.
+def compute_quality_band(
+    check_results: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    """Classify data quality into a band: good, attention, or poor.
 
-    Starting score is 100. Deductions are applied per issue found.
-    Data completeness is the primary factor — empty tables destroy the score.
-    Floor is 0.
+    Band criteria (evaluated top-down — first match wins):
 
-    Args:
-        check_results: Dict with check type keys and lists of issues.
-            - "completeness_pcts": list of floats (avg non-null % per table)
-            - "duplicate_pks": list of issue dicts
-            - "orphaned_fks": list of issue dicts
-            - "numeric_varchars": list of issue dicts
-            - "missing_descriptions": list of issue dicts
+    **Poor Quality** — ANY of:
+        - Duplicate PKs exist
+        - Average identifier completeness < 70%
+        - 3+ orphaned FKs
+
+    **Needs Attention** — ANY of:
+        - Average identifier completeness between 70–90%
+        - 1–2 orphaned FKs
+        - 3+ numeric-stored-as-varchar columns
+
+    **Good Quality** — everything else (no structural issues)
+
+    Missing table descriptions are informational only — they never
+    affect the band. Snowflake tables routinely lack comments.
 
     Returns:
-        Health score between 0 and 100
+        {"band": "good"|"attention"|"poor",
+         "label": "Good Quality"|"Needs Attention"|"Poor Quality",
+         "score": int}   # 100/60/20 for DB sorting/filtering
     """
-    score = 100
-
-    # Data completeness — most important factor
-    completeness_pcts = check_results.get("completeness_pcts", [])
-    if completeness_pcts:
-        avg_completeness = sum(completeness_pcts) / len(completeness_pcts)
-        # Deduct 1 point per % below 90% completeness
-        if avg_completeness < 90:
-            score -= int(90 - avg_completeness)
-        # Hard caps: empty data cannot score well
-        if avg_completeness < 10:
-            score = min(score, 15)
-        elif avg_completeness < 50:
-            score = min(score, 35)
-
     duplicate_pks = check_results.get("duplicate_pks", [])
-    score -= len(duplicate_pks) * _get_deduction_duplicate_pk()
-
     orphaned_fks = check_results.get("orphaned_fks", [])
-    score -= len(orphaned_fks) * _get_deduction_orphaned_fk()
-
     numeric_varchars = check_results.get("numeric_varchars", [])
-    score -= len(numeric_varchars) * _get_deduction_numeric_varchar()
+    completeness_pcts = check_results.get("completeness_pcts", [])
 
-    missing_descriptions = check_results.get("missing_descriptions", [])
-    # Cap missing description deduction at 10 points total (avoid penalizing
-    # large schemas unfairly — most Snowflake tables lack comments)
-    score -= min(len(missing_descriptions) * _get_deduction_missing_description(), 10)
+    avg_completeness = (
+        sum(completeness_pcts) / len(completeness_pcts)
+        if completeness_pcts
+        else 100.0
+    )
 
-    return max(0, score)
+    # --- Poor Quality ---
+    if (
+        len(duplicate_pks) > 0
+        or avg_completeness < 70
+        or len(orphaned_fks) >= 3
+    ):
+        return {"band": "poor", "label": "Poor Quality", "score": 20}
+
+    # --- Needs Attention ---
+    if (
+        avg_completeness < 90
+        or 1 <= len(orphaned_fks) <= 2
+        or len(numeric_varchars) >= 3
+    ):
+        return {"band": "attention", "label": "Needs Attention", "score": 60}
+
+    # --- Good Quality ---
+    return {"band": "good", "label": "Good Quality", "score": 100}
+
+
+def compute_health_score(check_results: dict[str, list[dict[str, Any]]]) -> int:
+    """Legacy wrapper — returns numeric score from band classification."""
+    return compute_quality_band(check_results)["score"]
 
 
 def detect_primary_key(column_profile: dict[str, Any], row_count: int) -> bool:
