@@ -125,6 +125,9 @@ def _load_tools() -> None:
         get_latest_data_description,
         upload_artifact,
         build_erd_from_description,
+        search_document_chunks,
+        find_facts_for_entity,
+        query_document_graph,
     ]
 
     # Transformation Agent tools — batch processing with Cortex AI fallback

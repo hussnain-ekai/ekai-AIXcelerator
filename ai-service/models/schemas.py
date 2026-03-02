@@ -113,6 +113,7 @@ StreamEventType = Literal[
     "done",
     "pipeline_progress",
     "data_maturity",
+    "document_evidence",
 ]
 
 

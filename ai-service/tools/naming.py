@@ -52,9 +52,16 @@ def ensure_ekaix_database() -> None:
 
 
 def ensure_schema(schema_name: str) -> None:
-    """Create a schema inside the EKAIX database if it doesn't exist."""
+    """Create a schema inside the EKAIX database if it doesn't exist.
+
+    Always uppercases the name so the created schema matches Snowflake's
+    default unquoted-identifier behaviour.  This prevents the LLM-fabricated
+    mixed-case name bug (e.g. ``Aviation_Safety_Compliance_MARTS`` vs
+    ``AVIATION_SAFETY_COMPLIANCE_MARTS``).
+    """
     ensure_ekaix_database()
+    safe_name = schema_name.upper()
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{EKAIX_DATABASE}"."{schema_name}"')
+    cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{EKAIX_DATABASE}"."{safe_name}"')
     cur.close()

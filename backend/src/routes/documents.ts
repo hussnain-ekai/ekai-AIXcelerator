@@ -8,6 +8,7 @@ import { postgresService } from '../services/postgresService.js';
 import { minioService } from '../services/minioService.js';
 import {
   extractDocumentContent,
+  extractSectionHeader,
   uploadChunksToSnowflake,
   uploadPageAwareChunksToSnowflake,
   type DocumentExtractionResult,
@@ -172,19 +173,15 @@ const STEP_RERUN_ACTIONS: Record<MissionStep, string> = {
   publishing: 'Re-publish the data product/agent after upstream artifacts are refreshed.',
 };
 
-function deriveParseQualityScore(extraction: DocumentExtractionResult): number {
+function deriveParseQualityScore(extraction: DocumentExtractionResult): number | null {
+  // Only return a score if the extraction provider actually reports one.
+  // We do not fabricate quality scores — if the provider doesn't measure it,
+  // we return null and the UI hides the chip.
   const raw = extraction.extractionMetadata['quality_score'];
-  const parsed = typeof raw === 'number' ? raw : Number(raw);
-  if (Number.isFinite(parsed) && parsed >= 0 && parsed <= 1) {
-    return Number((parsed * 100).toFixed(2));
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 0 && raw <= 1) {
+    return Number((raw * 100).toFixed(2));
   }
-
-  if (extraction.extractionStatus === 'failed') return 0;
-  if (extraction.extractionStatus === 'pending') return 40;
-
-  const warningPenalty = Math.min(extraction.extractionWarnings.length * 8, 40);
-  const base = 92 - warningPenalty;
-  return Math.max(40, Math.min(99, Number(base.toFixed(2))));
+  return null;
 }
 
 function buildExtractionDiagnostics(extraction: DocumentExtractionResult): Record<string, unknown> {
@@ -1105,10 +1102,16 @@ export async function documentRoutes(app: FastifyInstance): Promise<void> {
         return 0;
       }
 
-      const chunks = splitIntoChunks(extraction.extractedText);
-      if (chunks.length === 0) return 0;
+      const confidence = Math.max(0, Math.min(1, (deriveParseQualityScore(extraction) ?? 70) / 100));
+      const CHUNK_SIZE = 1500;
+      let totalChunks = 0;
 
-      for (let i = 0; i < chunks.length; i += 1) {
+      const insertChunk = async (
+        seq: number,
+        sectionPath: string,
+        pageNo: number | null,
+        text: string,
+      ): Promise<void> => {
         await postgresService.query(
           `INSERT INTO doc_chunks
              (id, data_product_id, document_id, registry_id, chunk_seq,
@@ -1120,18 +1123,39 @@ export async function documentRoutes(app: FastifyInstance): Promise<void> {
             dataProductId,
             documentId,
             registryId,
-            i + 1,
-            `auto_chunk_${i + 1}`,
-            null,
-            chunks[i],
-            'ekaix_chunker_v1',
-            Math.max(0, Math.min(1, deriveParseQualityScore(extraction) / 100)),
+            seq,
+            sectionPath,
+            pageNo,
+            text,
+            'ekaix_chunker_v2',
+            confidence,
           ],
           snowflakeUser,
         );
+      };
+
+      if (extraction.pages && extraction.pages.length > 0) {
+        // Page-aware chunking: chunk each page independently with metadata
+        for (const page of extraction.pages) {
+          const pageChunks = splitIntoChunks(page.text, CHUNK_SIZE);
+          const sectionHeader = extractSectionHeader(page.text);
+          const sectionPath = sectionHeader ?? `page_${page.pageNumber}`;
+
+          for (const chunk of pageChunks) {
+            totalChunks += 1;
+            await insertChunk(totalChunks, sectionPath, page.pageNumber, chunk);
+          }
+        }
+      } else {
+        // Fallback: flat chunking (no pages available)
+        const chunks = splitIntoChunks(extraction.extractedText, CHUNK_SIZE);
+        for (const chunk of chunks) {
+          totalChunks += 1;
+          await insertChunk(totalChunks, `auto_chunk_${totalChunks}`, null, chunk);
+        }
       }
 
-      return chunks.length;
+      return totalChunks;
     } catch (err) {
       if (isRecoverableContextSchemaError(err)) return 0;
       throw err;
@@ -1165,7 +1189,7 @@ export async function documentRoutes(app: FastifyInstance): Promise<void> {
         return { entities: 0, facts: 0, links: 0 };
       }
 
-      const confidence = Math.max(0, Math.min(1, deriveParseQualityScore(extraction) / 100));
+      const confidence = Math.max(0, Math.min(1, (deriveParseQualityScore(extraction) ?? 70) / 100));
       const metadataJson = JSON.stringify({
         extraction_method: extraction.extractionMethod,
         extraction_warnings: extraction.extractionWarnings,
@@ -1601,7 +1625,7 @@ export async function documentRoutes(app: FastifyInstance): Promise<void> {
       );
     }
 
-    // Upload chunks to Snowflake for Cortex Search Service (fire-and-forget)
+    // Upload chunks to Snowflake for Cortex Search Service (tracked)
     if (extractionStatus === 'completed' && extractedText) {
       const dpNameRow = await postgresService.query(
         'SELECT name FROM data_products WHERE id = $1::uuid',
@@ -1610,25 +1634,38 @@ export async function documentRoutes(app: FastifyInstance): Promise<void> {
       );
       const dpName = (dpNameRow.rows[0] as Record<string, unknown> | undefined)?.name;
       if (typeof dpName === 'string' && dpName) {
-        // Prefer page-aware upload for citation support when pages are available
-        if (extraction.pages && extraction.pages.length > 0) {
-          void uploadPageAwareChunksToSnowflake(
-            dataProductId, dpName, documentId, filename, docKind, extraction.pages,
-          ).catch((err) => {
-            app.log.warn({ err, document_id: documentId }, 'Page-aware chunk upload failed, falling back');
-            void uploadChunksToSnowflake(
-              dataProductId, dpName, documentId, filename, docKind, extractedText,
-            ).catch((fallbackErr) => {
-              app.log.warn({ err: fallbackErr, document_id: documentId }, 'Snowflake chunk upload failed');
-            });
+        const uploadFn = (extraction.pages && extraction.pages.length > 0)
+          ? () => uploadPageAwareChunksToSnowflake(dataProductId, dpName, documentId, filename, docKind, extraction.pages!)
+          : () => uploadChunksToSnowflake(dataProductId, dpName, documentId, filename, docKind, extractedText);
+
+        uploadFn()
+          .then(async (result) => {
+            await postgresService.query(
+              `UPDATE uploaded_documents
+               SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+                 'snowflake_chunk_count', $2::int,
+                 'snowflake_upload_status', 'completed',
+                 'snowflake_schema', $3
+               ) WHERE id = $1::uuid`,
+              [documentId, result.chunkCount, result.schema],
+              snowflakeUser,
+            );
+            app.log.info({ document_id: documentId, chunks: result.chunkCount }, 'Snowflake chunk upload tracked');
+          })
+          .catch(async (err) => {
+            app.log.error({ err, document_id: documentId }, 'Snowflake chunk upload failed');
+            try {
+              await postgresService.query(
+                `UPDATE uploaded_documents
+                 SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+                   'snowflake_upload_status', 'failed',
+                   'snowflake_upload_error', $2
+                 ) WHERE id = $1::uuid`,
+                [documentId, String(err).slice(0, 500)],
+                snowflakeUser,
+              );
+            } catch { /* best-effort metadata update */ }
           });
-        } else {
-          void uploadChunksToSnowflake(
-            dataProductId, dpName, documentId, filename, docKind, extractedText,
-          ).catch((err) => {
-            app.log.warn({ err, document_id: documentId }, 'Snowflake chunk upload failed');
-          });
-        }
       }
     }
 

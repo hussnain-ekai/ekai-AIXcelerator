@@ -230,12 +230,15 @@ def _build_provider_config(
         )
 
     elif provider == "snowflake-cortex":
-        config["litellm_params"]["model"] = f"snowflake/{model}"
-        config["litellm_params"]["account_identifier"] = settings.snowflake_account
-        config["litellm_params"]["user"] = settings.snowflake_user
-        password = _get_secret(settings.snowflake_password)
-        if password:
-            config["litellm_params"]["password"] = password
+        # Use the OpenAI-compatible Cortex Chat Completions REST API.
+        # LiteLLM's native snowflake/ prefix requires JWT key-pair auth,
+        # but Snowflake session tokens work with the OpenAI-compatible endpoint.
+        account = settings.snowflake_account
+        config["litellm_params"]["model"] = f"openai/{model}"
+        config["litellm_params"]["api_key"] = _get_secret(settings.snowflake_password)
+        config["litellm_params"]["api_base"] = (
+            f"https://{account}.snowflakecomputing.com/api/v2/cortex/v1"
+        )
 
     else:
         logger.warning("Unknown LLM provider: %s", provider)

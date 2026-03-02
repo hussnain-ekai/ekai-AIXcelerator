@@ -378,22 +378,45 @@ function extractTextFromAiExtract(
 
 async function getSnowflakeDocumentStageRef(): Promise<string> {
   if (!stageRefPromise) {
-    stageRefPromise = (async () => {
+    const attempt = (async () => {
       const preference = resolveStagePreference(config.SNOWFLAKE_DOCUMENT_STAGE);
-      if (!preference.createIfMissing || !preference.stageIdentifier) {
-        return preference.stageRef;
-      }
 
+      // AI_PARSE_DOCUMENT requires server-side encryption (SNOWFLAKE_SSE).
+      // The user session stage (@~) uses client-side encryption and cannot be
+      // altered, so we always need a named internal stage with SSE.
+      // Use fully-qualified name because the session may not have a current database.
+      const shortName =
+        preference.createIfMissing && preference.stageIdentifier
+          ? preference.stageIdentifier
+          : 'EKAIX_DOC_STAGE';
+
+      // Qualify with EKAIX.PUBLIC if not already qualified.
+      const fqn = shortName.includes('.') ? shortName : `EKAIX.PUBLIC.${shortName}`;
+
+      await snowflakeService.executeQuery('CREATE DATABASE IF NOT EXISTS EKAIX');
+      await snowflakeService.executeQuery(
+        `CREATE STAGE IF NOT EXISTS ${fqn} ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE')`,
+      );
+
+      // If the stage already existed with wrong encryption, fix it.
       try {
         await snowflakeService.executeQuery(
-          `CREATE STAGE IF NOT EXISTS ${preference.stageIdentifier}`,
+          `ALTER STAGE ${fqn} SET ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE')`,
         );
-        return preference.stageRef;
       } catch {
-        // Fallback to per-user session stage when named stage creation is not possible.
-        return '@~';
+        // ALTER may fail if permissions are restricted; the CREATE above
+        // already set SSE for new stages, so this is best-effort for
+        // pre-existing stages only.
       }
+
+      return `@${fqn}`;
     })();
+
+    // Cache the promise, but reset on failure so the next call retries.
+    stageRefPromise = attempt.catch((err) => {
+      stageRefPromise = null;
+      throw err;
+    });
   }
   return stageRefPromise;
 }
@@ -459,7 +482,6 @@ async function runSnowflakeParseDocument(
       provider: 'snowflake',
       method: 'AI_PARSE_DOCUMENT',
       page_count: pageCount ?? null,
-      confidence_score: extractedText ? 0.92 : 0.55,
     },
     summaryHint:
       typeof parsed.summary === 'string' && parsed.summary.trim().length > 0
@@ -504,7 +526,6 @@ async function runSnowflakeAiExtract(
     extractionMetadata: {
       provider: 'snowflake',
       method: 'AI_EXTRACT',
-      confidence_score: extractedText ? 0.84 : 0.5,
       output_keys: Object.keys(extracted),
     },
     summaryHint: summary,
@@ -571,7 +592,6 @@ function buildLocalTextFallback(
     extractionMetadata: {
       provider: 'local',
       method: 'utf8_decode',
-      confidence_score: 0.65,
       bytes: input.buffer.length,
     },
   };
@@ -696,7 +716,6 @@ function buildUnsupportedFormatResult(
       extractionMetadata: {
         provider: 'none',
         method: 'pbix_pending',
-        confidence_score: 0.2,
       },
       summaryHint:
         'Power BI PBIX detected. Add PBIP/XMLA metadata export for full model extraction.',
@@ -713,7 +732,6 @@ function buildUnsupportedFormatResult(
     extractionMetadata: {
       provider: 'none',
       method: 'unsupported',
-      confidence_score: 0.1,
     },
     summaryHint:
       'Binary document uploaded. Extraction is pending until a compatible parser is available.',
@@ -887,7 +905,7 @@ export async function uploadChunksToSnowflake(
  * Extract a section header from the first line of a markdown text block.
  * Returns the header text (without # prefix) or null if no header found.
  */
-function extractSectionHeader(text: string): string | null {
+export function extractSectionHeader(text: string): string | null {
   const firstLine = text.split('\n', 1)[0]?.trim() ?? '';
   if (firstLine.startsWith('#')) {
     // Strip leading # characters and whitespace

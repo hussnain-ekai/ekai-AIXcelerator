@@ -590,24 +590,21 @@ function ChatWorkspaceContent({ id }: { id: string }): React.ReactNode {
         .mutateAsync(document.id)
         .then((result) => {
           if (result.status === 'completed') {
-            const message = `Extraction completed for "${filename}" (${result.extracted_chars ?? 0} chars).`;
+            const chars = result.extracted_chars ?? 0;
+            const message = `"${filename}" extracted successfully (${chars.toLocaleString()} characters).`;
             setDocumentsUploadNotice(message);
             setDocumentsUploadNoticeSeverity('info');
             return;
           }
 
           if (result.status === 'pending') {
-            const message = result.message
-              ? `Extraction update for "${filename}": ${result.message}`
-              : `Extraction for "${filename}" is still pending.`;
+            const message = `"${filename}" extraction is still in progress. It will update automatically.`;
             setDocumentsUploadNotice(message);
             setDocumentsUploadNoticeSeverity('info');
             return;
           }
 
-          const message = result.message
-            ? `Extraction failed for "${filename}": ${result.message}`
-            : `Extraction failed for "${filename}".`;
+          const message = `"${filename}" could not be extracted. Check the document card for details.`;
           setDocumentsUploadNotice(message);
           setDocumentsUploadNoticeSeverity('error');
           addMessage({

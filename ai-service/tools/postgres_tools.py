@@ -1210,6 +1210,65 @@ async def save_semantic_view(
                     {"status": "error", "error": f"Table #{i} base_table missing '{key}'"}
                 )
 
+    # ── Schema fabrication guard: correct base_table.schema values ──
+    # The LLM often fabricates schema names (e.g. PRODUCT_NAME_MARTS) instead
+    # of using the real schemas from the data product. Look up actual schemas
+    # and correct any fabricated ones.
+    try:
+        dp_row = await pg_service.query(
+            pool,
+            "SELECT schemas, name FROM data_products WHERE id = $1::uuid",
+            data_product_id,
+        )
+        if dp_row:
+            real_schemas: list[str] = dp_row[0].get("schemas") or []
+            dp_name = dp_row[0].get("name", "")
+            if real_schemas:
+                real_schemas_upper = {s.upper() for s in real_schemas}
+                # Also allow EKAIX-managed schemas (curated, marts, docs)
+                from tools.naming import sanitize_dp_name
+                dp_name_sanitized = sanitize_dp_name(dp_name)
+                managed_schemas = {
+                    f"{dp_name_sanitized}_CURATED",
+                    f"{dp_name_sanitized}_MARTS",
+                    f"{dp_name_sanitized}_DOCS",
+                }
+                allowed_schemas = real_schemas_upper | managed_schemas
+
+                schema_corrected = False
+                for tbl in parsed_obj.get("tables", []):
+                    bt = tbl.get("base_table", {})
+                    yaml_schema = str(bt.get("schema", "")).strip('"').upper()
+                    if yaml_schema and yaml_schema not in allowed_schemas:
+                        # Fabricated schema — correct to the first real source schema
+                        # (for gold data this is the raw schema; for transformed data
+                        # it should be _MARTS but if _MARTS doesn't exist, use source)
+                        correct_schema = real_schemas[0]
+                        logger.warning(
+                            "save_semantic_view: correcting fabricated schema '%s' → '%s' "
+                            "for table '%s' (dp=%s)",
+                            yaml_schema,
+                            correct_schema,
+                            bt.get("table", "?"),
+                            data_product_id,
+                        )
+                        bt["schema"] = correct_schema
+                        schema_corrected = True
+
+                if schema_corrected:
+                    import yaml as _yaml_dump
+                    content = _yaml_dump.dump(
+                        parsed_obj, default_flow_style=False, sort_keys=False, allow_unicode=True
+                    )
+                    logger.info(
+                        "save_semantic_view: re-serialized YAML after schema correction (%d chars)",
+                        len(content),
+                    )
+    except Exception as schema_fix_err:
+        logger.warning(
+            "save_semantic_view: schema fabrication guard failed: %s", schema_fix_err
+        )
+
     # Data isolation guard: semantic model can only use selected source tables
     # plus internal EKAIX-managed curated/marts objects.
     try:

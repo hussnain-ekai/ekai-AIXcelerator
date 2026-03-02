@@ -69,6 +69,8 @@ cd ai-service && source venv/bin/activate && mypy . && black . && isort .
 5. **No hardcoded config.** URLs, ports, credentials, keys — all from environment variables.
 6. **TypeScript strict mode.** No `any`. Python type hints required.
 7. **Keep root clean.** No temp files, screenshots, or build artifacts in repo root.
+8. **Honest assessments only.** Never frame a failure as a success. If a feature doesn't work end-to-end for the user, it failed — regardless of how many internal steps succeeded. Report what broke, not what almost worked.
+9. **E2E testing = UI only.** Never manipulate the database directly (raw SQL inserts/updates/deletes) to set up, reset, or shortcut E2E tests. All test interactions must go through the UI (Playwright/browser) exactly as a real user would. Direct DB access is only acceptable for reading logs or verifying state after a UI action.
 
 ## Design System (ekai Brand)
 
@@ -87,6 +89,16 @@ Orchestrator (LangGraph + Deep Agents) delegates to 6 subagents:
 - **Publishing** — Cortex Agent deployment + artifact packaging
 - **Explorer** — hybrid Q&A with trust contracts
 
+### Data Layer Pipeline
+
+Semantic views are ALWAYS published on top of Gold/Marts layer tables — never on raw or silver.
+
+- **Raw (Bronze) input:** Discovery → Transformation to Silver → Transformation to Gold/Marts (`{dp_name}_MARTS`) → BRD → Semantic view on Gold → Publish
+- **Silver input:** Discovery → Transformation to Gold/Marts (`{dp_name}_MARTS`) → BRD → Semantic view on Gold → Publish
+- **Gold input:** Discovery → BRD → Semantic view directly on source tables (no transformation needed) → Publish
+
+The `base_table.schema` in semantic YAML must point to the actual schema where tables live: `_MARTS` for transformed data, or the original source schema for gold-quality input. NEVER fabricate schema names.
+
 ### Agent Language Rules
 
 Primary user is a business analyst. Agent output must NEVER contain: UUIDs, SQL keywords, database technology names (Neo4j, Redis), tool names, implementation jargon. Business language only in chat. Technical details in expandable panels.
@@ -103,6 +115,28 @@ Every answer carries: `source_mode` (structured/document/hybrid), `exactness_sta
 - **Workspace isolation:** PostgreSQL RLS + Neo4j data_product_id filtering + Redis session scoping.
 - **SPCS auth:** User identity from `Sf-Context-Current-User` header (prod) or `X-Dev-User` (dev).
 - **SSE streaming:** Backend relays AI Service SSE to frontend. Exponential backoff with jitter.
+
+## PostgreSQL Schema Management
+
+**NEVER add tables, columns, or indexes via ad-hoc SQL.** All schema changes MUST go through numbered migration files.
+
+### Rules
+
+1. **One source of truth:** `docs/plans/postgresql-schema.sql` defines the base schema (9 core tables). All additions go in `scripts/migrate-NNN-*.sql`.
+2. **Numbered migrations:** Files follow `migrate-NNN-<description>.sql` (e.g., `migrate-009-agent-artifact-tables.sql`). Next available: check `scripts/` for the highest number.
+3. **Idempotent:** Every migration uses `CREATE TABLE IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`. Must be safe to re-run.
+4. **Tracked:** Every migration inserts into `schema_migrations` table with version, filename, and checksum. Guard at top: skip if version already applied.
+5. **Transactional:** Wrap in `BEGIN; ... COMMIT;`.
+6. **New tool = new migration:** If you add a Python `@tool` function that writes to a new PostgreSQL table, you MUST create a migration for that table in the same PR. Never assume a table exists just because the code references it.
+7. **Apply via container:** `docker exec -i ekaix-postgresql psql -U ekaix -d ekaix < scripts/migrate-NNN-*.sql`
+
+### Current schema inventory (35 tables + views)
+
+**Base schema (9):** workspaces, data_products, data_product_shares, business_requirements, semantic_views, artifacts, uploaded_documents, data_quality_checks, audit_logs
+
+**Migrations 000-008:** schema_migrations, context_versions, document_evidence, context_step_selections, artifact_context_snapshots, doc_registry, doc_chunks, doc_entities, doc_facts, doc_fact_links, qa_evidence, doc_legal_holds, doc_governance_audit, doc_retention_jobs, ops_alert_events, app_config + views (v_doc_search_chunks, v_doc_search_facts) + LangGraph checkpoint tables
+
+**Migration 009:** data_descriptions, data_catalog, business_glossary, metrics_definitions, validation_rules
 
 ## Sensitive Files (DO NOT COMMIT)
 

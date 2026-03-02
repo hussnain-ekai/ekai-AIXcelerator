@@ -810,6 +810,17 @@ def _classify_query_intent(message: str) -> tuple[str, str]:
             "comparison",
             "top ",
             "bottom ",
+            "how many",
+            "how much",
+            "percentage",
+            "rate ",
+            "frequency",
+            "number of ",
+            "most common",
+            "least common",
+            "highest",
+            "lowest",
+            "ranking",
         )
     )
     has_transaction = any(
@@ -846,10 +857,34 @@ def _classify_query_intent(message: str) -> tuple[str, str]:
             "outlook report",
             "document says",
             "report says",
+            "recommend",
+            "recommendation",
+            "advisory",
+            "bulletin",
+            "regulation",
+            "standard",
+            "guidance",
+            "best practice",
+            "safety management",
+            "corrective action",
         )
     )
     has_document_signal = any(
-        token in text for token in ("document", "pdf", "file", "report", "notes", "memo")
+        token in text
+        for token in (
+            "document",
+            "pdf",
+            "file",
+            "report",
+            "notes",
+            "memo",
+            "investigation",
+            "finding",
+            "assessment",
+            "analysis report",
+            "ntsb",
+            "faa",
+        )
     )
 
     if has_metric and (has_transaction or has_policy or has_document_signal):
@@ -871,6 +906,7 @@ def _build_query_route_plan(
     *,
     current_phase: str,
     already_published: bool,
+    has_documents: bool = False,
 ) -> dict[str, Any]:
     """Build a planner object persisted for hybrid-routing auditability."""
     intent, rationale = _classify_query_intent(message)
@@ -884,7 +920,12 @@ def _build_query_route_plan(
         lanes = ["document_chunks"]
         requires_exact = False
     elif intent == "metric":
-        lanes = ["structured_agent" if already_published else "structured_sql"]
+        lanes: list[str] = ["structured_agent" if already_published else "structured_sql"]
+        # For document-enabled products, always include document search
+        # alongside structured queries — the structured model may lack
+        # dimensions the user is asking about (e.g. cause factors, recommendations).
+        if has_documents:
+            lanes.append("document_chunks")
         requires_exact = False
     elif intent == "hybrid":
         lanes = ["document_facts", "document_chunks"]
@@ -896,6 +937,10 @@ def _build_query_route_plan(
     else:
         lanes = ["structured_sql", "document_chunks"]
         requires_exact = False
+
+    # Safety net: hybrid/document products always include document lanes
+    if has_documents and "document_chunks" not in lanes:
+        lanes.append("document_chunks")
 
     return {
         "version": "hyb-ai-003-v1",
@@ -1044,7 +1089,12 @@ def _requirements_entry_ready(snapshot: dict[str, Any]) -> tuple[bool, str]:
     if not has_quality_report:
         return False, "Discovery profiling is not complete yet."
 
-    if data_tier in {"silver", "bronze"} and not transformation_done:
+    # Conservative gate: if data_tier is unknown, block until classification
+    # completes. This prevents skipping transformations for non-gold data.
+    if not data_tier:
+        return False, "Data tier classification not yet available."
+
+    if data_tier in {"silver", "bronze", "raw"} and not transformation_done:
         return False, "Data cleanup is required before requirements."
 
     return True, "Requirements entry conditions satisfied."
@@ -1102,11 +1152,24 @@ def _build_supervisor_contract(
         f"data_tier={data_tier}",
         f"product_type={snapshot.get('product_type') or 'structured'}",
         f"has_documents={bool(snapshot.get('has_documents'))}",
+        *(
+            [
+                f"doc_chunks_count={snapshot['doc_chunks_count']}",
+                f"doc_facts_count={snapshot['doc_facts_count']}",
+            ]
+            if snapshot.get("doc_chunks_count")
+            else []
+        ),
         f"data_description_exists={bool(snapshot.get('data_description_exists'))}",
         f"transformation_done={bool(snapshot.get('transformation_done'))}",
         f"brd_exists={bool(snapshot.get('brd_exists'))}",
         f"semantic_view_exists={bool(snapshot.get('semantic_view_exists'))}",
         f"validation_status={validation_status}",
+        *(
+            [f"published_agent_fqn={snapshot['published_agent_fqn']}"]
+            if snapshot.get("published_agent_fqn")
+            else []
+        ),
         "internal_ids_available=true",
         "id_request_policy=never ask user for data_product_id/session_id/uuid; use context values silently",
         (
@@ -1182,6 +1245,9 @@ def _build_supervisor_contract(
         lines.append(
             "planner_policy=follow query_route_plan lanes and rationale unless a hard error requires fallback"
         )
+    agent_fqn = snapshot.get("published_agent_fqn")
+    if agent_fqn:
+        lines.append(f"published_agent_fqn={agent_fqn}")
     lines.append(f"publish_approval={'preapproved' if publish_preapproved else 'required'}")
     if forced_subagent:
         lines.append(f"forced_subagent={forced_subagent}")
@@ -1191,6 +1257,113 @@ def _build_supervisor_contract(
     lines.append("[END SUPERVISOR CONTEXT CONTRACT]")
     lines.append(f"[USER MESSAGE]\n{user_message}")
     return "\n".join(lines)
+
+
+# ── Artifact appendix injection ──────────────────────────────
+
+# Phase → which artifact keys to inject
+_PHASE_ARTIFACT_MAP: dict[str, list[str]] = {
+    "requirements": ["data_description"],
+    "generation": ["data_description", "brd"],
+    "modeling": ["data_description", "brd"],
+    "validation": ["brd", "semantic_view"],
+    "publishing": ["brd", "semantic_view"],
+}
+
+
+def _format_artifact_content(key: str, raw: Any) -> str:
+    """Extract human-readable text from a stored artifact value.
+
+    - BRD: stored as ``{"document": "<text>"}`` → extract the text.
+    - Data Description: structured JSON dict/list → pretty-print as indented JSON.
+    - Semantic View: stored as TEXT (YAML string) → pass through.
+    """
+    if raw is None:
+        return ""
+
+    # Handle JSON strings that need parsing first
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            # Already a plain string (e.g. YAML text) — return as-is
+            return raw.strip()
+
+    if isinstance(raw, dict):
+        # BRD is stored as {"document": "<text>"}
+        if "document" in raw:
+            return str(raw["document"]).strip()
+        # Otherwise structured JSON — pretty-print
+        return json.dumps(raw, indent=2, ensure_ascii=False)
+
+    if isinstance(raw, list):
+        return json.dumps(raw, indent=2, ensure_ascii=False)
+
+    return str(raw).strip()
+
+
+def _build_artifact_appendices(
+    snapshot: dict[str, Any],
+    current_phase: str,
+) -> str:
+    """Build formatted artifact appendix text for injection into the orchestrator message.
+
+    Returns an empty string when no artifacts are relevant for the current phase.
+    """
+    artifact_keys = _PHASE_ARTIFACT_MAP.get(current_phase)
+    if not artifact_keys:
+        return ""
+
+    _LABELS = {
+        "data_description": "DATA DESCRIPTION",
+        "brd": "BUSINESS REQUIREMENTS DOCUMENT",
+        "semantic_view": "SEMANTIC VIEW YAML",
+    }
+    _CONTENT_KEYS = {
+        "data_description": "data_description_content",
+        "brd": "brd_content",
+        "semantic_view": "semantic_view_content",
+    }
+    _VERSION_KEYS = {
+        "data_description": "data_description_version",
+        "brd": "brd_version",
+        "semantic_view": "semantic_view_version",
+    }
+
+    sections: list[str] = []
+    total_chars = 0
+
+    for key in artifact_keys:
+        raw = snapshot.get(_CONTENT_KEYS[key])
+        if raw is None:
+            continue
+        text = _format_artifact_content(key, raw)
+        if not text:
+            continue
+        version = snapshot.get(_VERSION_KEYS[key], "?")
+        label = _LABELS[key]
+        sections.append(
+            f"[ARTIFACT APPENDIX: {label} (v{version})]\n{text}\n[END {label}]"
+        )
+        total_chars += len(text)
+
+    if not sections:
+        return ""
+
+    header = (
+        "\n\n"
+        "═══════════════════════════════════════════════════════\n"
+        "ARTIFACT APPENDICES (pre-loaded — COPY VERBATIM into task descriptions)\n"
+        "═══════════════════════════════════════════════════════\n\n"
+    )
+    result = header + "\n\n".join(sections)
+    logger.info(
+        "Injected artifact appendices: phase=%s artifacts=%d chars=%d",
+        current_phase,
+        len(sections),
+        total_chars,
+    )
+    return result
 
 
 def _is_non_fatal_publish_tool_error(
@@ -1837,7 +2010,8 @@ async def _get_workflow_snapshot(data_product_id: str) -> dict[str, Any]:
                    state->>'current_phase' AS current_phase,
                    state->>'data_tier' AS data_tier,
                    state->'working_layer' AS working_layer,
-                   product_type
+                   product_type,
+                   published_agent_fqn
                FROM data_products
                WHERE id = $1::uuid""",
             data_product_id,
@@ -1863,13 +2037,22 @@ async def _get_workflow_snapshot(data_product_id: str) -> dict[str, Any]:
             snapshot["transformation_done"] = (
                 isinstance(working_layer, dict) and len(working_layer) > 0
             )
+            agent_fqn = row.get("published_agent_fqn")
+            if agent_fqn and isinstance(agent_fqn, str):
+                snapshot["published_agent_fqn"] = agent_fqn
 
         dd_rows = await _q(
             _pool,
-            "SELECT 1 FROM data_descriptions WHERE data_product_id = $1::uuid LIMIT 1",
+            """SELECT description_json, version
+               FROM data_descriptions
+               WHERE data_product_id = $1::uuid
+               ORDER BY version DESC LIMIT 1""",
             data_product_id,
         )
         snapshot["data_description_exists"] = bool(dd_rows)
+        if dd_rows:
+            snapshot["data_description_content"] = dd_rows[0].get("description_json")
+            snapshot["data_description_version"] = dd_rows[0].get("version")
 
         quality_rows = await _q(
             _pool,
@@ -1880,10 +2063,16 @@ async def _get_workflow_snapshot(data_product_id: str) -> dict[str, Any]:
 
         brd_rows = await _q(
             _pool,
-            "SELECT 1 FROM business_requirements WHERE data_product_id = $1::uuid LIMIT 1",
+            """SELECT brd_json, version
+               FROM business_requirements
+               WHERE data_product_id = $1::uuid
+               ORDER BY version DESC LIMIT 1""",
             data_product_id,
         )
         snapshot["brd_exists"] = bool(brd_rows)
+        if brd_rows:
+            snapshot["brd_content"] = brd_rows[0].get("brd_json")
+            snapshot["brd_version"] = brd_rows[0].get("version")
 
         doc_rows = await _q(
             _pool,
@@ -1892,9 +2081,22 @@ async def _get_workflow_snapshot(data_product_id: str) -> dict[str, Any]:
         )
         snapshot["has_documents"] = bool(doc_rows)
 
+        if snapshot["has_documents"]:
+            count_rows = await _q(
+                _pool,
+                """SELECT
+                     (SELECT count(*) FROM doc_chunks WHERE data_product_id = $1::uuid) AS chunk_count,
+                     (SELECT count(*) FROM doc_facts  WHERE data_product_id = $1::uuid) AS fact_count
+                """,
+                data_product_id,
+            )
+            if count_rows:
+                snapshot["doc_chunks_count"] = count_rows[0].get("chunk_count", 0)
+                snapshot["doc_facts_count"] = count_rows[0].get("fact_count", 0)
+
         sv_rows = await _q(
             _pool,
-            """SELECT validation_status
+            """SELECT yaml_content, validation_status, version
                FROM semantic_views
                WHERE data_product_id = $1::uuid
                ORDER BY version DESC
@@ -1904,6 +2106,8 @@ async def _get_workflow_snapshot(data_product_id: str) -> dict[str, Any]:
         snapshot["semantic_view_exists"] = bool(sv_rows)
         if sv_rows:
             snapshot["validation_status"] = sv_rows[0].get("validation_status")
+            snapshot["semantic_view_content"] = sv_rows[0].get("yaml_content")
+            snapshot["semantic_view_version"] = sv_rows[0].get("version")
     except Exception as e:
         logger.warning("Failed to load workflow snapshot for %s: %s", data_product_id, e)
 
@@ -2163,6 +2367,246 @@ async def _persist_phase(data_product_id: str, phase: str) -> None:
         logger.warning("Failed to persist current_phase=%s/status: %s", phase, e)
 
 
+async def _post_publish_auto_repair(
+    *,
+    data_product_id: str,
+    published_agent_fqn: str | None,
+) -> None:
+    """Deterministic post-publish safety net.
+
+    After the LLM publish stream completes, verify that the Cortex Search
+    Service and Cortex Agent actually exist.  If missing (the LLM skipped a
+    step), create them deterministically.  Persist ``published_at`` and
+    ``published_agent_fqn`` to PostgreSQL regardless.
+    """
+    from config import get_effective_settings
+    from services.postgres import execute as pg_execute
+    from services.postgres import get_pool as pg_get_pool
+    from services.postgres import query as pg_query
+    from services.snowflake import execute_query as sf_query
+    from tools.naming import sanitize_dp_name
+
+    settings = get_effective_settings()
+    pool = await pg_get_pool(settings.database_url)
+
+    # Fetch data product name to derive schema names
+    dp_rows = await pg_query(
+        pool,
+        "SELECT name FROM data_products WHERE id = $1::uuid",
+        data_product_id,
+    )
+    if not dp_rows:
+        logger.warning("Post-publish auto-repair: data product %s not found", data_product_id)
+        return
+
+    dp_name = dp_rows[0].get("name") or ""
+    if not dp_name:
+        logger.warning("Post-publish auto-repair: data product %s has no name", data_product_id)
+        return
+
+    sanitized = sanitize_dp_name(dp_name)
+    docs_schema = f"{sanitized}_DOCS"
+    marts_schema = f"{sanitized}_MARTS"
+    quoted_docs = f'"EKAIX"."{docs_schema}"'
+    quoted_marts = f'"EKAIX"."{marts_schema}"'
+    warehouse = settings.snowflake_warehouse
+
+    # ── Step 1: Ensure Cortex Search Service exists ──────────────────
+    has_search_service = False
+    has_doc_chunks = False
+    try:
+        svc_rows = await sf_query(f"SHOW CORTEX SEARCH SERVICES IN SCHEMA {quoted_docs}")
+        has_search_service = bool(svc_rows)
+    except Exception:
+        pass  # Schema or service doesn't exist
+
+    if not has_search_service:
+        # Check if DOC_CHUNKS has rows
+        try:
+            chunk_rows = await sf_query(
+                f"SELECT COUNT(*) AS cnt FROM {quoted_docs}.DOC_CHUNKS"
+            )
+            has_doc_chunks = (
+                bool(chunk_rows)
+                and int(chunk_rows[0].get("CNT") or chunk_rows[0].get("cnt") or 0) > 0
+            )
+        except Exception:
+            pass
+
+        if has_doc_chunks:
+            logger.info(
+                "Post-publish auto-repair: creating Cortex Search Service in %s",
+                docs_schema,
+            )
+            try:
+                await sf_query("ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 300")
+            except Exception:
+                pass
+            service_fqn = f'{quoted_docs}."EKAIX_DOCUMENT_SEARCH"'
+            create_css_sql = f"""CREATE OR REPLACE CORTEX SEARCH SERVICE {service_fqn}
+  ON chunk_text
+  ATTRIBUTES document_id, filename, doc_kind, page_no, section_path
+  WAREHOUSE = {warehouse}
+  TARGET_LAG = '1 hour'
+AS
+  SELECT chunk_id, document_id, filename, doc_kind, page_no,
+         section_path, chunk_seq, chunk_text
+  FROM {quoted_docs}.DOC_CHUNKS"""
+            try:
+                await sf_query(create_css_sql)
+                has_search_service = True
+                logger.info("Post-publish auto-repair: Cortex Search Service created")
+            except Exception as e:
+                logger.warning("Post-publish auto-repair: failed to create search service: %s", e)
+            try:
+                await sf_query("ALTER SESSION UNSET STATEMENT_TIMEOUT_IN_SECONDS")
+            except Exception:
+                pass
+
+    # ── Step 2: Ensure Cortex Agent exists ───────────────────────────
+    has_agent = False
+    agent_fqn_resolved = published_agent_fqn
+    try:
+        agent_rows = await sf_query(f"SHOW AGENTS IN SCHEMA {quoted_marts}")
+        has_agent = bool(agent_rows)
+        if has_agent and not agent_fqn_resolved and agent_rows:
+            # Capture FQN from existing agent
+            first_name = agent_rows[0].get("name") or agent_rows[0].get("NAME")
+            if first_name:
+                agent_fqn_resolved = f"EKAIX.{marts_schema}.{first_name}"
+    except Exception:
+        pass
+
+    if not has_agent:
+        logger.info(
+            "Post-publish auto-repair: creating Cortex Agent in %s",
+            marts_schema,
+        )
+        # Check for semantic view
+        sv_fqn = ""
+        try:
+            sv_rows = await sf_query(
+                f"SHOW VIEWS IN SCHEMA {quoted_marts}"
+            )
+            for sv_row in sv_rows or []:
+                vname = sv_row.get("name") or sv_row.get("NAME") or ""
+                if "SEMANTIC" in vname.upper() or vname.upper().startswith("SV_"):
+                    sv_fqn = f"EKAIX.{marts_schema}.{vname}"
+                    break
+        except Exception:
+            pass
+
+        # Build agent tools based on what's available
+        tools_yaml_parts: list[str] = []
+        resources_yaml_parts: list[str] = []
+
+        if sv_fqn:
+            tools_yaml_parts.append("""  - tool_spec:
+      type: cortex_analyst_text_to_sql
+      name: Analyst
+      description: 'Answers questions about the data using the semantic model'""")
+            resources_yaml_parts.append(f"""  Analyst:
+    semantic_view: '{sv_fqn}'
+    execution_environment:
+      type: warehouse
+      warehouse: '{warehouse}'""")
+
+        if has_search_service:
+            tools_yaml_parts.append("""  - tool_spec:
+      type: cortex_search
+      name: DocumentSearch
+      description: 'Searches uploaded documents for relevant context and evidence'""")
+            resources_yaml_parts.append(f"""  DocumentSearch:
+    search_service: 'EKAIX.{docs_schema}.EKAIX_DOCUMENT_SEARCH'
+    max_results: 5""")
+
+        if tools_yaml_parts:
+            agent_name = f"{sanitized}_AGENT"
+            agent_fqn_full = f'{quoted_marts}."{agent_name}"'
+            tools_yaml = "\n".join(tools_yaml_parts)
+            resources_yaml = "\n".join(resources_yaml_parts)
+
+            spec_yaml = f"""models:
+  orchestration: claude-3-5-sonnet
+orchestration:
+  budget:
+    seconds: 120
+    tokens: 10000
+instructions:
+  response: 'Answer the user''s question using the available tools. Provide evidence-backed answers with citations.'
+  system: 'AI agent for {dp_name} data product'
+tools:
+{tools_yaml}
+tool_resources:
+{resources_yaml}"""
+
+            create_agent_sql = (
+                f'CREATE OR REPLACE AGENT {agent_fqn_full}\n'
+                f"  COMMENT = 'AI agent for {dp_name.replace(chr(39), chr(39)+chr(39))} data product'\n"
+                f'  FROM SPECIFICATION\n$${spec_yaml}$$'
+            )
+            try:
+                await sf_query(create_agent_sql)
+                agent_fqn_resolved = f"EKAIX.{marts_schema}.{agent_name}"
+                logger.info(
+                    "Post-publish auto-repair: Cortex Agent created at %s",
+                    agent_fqn_resolved,
+                )
+            except Exception as e:
+                logger.warning("Post-publish auto-repair: failed to create agent: %s", e)
+        else:
+            logger.warning(
+                "Post-publish auto-repair: no tools available to create agent (no semantic view, no search service)"
+            )
+
+    # ── Step 3: Persist published_at + published_agent_fqn to PG ─────
+    try:
+        await pg_execute(
+            pool,
+            """UPDATE data_products
+               SET published_at = COALESCE(published_at, NOW()),
+                   published_agent_fqn = COALESCE($1, published_agent_fqn),
+                   state = jsonb_set(
+                       COALESCE(state, '{}'::jsonb),
+                       '{published}',
+                       'true'::jsonb
+                   )
+               WHERE id = $2::uuid""",
+            agent_fqn_resolved,
+            data_product_id,
+        )
+        logger.info(
+            "Post-publish auto-repair: persisted published_at and agent_fqn=%s for %s",
+            agent_fqn_resolved,
+            data_product_id,
+        )
+    except Exception as e:
+        logger.warning("Post-publish auto-repair: failed to persist publish state: %s", e)
+
+    # ── Step 4: Clear transient PostgreSQL doc_chunks ────────────────
+    # Only safe to delete PG chunks when the Cortex Search Service is
+    # confirmed healthy. If it failed to create, PG chunks are the ONLY
+    # document store the explorer can search.
+    if has_search_service:
+        try:
+            await pg_execute(
+                pool,
+                "DELETE FROM doc_chunks WHERE data_product_id = $1::uuid",
+                data_product_id,
+            )
+            logger.info(
+                "Post-publish auto-repair: cleared PG doc_chunks for %s (Cortex Search healthy)",
+                data_product_id,
+            )
+        except Exception as e:
+            logger.warning("Post-publish auto-repair: failed to clear doc_chunks: %s", e)
+    else:
+        logger.info(
+            "Post-publish auto-repair: keeping PG doc_chunks for %s (Cortex Search not available)",
+            data_product_id,
+        )
+
+
 def _build_discovery_summary(
     pipeline_results: dict,
     dp_name: str,
@@ -2344,7 +2788,7 @@ Your job is to:
    If you're not sure, I'll proceed with my analysis."
 
 RULES:
-- Do NOT call any tools on this first message — everything is in the context above
+- Do NOT call tools on this first message — document intelligence is ALREADY pre-computed in the DOCUMENT INTELLIGENCE section below (if documents exist). Use that context directly to form enriched questions. You may call search_document_chunks later for deeper exploration.
 - Do NOT repeat the data above verbatim — interpret it in business language
 - Refer to the data product as "{dp_name}"
 - Use table short names (e.g. "your Customers table") not FQNs
@@ -2398,6 +2842,456 @@ TABLE DETAILS & FIELD ANALYSIS
         logger.info("Discovery summary truncated to %d chars", len(summary))
 
     return summary
+
+
+async def _build_document_intelligence(
+    data_product_id: str,
+    pipeline_results: dict,
+    doc_chunks_count: int,
+) -> str:
+    """Pre-compute document intelligence by cross-referencing doc_chunks with table metadata.
+
+    Instead of relying on the LLM to call tools and parse JSON results,
+    this function queries doc_chunks directly and returns plain-text excerpts
+    with cross-references to structured tables/columns.
+
+    Returns a formatted section to inject into the discovery context.
+    """
+    from services.postgres import get_pool as _gp, query as _q
+    from config import get_effective_settings
+
+    settings = get_effective_settings()
+    pool = await _gp(settings.database_url)
+
+    # 1. Extract domain terms from table/column metadata
+    metadata = pipeline_results.get("metadata", [])
+    table_names = [t.get("name", "") for t in metadata]
+    # Collect important column names (dimensions, measures, IDs with business meaning)
+    domain_terms: list[str] = []
+    column_to_table: dict[str, str] = {}  # column_name -> table_name for cross-refs
+    for table in metadata:
+        tname = table.get("name", "")
+        for col in table.get("columns", []):
+            cname = col.get("name", "")
+            cname_lower = cname.lower()
+            # Skip generic columns (IDs, timestamps, metadata)
+            if cname_lower in ("id", "created_at", "updated_at", "row_id"):
+                continue
+            if cname_lower.endswith("_id") or cname_lower.endswith("_key"):
+                continue
+            # Business-relevant columns become search terms
+            # Convert SNAKE_CASE to space-separated words
+            readable = cname.replace("_", " ").strip()
+            if len(readable) > 3:
+                domain_terms.append(readable)
+                column_to_table[cname] = tname
+
+    # 2. Fetch top document chunks by extraction confidence (broad coverage)
+    top_chunks: list[dict] = []
+    try:
+        top_chunks = await _q(
+            pool,
+            """SELECT c.chunk_text, ud.filename, c.page_no, c.chunk_seq,
+                      c.extraction_confidence
+               FROM doc_chunks c
+               JOIN uploaded_documents ud ON ud.id = c.document_id
+               WHERE c.data_product_id = $1::uuid
+                 AND COALESCE(ud.is_deleted, false) = false
+                 AND c.chunk_text IS NOT NULL
+                 AND length(c.chunk_text) > 50
+               ORDER BY COALESCE(c.extraction_confidence, 0) DESC, c.chunk_seq ASC
+               LIMIT 12""",
+            data_product_id,
+        )
+    except Exception as e:
+        logger.warning("Failed to fetch top doc chunks: %s", e)
+
+    if not top_chunks:
+        return ""
+
+    # 3. Build a domain-keyword search to find chunks that reference structured concepts
+    # Use ILIKE for reliability — search for table names and key column terms in chunks
+    cross_refs: list[dict] = []
+    search_terms = list(set(
+        [t.replace("_", " ") for t in table_names if len(t) > 3]
+        + domain_terms[:20]  # Cap to avoid too many
+    ))
+
+    for term in search_terms[:15]:  # Limit queries
+        try:
+            matches = await _q(
+                pool,
+                """SELECT c.chunk_text, ud.filename, c.page_no
+                   FROM doc_chunks c
+                   JOIN uploaded_documents ud ON ud.id = c.document_id
+                   WHERE c.data_product_id = $1::uuid
+                     AND COALESCE(ud.is_deleted, false) = false
+                     AND LOWER(c.chunk_text) LIKE $2
+                   LIMIT 2""",
+                data_product_id,
+                f"%{term.lower()}%",
+            )
+            for m in matches:
+                cross_refs.append({
+                    "term": term,
+                    "filename": m.get("filename", ""),
+                    "page_no": m.get("page_no"),
+                    "excerpt": (m.get("chunk_text") or "")[:300].strip(),
+                })
+        except Exception:
+            continue
+
+    # 4. Build plain-text output
+    lines: list[str] = []
+    lines.append("═══════════════════════════════════════════════════════")
+    lines.append("DOCUMENT INTELLIGENCE (pre-computed cross-references)")
+    lines.append("═══════════════════════════════════════════════════════")
+    lines.append(f"Documents: {len(set(c.get('filename','') for c in top_chunks))} files, "
+                 f"{doc_chunks_count} total chunks analyzed")
+    lines.append("")
+
+    # 4a. Key document excerpts (top by quality)
+    lines.append("KEY DOCUMENT EXCERPTS:")
+    seen_files: set[str] = set()
+    excerpt_count = 0
+    for chunk in top_chunks:
+        if excerpt_count >= 6:
+            break
+        fname = chunk.get("filename", "Unknown")
+        text = (chunk.get("chunk_text") or "")[:400].strip()
+        if not text:
+            continue
+        page = chunk.get("page_no")
+        loc = f"{fname}" + (f" (p{page})" if page else "")
+        lines.append(f"\n  [{loc}]:")
+        lines.append(f"  {text}")
+        seen_files.add(fname)
+        excerpt_count += 1
+
+    # 4b. Cross-references between documents and structured data
+    if cross_refs:
+        lines.append("")
+        lines.append("DOCUMENT-TO-TABLE CROSS-REFERENCES:")
+        lines.append("(Domain concepts found in BOTH documents and structured tables)")
+        # Deduplicate and show most interesting
+        seen_xrefs: set[str] = set()
+        xref_count = 0
+        for xr in cross_refs:
+            if xref_count >= 8:
+                break
+            key = f"{xr['term']}|{xr['filename']}"
+            if key in seen_xrefs:
+                continue
+            seen_xrefs.add(key)
+            term = xr["term"]
+            fname = xr["filename"]
+            page = xr.get("page_no")
+            excerpt = xr["excerpt"][:200]
+            loc = f"{fname}" + (f" (p{page})" if page else "")
+            # Find which table this term maps to
+            table_match = ""
+            for col, tbl in column_to_table.items():
+                if col.replace("_", " ").lower() == term.lower():
+                    table_match = f" → maps to {tbl}.{col}"
+                    break
+            lines.append(f"\n  Concept: \"{term}\"{table_match}")
+            lines.append(f"  Document: [{loc}]: {excerpt}")
+            xref_count += 1
+
+    lines.append("")
+    lines.append("USE THESE CROSS-REFERENCES to ask enriched questions that demonstrate")
+    lines.append("understanding of BOTH the structured tables AND the document content.")
+    lines.append("Reference specific document findings alongside table columns in your questions.")
+    lines.append("═══════════════════════════════════════════════════════")
+
+    return "\n".join(lines)
+
+
+async def _build_requirements_document_intelligence(
+    data_product_id: str,
+    workflow_snapshot: dict,
+) -> str:
+    """Pre-compute document intelligence tuned for BRD requirements capture.
+
+    Unlike discovery's _build_document_intelligence (which cross-refs chunks with
+    table metadata), this function fetches structured doc_facts, doc_fact_links,
+    and BRD-relevant chunks to give the model-builder concrete metric hints,
+    thresholds, and cross-references BEFORE it asks its first question.
+
+    Returns a formatted section to inject into the model-builder context.
+    """
+    from services.postgres import get_pool as _gp, query as _q
+    from config import get_effective_settings
+
+    settings = get_effective_settings()
+    pool = await _gp(settings.database_url)
+
+    # ── 1. Extract domain terms from Data Description ────────────────────
+    dd_content = workflow_snapshot.get("data_description_content", "")
+    domain_terms: list[str] = []
+    if dd_content:
+        # Parse table/column names from Data Description text
+        # Patterns: "TABLE_NAME" headers, "COLUMN_NAME" in column lists
+        import re as _re
+
+        # Match words that look like column/table names (UPPER_SNAKE or MixedCase)
+        raw_terms = _re.findall(r"\b([A-Z][A-Z0-9_]{2,})\b", dd_content)
+        # Filter out generic terms
+        _skip = {
+            "THE", "AND", "FOR", "NOT", "ARE", "ALL", "HAS", "WAS", "BUT",
+            "TABLE", "COLUMN", "TYPE", "NULL", "DATA", "NAME", "VALUE",
+            "PRIMARY", "FOREIGN", "KEY", "INDEX", "CREATE", "ALTER",
+            "SELECT", "FROM", "WHERE", "ORDER", "GROUP", "HAVING",
+            "INSERT", "UPDATE", "DELETE", "DROP", "SECTION", "DESCRIPTION",
+            "PRODUCT", "QUALITY", "SCORE", "TOTAL", "COUNT",
+        }
+        for t in raw_terms:
+            if t not in _skip and len(t) > 3:
+                readable = t.replace("_", " ").strip().lower()
+                if readable and readable not in domain_terms:
+                    domain_terms.append(readable)
+        domain_terms = domain_terms[:30]  # Cap
+
+    # ── 2. Fetch doc_facts — structured assertions from documents ────────
+    metric_hints: list[dict] = []
+    threshold_hints: list[dict] = []
+    try:
+        facts = await _q(
+            pool,
+            """SELECT f.fact_type, f.subject_key, f.predicate, f.object_value,
+                      f.numeric_value, f.currency, f.object_unit, f.confidence,
+                      ud.filename, f.source_page
+                 FROM doc_facts f
+                 JOIN uploaded_documents ud ON ud.id = f.document_id
+                WHERE f.data_product_id = $1::uuid
+                  AND COALESCE(ud.is_deleted, false) = false
+                ORDER BY f.confidence DESC NULLS LAST
+                LIMIT 30""",
+            data_product_id,
+        )
+        for f in facts:
+            entry = {
+                "subject": f.get("subject_key", ""),
+                "predicate": f.get("predicate", ""),
+                "object": f.get("object_value", ""),
+                "numeric": f.get("numeric_value"),
+                "unit": f.get("object_unit", ""),
+                "currency": f.get("currency", ""),
+                "filename": f.get("filename", ""),
+                "page": f.get("source_page"),
+                "type": f.get("fact_type", ""),
+            }
+            # Classify: metric hints vs threshold hints
+            ftype = (f.get("fact_type") or "").lower()
+            pred = (f.get("predicate") or "").lower()
+            if any(
+                kw in ftype or kw in pred
+                for kw in ("metric", "kpi", "formula", "rate", "ratio", "measure", "calculate")
+            ):
+                metric_hints.append(entry)
+            elif f.get("numeric_value") is not None:
+                threshold_hints.append(entry)
+            else:
+                # Default: if it has a numeric value it's a threshold, else metric hint
+                metric_hints.append(entry)
+    except Exception as e:
+        logger.warning("Failed to fetch doc_facts for requirements: %s", e)
+
+    # ── 3. Fetch doc_fact_links — cross-references to structured data ────
+    cross_refs: list[dict] = []
+    try:
+        links = await _q(
+            pool,
+            """SELECT fl.target_domain, fl.target_key, fl.link_reason,
+                      fl.link_confidence, f.subject_key, f.object_value
+                 FROM doc_fact_links fl
+                 JOIN doc_facts f ON f.id = fl.fact_id
+                WHERE f.data_product_id = $1::uuid
+                ORDER BY fl.link_confidence DESC NULLS LAST
+                LIMIT 20""",
+            data_product_id,
+        )
+        for lk in links:
+            cross_refs.append({
+                "subject": lk.get("subject_key", ""),
+                "object": lk.get("object_value", ""),
+                "target_domain": lk.get("target_domain", ""),
+                "target_key": lk.get("target_key", ""),
+                "reason": lk.get("link_reason", ""),
+            })
+    except Exception as e:
+        logger.warning("Failed to fetch doc_fact_links for requirements: %s", e)
+
+    # ── 4. Fetch BRD-relevant chunks ─────────────────────────────────────
+    brd_keywords = [
+        "metric", "KPI", "rate", "ratio", "threshold", "compliance",
+        "regulation", "target", "benchmark", "formula", "standard",
+        "requirement", "criterion", "limit", "tolerance",
+    ]
+    # Combine with domain terms for richer search
+    search_terms = list(set(brd_keywords + domain_terms[:10]))
+
+    brd_chunks: list[dict] = []
+    seen_chunk_texts: set[str] = set()
+    for term in search_terms[:20]:
+        try:
+            matches = await _q(
+                pool,
+                """SELECT c.chunk_text, ud.filename, c.page_no
+                     FROM doc_chunks c
+                     JOIN uploaded_documents ud ON ud.id = c.document_id
+                    WHERE c.data_product_id = $1::uuid
+                      AND COALESCE(ud.is_deleted, false) = false
+                      AND c.chunk_text IS NOT NULL
+                      AND length(c.chunk_text) > 50
+                      AND LOWER(c.chunk_text) LIKE $2
+                    LIMIT 2""",
+                data_product_id,
+                f"%{term.lower()}%",
+            )
+            for m in matches:
+                text_key = (m.get("chunk_text") or "")[:100]
+                if text_key in seen_chunk_texts:
+                    continue
+                seen_chunk_texts.add(text_key)
+                brd_chunks.append({
+                    "filename": m.get("filename", ""),
+                    "page": m.get("page_no"),
+                    "excerpt": (m.get("chunk_text") or "")[:300].strip(),
+                })
+        except Exception:
+            continue
+
+    # Limit to most relevant
+    brd_chunks = brd_chunks[:10]
+
+    # ── 5. Build suggested enrichments ───────────────────────────────────
+    enrichments: list[str] = []
+    # Derived metrics from ratio/rate patterns in facts
+    for mh in metric_hints:
+        pred = (mh.get("predicate") or "").lower()
+        obj = mh.get("object") or ""
+        subj = mh.get("subject") or ""
+        fname = mh.get("filename") or ""
+        if any(kw in pred or kw in obj.lower() for kw in ("rate", "ratio", "per", "percentage", "/")):
+            enrichments.append(
+                f'DERIVED METRIC: "{subj}: {obj}" (from {fname})'
+            )
+        elif any(kw in pred for kw in ("formula", "calculate", "compute")):
+            enrichments.append(
+                f'DERIVED METRIC: "{subj}: {obj}" (from {fname})'
+            )
+    # Regulatory thresholds from numeric facts
+    for th in threshold_hints:
+        subj = th.get("subject") or ""
+        num = th.get("numeric")
+        unit = th.get("unit") or ""
+        fname = th.get("filename") or ""
+        if num is not None:
+            enrichments.append(
+                f'REGULATORY THRESHOLD: "{subj}" = {num} {unit} (from {fname})'
+            )
+    # Composite dimensions from cross-references
+    for xr in cross_refs:
+        subj = xr.get("subject") or ""
+        domain = xr.get("target_domain") or ""
+        key = xr.get("target_key") or ""
+        if domain and key:
+            enrichments.append(
+                f'COMPOSITE DIMENSION: "{subj}" maps to {domain}.{key}'
+            )
+    enrichments = enrichments[:10]  # Cap
+
+    # ── 6. Format output ─────────────────────────────────────────────────
+    if not metric_hints and not threshold_hints and not cross_refs and not brd_chunks:
+        return ""
+
+    lines: list[str] = []
+    lines.append("═══════════════════════════════════════════════════════")
+    lines.append("REQUIREMENTS DOCUMENT INTELLIGENCE (pre-computed)")
+    lines.append("═══════════════════════════════════════════════════════")
+
+    def _truncate(s: str, maxlen: int = 80) -> str:
+        return s[:maxlen].rstrip() + ("..." if len(s) > maxlen else "")
+
+    if metric_hints:
+        lines.append("")
+        lines.append("DOCUMENT-SOURCED METRICS AND KPIS:")
+        seen_metric_subjects: set[str] = set()
+        for mh in metric_hints[:8]:
+            subj = _truncate(mh.get("subject") or "?", 80)
+            dedup_key = subj.lower()
+            if dedup_key in seen_metric_subjects:
+                continue
+            seen_metric_subjects.add(dedup_key)
+            obj = _truncate(mh.get("object") or mh.get("predicate") or "", 120)
+            fname = mh.get("filename") or ""
+            page = mh.get("page")
+            loc = f"from {fname}" + (f" p{page}" if page else "")
+            lines.append(f'  - "{subj}": {obj} ({loc})')
+
+    if threshold_hints:
+        lines.append("")
+        lines.append("DOCUMENT-SOURCED THRESHOLDS AND VALUES:")
+        seen_threshold_keys: set[str] = set()
+        for th in threshold_hints[:8]:
+            subj = _truncate(th.get("subject") or "?", 80)
+            num = th.get("numeric")
+            unit = th.get("unit") or ""
+            dedup_key = f"{subj.lower()}|{num}|{unit}"
+            if dedup_key in seen_threshold_keys:
+                continue
+            seen_threshold_keys.add(dedup_key)
+            currency = th.get("currency") or ""
+            fname = th.get("filename") or ""
+            page = th.get("page")
+            loc = f"from {fname}" + (f" p{page}" if page else "")
+            val_str = f"{currency}{num} {unit}".strip() if num is not None else "N/A"
+            lines.append(f'  - "{subj}": {val_str} ({loc})')
+
+    if cross_refs:
+        lines.append("")
+        lines.append("DOCUMENT-TO-DATA CROSS-REFERENCES:")
+        seen_xref_keys: set[str] = set()
+        xref_shown = 0
+        for xr in cross_refs:
+            if xref_shown >= 8:
+                break
+            subj = _truncate(xr.get("subject") or "?", 80)
+            domain = xr.get("target_domain") or ""
+            key = xr.get("target_key") or ""
+            dedup_key = f"{subj.lower()}|{domain}|{key}"
+            if dedup_key in seen_xref_keys:
+                continue
+            seen_xref_keys.add(dedup_key)
+            reason = _truncate(xr.get("reason") or "", 100)
+            target = f"{domain}.{key}" if domain else key
+            lines.append(f'  - Fact "{subj}" -> links to {target}' + (f" ({reason})" if reason else ""))
+            xref_shown += 1
+
+    if brd_chunks:
+        lines.append("")
+        lines.append("BRD-RELEVANT EXCERPTS:")
+        for ch in brd_chunks[:6]:
+            fname = ch.get("filename") or ""
+            page = ch.get("page")
+            excerpt = ch.get("excerpt") or ""
+            loc = f"{fname}" + (f" (p{page})" if page else "")
+            lines.append(f"  - [{loc}]: {excerpt}")
+
+    if enrichments:
+        lines.append("")
+        lines.append("SUGGESTED ENRICHMENTS (verify with user):")
+        for e in enrichments:
+            lines.append(f"  - {e}")
+
+    lines.append("")
+    lines.append("USE THESE FINDINGS to ask informed, domain-specific questions.")
+    lines.append("Reference specific document findings by name in your first round.")
+    lines.append("PROPOSE at least 1 derived metric and 1 document-informed dimension.")
+    lines.append("═══════════════════════════════════════════════════════")
+
+    return "\n".join(lines)
 
 
 def _looks_like_pbix(filename: str, mime_type: str) -> bool:
@@ -2793,6 +3687,7 @@ async def _run_agent(
     _last_tool_name: str | None = None
     _failure_plan_message: str | None = None
     _publish_completed: bool = False
+    _published_agent_fqn: str | None = None
     _publish_tool_error_name: str | None = None
     _publish_tool_error_reason: str | None = None
     _abort_stream_due_publish_error: bool = False
@@ -3003,6 +3898,22 @@ async def _run_agent(
                         }
                     )
 
+                    # Persist data_tier for cached path too (gate depends on it)
+                    try:
+                        from services.postgres import get_pool as _gp2, execute as _ex2
+
+                        _dp_pool2 = await _gp2(_settings.database_url)
+                        await _ex2(
+                            _dp_pool2,
+                            """UPDATE data_products
+                               SET state = jsonb_set(COALESCE(state, '{}'::jsonb), '{data_tier}', $1::jsonb)
+                               WHERE id = $2::uuid""",
+                            f'"{_cached_tier}"',
+                            data_product_id,
+                        )
+                    except Exception as _e:
+                        logger.warning("Failed to persist cached data_tier: %s", _e)
+
                 # 3. Build human-readable summary for the LLM
                 actual_message = _build_discovery_summary(
                     pipeline_results,
@@ -3010,6 +3921,37 @@ async def _run_agent(
                     data_product_id,
                     dp_description=dp_info["description"],
                 )
+
+                # 3b. Append document intelligence for hybrid/document products
+                _ws = workflow_snapshot
+                if _ws.get("has_documents"):
+                    try:
+                        _doc_intel = await _build_document_intelligence(
+                            data_product_id,
+                            pipeline_results,
+                            doc_chunks_count=_ws.get("doc_chunks_count", 0),
+                        )
+                    except Exception as e:
+                        logger.warning("Document intelligence pre-computation failed: %s", e)
+                        _doc_intel = ""
+
+                    if _doc_intel:
+                        actual_message += "\n\n" + _doc_intel
+                    else:
+                        # Fallback: at least flag that documents exist
+                        _doc_section = (
+                            "\n\n═══════════════════════════════════════════════════════\n"
+                            "UPLOADED DOCUMENTS\n"
+                            "═══════════════════════════════════════════════════════\n"
+                            f"has_documents=True\n"
+                            f"doc_chunks_count={_ws.get('doc_chunks_count', 0)}\n"
+                            f"product_type={_ws.get('product_type', 'hybrid')}\n\n"
+                            "This is a hybrid data product with uploaded documents. "
+                            "Call search_document_chunks to explore document content.\n"
+                            "═══════════════════════════════════════════════════════"
+                        )
+                        actual_message += _doc_section
+
                 logger.info("Pipeline complete, summary length: %d chars", len(actual_message))
 
                 # 4. Emit data maturity tier so frontend can adapt the phase stepper.
@@ -3275,6 +4217,7 @@ async def _run_agent(
                     message,
                     current_phase=effective_phase,
                     already_published=already_published,
+                    has_documents=bool(workflow_snapshot.get("has_documents")),
                 )
                 logger.info(
                     "Hybrid route plan (session=%s): intent=%s lanes=%s exact_required=%s",
@@ -3319,6 +4262,35 @@ async def _run_agent(
                 document_context=document_context_contract,
                 query_route_plan=_query_route_plan,
             )
+
+            # Inject artifact appendices for deterministic subagent context
+            effective_phase = supervisor_forced_phase or _current_phase
+            artifact_appendices = _build_artifact_appendices(
+                snapshot=workflow_snapshot,
+                current_phase=effective_phase,
+            )
+            if artifact_appendices:
+                actual_message += artifact_appendices
+
+            # Inject requirements-specific document intelligence for hybrid/document products
+            if (
+                workflow_snapshot.get("has_documents")
+                and effective_phase == "requirements"
+                and workflow_snapshot.get("doc_facts_count", 0) > 0
+            ):
+                try:
+                    req_doc_intel = await _build_requirements_document_intelligence(
+                        data_product_id, workflow_snapshot
+                    )
+                except Exception as e:
+                    logger.warning("Requirements document intelligence failed: %s", e)
+                    req_doc_intel = ""
+                if req_doc_intel:
+                    actual_message += "\n\n" + req_doc_intel
+                    logger.info(
+                        "Injected requirements document intelligence: %d chars",
+                        len(req_doc_intel),
+                    )
 
         content = _build_multimodal_content(actual_message, file_contents)
         input_messages = {"messages": [HumanMessage(content=content)]}
@@ -3478,7 +4450,9 @@ async def _run_agent(
                     _current_run_has_llm_reasoning = False
 
                 # Gate: only emit chunks from subagent runs (inside task tool)
-                if not _inside_task:
+                # After a subagent completes, allow orchestrator synthesis to flow through —
+                # otherwise the final user-facing response is swallowed.
+                if not _inside_task and not _subagent_completed:
                     _stream_gated_out += 1
                     continue
 
@@ -3823,15 +4797,21 @@ async def _run_agent(
 
                 if tool_name == "query_cortex_agent" and isinstance(output_payload, dict):
                     if _is_tool_payload_success(output_payload):
+                        is_non_answer = bool(output_payload.get("is_non_answer"))
                         _tool_contract_hints.append(
                             {
                                 "source_mode": "structured",
                                 "exactness_state": "not_applicable",
-                                "confidence_decision": "medium",
-                                "trust_state": "answer_ready",
-                                "evidence_summary": "Structured answer path completed via the published AI agent.",
+                                "confidence_decision": "low" if is_non_answer else "medium",
+                                "trust_state": "insufficient_evidence" if is_non_answer else "answer_ready",
+                                "evidence_summary": (
+                                    "The published AI agent could not answer from its semantic model. "
+                                    "A direct SQL fallback is needed."
+                                    if is_non_answer
+                                    else "Structured answer path completed via the published AI agent."
+                                ),
                                 "citations": [],
-                                "metadata": {"tool": "query_cortex_agent"},
+                                "metadata": {"tool": "query_cortex_agent", "is_non_answer": is_non_answer},
                             }
                         )
                     elif str(output_payload.get("error_type") or "").lower() == "auth":
@@ -3974,9 +4954,13 @@ async def _run_agent(
                             )
                         if tool_name == "create_cortex_agent":
                             _publish_completed = True
+                            # Capture the agent FQN from tool output
+                            if isinstance(output_payload, dict):
+                                _published_agent_fqn = output_payload.get("agent_fqn") or None
                             logger.info(
-                                "Publish completed for session %s (create_cortex_agent succeeded)",
+                                "Publish completed for session %s (create_cortex_agent succeeded, fqn=%s)",
                                 session_id,
+                                _published_agent_fqn,
                             )
                             await _persist_artifact_context_snapshot(
                                 data_product_id=data_product_id,
@@ -4239,6 +5223,46 @@ async def _run_agent(
             metadata["tool_trace_count"] = len(_tool_call_trace)
             status_contract_payload["metadata"] = metadata
 
+        # ── System-level document evidence guarantee ─────────────────────
+        if (
+            isinstance(_query_route_plan, dict)
+            and "document_chunks" in (_query_route_plan.get("lanes") or [])
+            and workflow_snapshot.get("has_documents")
+        ):
+            _got_doc_evidence = False
+            for trace in _tool_call_trace:
+                if trace.get("tool") == "query_cortex_agent":
+                    try:
+                        _trace_result = json.loads(trace.get("result", "{}"))
+                        if _trace_result.get("has_doc_search") or _trace_result.get("citations"):
+                            _got_doc_evidence = True
+                            break
+                    except Exception:
+                        pass
+
+            if not _got_doc_evidence:
+                try:
+                    from tools.snowflake_tools import _search_preview
+                    from tools.postgres_tools import get_data_product_name
+                    dp_name = get_data_product_name()
+                    if dp_name:
+                        fallback_chunks = _search_preview(dp_name, message, limit=10)
+                        if fallback_chunks:
+                            await queue.put({
+                                "type": "document_evidence",
+                                "data": {
+                                    "source": "system_search_preview_fallback",
+                                    "chunks": fallback_chunks,
+                                    "message": f"Found {len(fallback_chunks)} relevant document excerpts.",
+                                },
+                            })
+                            logger.info(
+                                "System SEARCH_PREVIEW fallback: found %d chunks for session=%s",
+                                len(fallback_chunks), session_id,
+                            )
+                except Exception as e:
+                    logger.warning("System doc search fallback failed: %s", e)
+
         if _failure_plan_message:
             await queue.put(
                 {
@@ -4415,10 +5439,28 @@ async def _run_agent(
         except Exception as e:
             logger.warning("Failed to update data product session_id: %s", e)
 
-        # Transition to explorer phase ONLY when the full pipeline completed
-        # (i.e. publishing was the last active phase). Otherwise the stepper
-        # incorrectly shows all phases as completed when pausing mid-pipeline.
-        if _current_phase == "publishing" and _publish_completed and not _failure_plan_message:
+        # Transition to explorer phase when we're in publishing and no hard
+        # failure occurred. Auto-repair runs unconditionally — it checks for
+        # agent/service existence internally, so it handles both "LLM created
+        # everything" and "LLM skipped tools entirely" cases.
+        if _current_phase == "publishing" and not _failure_plan_message:
+            # ── Post-publish auto-repair ──────────────────────────────────
+            # Deterministic safety net: ensure Cortex Search Service and
+            # Cortex Agent exist even if the LLM skipped a tool call.
+            # NOT gated on _publish_completed — that's the whole point.
+            try:
+                await _post_publish_auto_repair(
+                    data_product_id=data_product_id,
+                    published_agent_fqn=_published_agent_fqn,
+                )
+            except Exception as _repair_err:
+                logger.warning(
+                    "Post-publish auto-repair failed for %s: %s",
+                    data_product_id,
+                    _repair_err,
+                )
+            # ──────────────────────────────────────────────────────────────
+
             await queue.put(
                 {
                     "type": "phase_change",
@@ -4426,14 +5468,10 @@ async def _run_agent(
                 }
             )
             logger.info(
-                "Phase change: %s → explorer (session %s, stream end)", _current_phase, session_id
+                "Phase change: %s → explorer (session %s, stream end, publish_completed=%s)",
+                _current_phase, session_id, _publish_completed,
             )
             await _persist_phase(data_product_id, "explorer")
-        elif _current_phase == "publishing" and not _publish_completed:
-            logger.info(
-                "Skipping explorer transition for session %s because publishing did not complete",
-                session_id,
-            )
 
         # Persist answer evidence packet for auditability and trust UX playback.
         try:
@@ -4498,14 +5536,21 @@ async def _run_agent(
                     _tool_calls_payload.append({"type": "route_plan", "plan": _query_route_plan})
                 _tool_calls_payload.extend(_tool_call_trace[-80:])
 
-                if _trust_state in {"answer_ready", "answer_with_warnings"} and not (
-                    _sql_refs or _fact_refs or _chunk_refs
+                # Citation check only applies to explorer phase — pipeline phases
+                # (discovery/requirements/generation/validation/publishing) use artifacts,
+                # not live document queries, so citation_missing is a false positive there.
+                _citation_check_phases = {"explorer", ""}
+                if (
+                    _trust_state in {"answer_ready", "answer_with_warnings"}
+                    and not (_sql_refs or _fact_refs or _chunk_refs)
+                    and _current_phase in _citation_check_phases
                 ):
                     logger.warning(
-                        "OPS_ALERT[citation_missing] session=%s source_mode=%s trust_state=%s",
+                        "OPS_ALERT[citation_missing] session=%s source_mode=%s trust_state=%s phase=%s",
                         session_id,
                         status_contract_payload.get("source_mode"),
                         _trust_state,
+                        _current_phase,
                     )
                     if _ops_alert_rel:
                         try:

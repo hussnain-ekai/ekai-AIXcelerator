@@ -772,8 +772,25 @@ def create_semantic_view(yaml_content: str, target_schema: str, verify_only: boo
         target_schema: Fully qualified schema (DATABASE.SCHEMA) where the view will be created.
         verify_only: If True, validates YAML without creating the view.
     """
-    # Auto-fix target schema if LLM passed UUID or invalid identifier
-    target_schema = _auto_fix_target_schema(target_schema)
+    # Always derive correct schema from the CONTEXT variable (set by the router
+    # from the database). The LLM-provided target_schema is unreliable — it
+    # frequently uses mixed-case names that create case-sensitive schemas.
+    from tools.naming import sanitize_dp_name, EKAIX_DATABASE
+    from tools.postgres_tools import get_data_product_name
+
+    ctx_name = get_data_product_name()
+    if ctx_name:
+        sanitized = sanitize_dp_name(ctx_name)
+        correct_schema = f"{EKAIX_DATABASE}.{sanitized}_MARTS"
+        if target_schema != correct_schema:
+            logger.warning(
+                "create_semantic_view: corrected target_schema from '%s' to '%s' (dp_name='%s')",
+                target_schema, correct_schema, ctx_name,
+            )
+        target_schema = correct_schema
+    else:
+        target_schema = _auto_fix_target_schema(target_schema)
+
     # Validate target schema (DATABASE.SCHEMA)
     schema_parts = target_schema.split(".")
     if len(schema_parts) != 2:
@@ -923,8 +940,23 @@ def create_cortex_agent(
             "Publishing is blocked: explicit user approval is required before deployment.",
         )
 
-    # Auto-fix target schema if LLM passed UUID or invalid identifier
-    target_schema = _auto_fix_target_schema(target_schema)
+    # Always derive correct schema from the CONTEXT variable.
+    from tools.naming import sanitize_dp_name, EKAIX_DATABASE
+    from tools.postgres_tools import get_data_product_name
+
+    ctx_name = get_data_product_name()
+    if ctx_name:
+        sanitized = sanitize_dp_name(ctx_name)
+        correct_schema = f"{EKAIX_DATABASE}.{sanitized}_MARTS"
+        if target_schema != correct_schema:
+            logger.warning(
+                "create_cortex_agent: corrected target_schema from '%s' to '%s' (dp_name='%s')",
+                target_schema, correct_schema, ctx_name,
+            )
+        target_schema = correct_schema
+    else:
+        target_schema = _auto_fix_target_schema(target_schema)
+
     # Validate target schema
     schema_parts = target_schema.split(".")
     if len(schema_parts) != 2:
@@ -1025,7 +1057,7 @@ def create_cortex_agent(
       description: 'Searches uploaded documents for relevant context and evidence'""")
             resources_yaml_parts.append(f"""  DocumentSearch:
     search_service: '{docs_schema_fqn}.EKAIX_DOCUMENT_SEARCH'
-    max_results: 5""")
+    max_results: 10""")
 
         tools_yaml = "\n".join(tools_yaml_parts)
         resources_yaml = "\n".join(resources_yaml_parts)
@@ -1215,15 +1247,60 @@ def query_cortex_agent(agent_fqn: str, question: str) -> str:
             )
 
         answer_text = ""
+        citations: list[dict[str, Any]] = []
+        tools_used: list[str] = []
+        has_doc_search = False
+        has_analyst = False
+        tables: list[dict[str, Any]] = []
+
         if isinstance(parsed, dict):
             content = parsed.get("content", [])
             if isinstance(content, list):
                 texts: list[str] = []
                 for item in content:
-                    if isinstance(item, dict) and item.get("type") == "text":
+                    if not isinstance(item, dict):
+                        continue
+                    item_type = item.get("type", "")
+
+                    if item_type == "text":
                         txt = str(item.get("text") or "").strip()
                         if txt:
                             texts.append(txt)
+                        # Extract citations from annotations
+                        for ann in (item.get("annotations") or []):
+                            if isinstance(ann, dict) and ann.get("type") == "cortex_search_citation":
+                                citations.append({
+                                    "doc_id": ann.get("doc_id", ""),
+                                    "doc_title": ann.get("doc_title", ""),
+                                    "text": ann.get("text", ""),
+                                    "search_result_id": ann.get("search_result_id", ""),
+                                })
+
+                    elif item_type == "tool_use":
+                        tool_info = item.get("tool_use", {})
+                        tool_type = tool_info.get("type", "")
+                        tool_name = tool_info.get("name", "")
+                        tools_used.append(tool_type or tool_name)
+                        if "cortex_search" in tool_type:
+                            has_doc_search = True
+                        if "cortex_analyst" in tool_type:
+                            has_analyst = True
+
+                    elif item_type == "tool_result":
+                        result_info = item.get("tool_result", {})
+                        tool_type = result_info.get("type", "")
+                        if "cortex_search" in tool_type:
+                            has_doc_search = True
+                        if "cortex_analyst" in tool_type:
+                            has_analyst = True
+
+                    elif item_type == "table":
+                        table_info = item.get("table", {})
+                        tables.append({
+                            "title": table_info.get("title", ""),
+                            "query_id": table_info.get("query_id", ""),
+                        })
+
                 answer_text = "\n".join(texts).strip()
             if not answer_text:
                 answer_text = str(parsed.get("text") or "").strip()
@@ -1233,12 +1310,112 @@ def query_cortex_agent(agent_fqn: str, question: str) -> str:
         if not answer_text:
             answer_text = "(No answer returned by agent)"
 
+        # Detect non-answer using both tool-use metadata and phrase matching
+        is_non_answer = (
+            not answer_text
+            or answer_text == "(No answer returned by agent)"
+            or any(
+                phrase in answer_text.lower()
+                for phrase in (
+                    "i do not have access",
+                    "i don't have access",
+                    "i cannot access",
+                    "unable to retrieve",
+                    "no information available",
+                    "no relevant information",
+                    "i couldn't find",
+                    "i could not find",
+                    "no results found",
+                    "no matching",
+                    "not able to find",
+                    "don't have enough information",
+                    "do not have enough information",
+                    "outside the scope",
+                    "beyond the scope",
+                    "no specific data",
+                    "not available in",
+                    "i don't have specific",
+                    "i do not have specific",
+                    "cannot provide specific",
+                )
+            )
+        )
+
         logger.info(
-            "query_cortex_agent success via AGENT_RUN: agent=%s, answer_len=%d",
+            "query_cortex_agent success via AGENT_RUN: agent=%s, answer_len=%d, "
+            "is_non_answer=%s, tools_used=%s, has_doc_search=%s, has_analyst=%s, citations=%d",
             normalized_fqn,
             len(answer_text),
+            is_non_answer,
+            tools_used,
+            has_doc_search,
+            has_analyst,
+            len(citations),
         )
-        return json.dumps({"status": "success", "answer": answer_text})
+        result: dict[str, Any] = {
+            "status": "success",
+            "answer": answer_text,
+            "tools_used": tools_used,
+            "has_doc_search": has_doc_search,
+            "has_analyst": has_analyst,
+        }
+        if citations:
+            result["citations"] = citations
+        if tables:
+            result["tables"] = tables
+        if is_non_answer:
+            result["is_non_answer"] = True
+            result["fallback_hint"] = (
+                "The published agent could not answer from the semantic model. "
+                "Fall back to direct SQL: call query_erd_graph to discover table/column names, "
+                "then execute_rcr_query with a read-only query."
+            )
+
+        # ── Inline document search fallback ──────────────────────────
+        # When the Cortex Agent did NOT invoke DocumentSearch, supplement
+        # the answer with direct SEARCH_PREVIEW results so the explorer
+        # LLM can incorporate document evidence into its response.
+        if not has_doc_search:
+            try:
+                from tools.postgres_tools import get_data_product_name as _get_dp_name
+                _dp_name = _get_dp_name()
+                if _dp_name:
+                    _fallback_chunks = _search_preview(_dp_name, question, limit=10)
+                    if _fallback_chunks:
+                        # Build a readable excerpt block for the LLM
+                        excerpts = []
+                        for i, chunk in enumerate(_fallback_chunks[:5], 1):
+                            text = chunk.get("chunk_text", chunk.get("CHUNK_TEXT", ""))
+                            fname = chunk.get("filename", chunk.get("FILENAME", ""))
+                            page = chunk.get("page_no", chunk.get("PAGE_NO", ""))
+                            if text:
+                                header = f"[Document: {fname}"
+                                if page:
+                                    header += f", Page {page}"
+                                header += "]"
+                                excerpts.append(f"{header}\n{text[:500]}")
+                        if excerpts:
+                            doc_block = (
+                                "\n\n--- SUPPLEMENTARY DOCUMENT EVIDENCE "
+                                "(from direct search, Cortex Agent did not search documents) ---\n"
+                                + "\n\n".join(excerpts)
+                            )
+                            result["answer"] = answer_text + doc_block
+                            result["has_doc_search"] = True
+                            result["doc_search_source"] = "inline_search_preview_fallback"
+                            result["doc_chunk_count"] = len(_fallback_chunks)
+                            logger.info(
+                                "query_cortex_agent: inline SEARCH_PREVIEW fallback "
+                                "appended %d chunks for question: %.80s",
+                                len(_fallback_chunks), question,
+                            )
+            except Exception as _fb_err:
+                logger.warning(
+                    "query_cortex_agent: inline SEARCH_PREVIEW fallback failed: %s",
+                    _fb_err,
+                )
+
+        return json.dumps(result)
     except Exception as e:
         logger.error("query_cortex_agent failed: %s", e)
         msg = str(e)
@@ -1263,6 +1440,49 @@ def query_cortex_agent(agent_fqn: str, question: str) -> str:
             error_type="unknown",
             retryable=False,
         )
+
+
+def _search_preview(
+    data_product_name: str,
+    query_text: str,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Internal: Query Cortex Search Service directly via SEARCH_PREVIEW.
+
+    NOT a @tool — used by the router as a system-level fallback when
+    the Cortex Agent fails to invoke DocumentSearch.
+    """
+    from tools.naming import sanitize_dp_name, EKAIX_DATABASE
+
+    sanitized = sanitize_dp_name(data_product_name)
+    service_fqn = f"{EKAIX_DATABASE}.{sanitized}_DOCS.EKAIX_DOCUMENT_SEARCH"
+    safe_query = query_text.replace('"', '\\"').replace("'", "''")
+
+    search_payload = json.dumps({
+        "query": safe_query,
+        "columns": ["chunk_text", "document_id", "filename", "doc_kind", "page_no", "section_path"],
+        "limit": min(limit, 50),
+    })
+
+    sql = f"""SELECT PARSE_JSON(
+        SNOWFLAKE.CORTEX.SEARCH_PREVIEW(
+            '{service_fqn}',
+            $${search_payload}$$
+        )
+    )['results'] AS results"""
+
+    try:
+        rows = execute_query_sync(sql)
+        if not rows:
+            return []
+        raw = rows[0].get("RESULTS") or rows[0].get("results")
+        if not raw:
+            return []
+        results = json.loads(str(raw)) if isinstance(raw, str) else raw
+        return results if isinstance(results, list) else []
+    except Exception as e:
+        logger.warning("_search_preview failed: %s", e)
+        return []
 
 
 def _try_cortex_yaml_fix(yaml_content: str, error_msg: str, schema_name: str) -> str | None:
@@ -1802,7 +2022,7 @@ def create_document_search_service(target_schema: str, data_product_name: str) -
   ON chunk_text
   ATTRIBUTES document_id, filename, doc_kind, page_no, section_path
   WAREHOUSE = {warehouse}
-  TARGET_LAG = '1 hour'
+  TARGET_LAG = '1 minute'
 AS
   SELECT chunk_id, document_id, filename, doc_kind, page_no,
          section_path, chunk_seq, chunk_text
@@ -1815,6 +2035,20 @@ AS
             execute_query_sync("ALTER SESSION UNSET STATEMENT_TIMEOUT_IN_SECONDS")
         except Exception:
             pass
+
+        # Verify the search service is operational
+        verified = False
+        try:
+            verify_rows = _search_preview(dp_name_for_schema, "test", limit=1)
+            verified = len(verify_rows) > 0
+            logger.info(
+                "create_document_search_service: verification=%s (%d results)",
+                "passed" if verified else "no_results_yet (TARGET_LAG pending)",
+                len(verify_rows),
+            )
+        except Exception as ve:
+            logger.warning("create_document_search_service: verification failed: %s", ve)
+
         display_fqn = f"{target_schema}.EKAIX_DOCUMENT_SEARCH"
         logger.info(
             "create_document_search_service: created %s with %d chunks",
@@ -1824,6 +2058,7 @@ AS
             "status": "success",
             "search_service_fqn": display_fqn,
             "chunk_count": chunk_count,
+            "verified": verified,
             "message": f"Cortex Search Service {display_fqn} created successfully over {chunk_count} document chunks",
         })
 

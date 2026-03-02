@@ -80,13 +80,75 @@ function formatFileSize(size: number | null): string {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function statusColor(status: string): 'default' | 'success' | 'warning' | 'error' | 'info' {
+/** Determine whether a document with "pending" status actually failed. */
+function isEffectivelyFailed(doc: UploadedDocument): boolean {
+  if (doc.extraction_status === 'failed') return true;
+  // "pending" with an extraction_error means the extraction was attempted and failed.
+  if (doc.extraction_status === 'pending' && doc.extraction_error) return true;
+  return false;
+}
+
+/** User-facing extraction status label. */
+function humanizeExtractionStatus(doc: UploadedDocument): string {
+  if (doc.extraction_status === 'completed') return 'Extracted';
+  if (isEffectivelyFailed(doc)) return 'Extraction failed';
+  if (doc.extraction_status === 'processing') return 'Extracting…';
+  return 'Awaiting extraction';
+}
+
+function statusColor(status: string, doc?: UploadedDocument): 'default' | 'success' | 'warning' | 'error' | 'info' {
+  if (doc && isEffectivelyFailed(doc)) return 'error';
   const normalized = status.toLowerCase();
   if (normalized === 'completed') return 'success';
   if (normalized === 'failed' || normalized === 'error') return 'error';
   if (normalized === 'pending' || normalized === 'queued') return 'warning';
   if (normalized === 'processing' || normalized === 'running') return 'info';
   return 'default';
+}
+
+/** Translate raw extraction_error into a short, actionable message. */
+function humanizeExtractionError(raw: string): string {
+  const lower = raw.toLowerCase();
+  if (lower.includes('client side encryption'))
+    return 'Document storage needs reconfiguration. Try re-uploading.';
+  if (lower.includes('llm provider not configured'))
+    return 'LLM provider is not configured. Go to LLM Configuration to set one up.';
+  if (lower.includes('no compatible extractor'))
+    return 'This file type could not be processed. Try a different format (PDF, DOCX).';
+  if (lower.includes('timeout') || lower.includes('timed out') || lower.includes('aborted'))
+    return 'Extraction timed out. Try again — the file may be large.';
+  if (lower.includes('unauthorized') || lower.includes('401'))
+    return 'Snowflake access denied. Check your account permissions.';
+  if (lower.includes('does not have a current database'))
+    return 'Snowflake session is misconfigured. Contact your administrator.';
+  // Fallback: strip pipe-delimited multi-segment errors and return just the first segment.
+  const firstSegment = raw.split('|')[0]?.trim();
+  if (firstSegment && firstSegment.length < 120) return firstSegment;
+  return 'Extraction failed. Click retry or re-upload the document.';
+}
+
+/** User-facing extraction method label. */
+function humanizeExtractionMethod(method: string | null): string | null {
+  if (!method) return null;
+  const m = method.toLowerCase();
+  if (m === 'snowflake_ai_parse_document') return 'Full text extraction';
+  if (m === 'ai_multimodal_fallback') return 'AI summary (partial)';
+  if (m === 'text_direct') return 'Direct text read';
+  if (m === 'unsupported_binary') return null; // Don't show — it's a failure, not a method.
+  return null;
+}
+
+/** Detect diagnostic/junk summaries that shouldn't be shown to users. */
+function isSyntheticSummary(summary: string | null | undefined): boolean {
+  if (!summary) return false;
+  const lower = summary.toLowerCase();
+  return (
+    lower.includes('binary document uploaded') ||
+    lower.includes('extraction is pending') ||
+    lower.includes('compatible parser') ||
+    lower.includes('extraction did not produce') ||
+    lower.includes('extraction update for')
+  );
 }
 
 function contextStateColor(
@@ -194,7 +256,7 @@ export function DocumentsPanel({
         </Box>
 
         <Box sx={{ flex: 1, overflow: 'auto', px: 2.5, py: 2 }}>
-          {uploadNotice && (
+          {uploadNotice && !isSyntheticSummary(uploadNotice) && (
             <Typography
               variant="caption"
               sx={{
@@ -266,9 +328,8 @@ export function DocumentsPanel({
               {documents.map((doc) => {
                 const contextState = contextByDocumentId[doc.id]?.state;
                 const registry = registryByDocumentId[doc.id];
-                const extractionStatus = (doc.extraction_status || '').toLowerCase();
-                const canRetryExtraction =
-                  extractionStatus === 'pending' || extractionStatus === 'failed';
+                const canRetryExtraction = isEffectivelyFailed(doc) ||
+                  doc.extraction_status === 'pending' || doc.extraction_status === 'failed';
 
                 return (
                   <Box
@@ -298,7 +359,8 @@ export function DocumentsPanel({
                         {formatFileSize(doc.file_size_bytes)} • {formatTimestamp(doc.created_at)}
                       </Typography>
 
-                      {doc.summary && (
+                      {/* Show real summary only — suppress diagnostic/junk messages */}
+                      {doc.summary && !isSyntheticSummary(doc.summary) && !isEffectivelyFailed(doc) && (
                         <Typography
                           variant="caption"
                           color="text.secondary"
@@ -306,6 +368,30 @@ export function DocumentsPanel({
                         >
                           {doc.summary}
                         </Typography>
+                      )}
+
+                      {/* Extraction failure banner — clear, actionable */}
+                      {isEffectivelyFailed(doc) && (
+                        <Box
+                          sx={{
+                            mt: 0.75,
+                            px: 1.25,
+                            py: 0.75,
+                            borderRadius: 0.75,
+                            bgcolor: 'error.900',
+                            border: 1,
+                            borderColor: 'error.main',
+                          }}
+                        >
+                          <Typography variant="caption" color="error.light" sx={{ display: 'block', fontWeight: 600 }}>
+                            Extraction failed
+                          </Typography>
+                          <Typography variant="caption" color="error.light" sx={{ display: 'block', mt: 0.25, opacity: 0.85 }}>
+                            {doc.extraction_error
+                              ? humanizeExtractionError(doc.extraction_error)
+                              : 'Could not read this document. Try re-uploading or use a different format.'}
+                          </Typography>
+                        </Box>
                       )}
 
                       <Box
@@ -319,15 +405,21 @@ export function DocumentsPanel({
                       >
                         <Chip
                           size="small"
-                          label={doc.extraction_status || 'uploaded'}
-                          color={statusColor(doc.extraction_status || 'uploaded')}
+                          label={humanizeExtractionStatus(doc)}
+                          color={statusColor(doc.extraction_status || 'uploaded', doc)}
                           variant="outlined"
                         />
 
                         {doc.doc_kind && (
                           <Chip
                             size="small"
-                            label={doc.doc_kind}
+                            label={
+                              doc.doc_kind === 'business_doc' ? 'Business document' :
+                              doc.doc_kind === 'technical_doc' ? 'Technical document' :
+                              doc.doc_kind === 'data_dictionary' ? 'Data dictionary' :
+                              doc.doc_kind === 'schema_diagram' ? 'Schema diagram' :
+                              doc.doc_kind.replace(/_/g, ' ')
+                            }
                             variant="outlined"
                             color="default"
                           />
@@ -342,15 +434,6 @@ export function DocumentsPanel({
                           />
                         )}
 
-                        {registry && (
-                          <Chip
-                            size="small"
-                            label={`v${registry.versionId}`}
-                            variant="outlined"
-                            color="default"
-                          />
-                        )}
-
                         {registry && registry.parseQualityScore !== null && (
                           <Chip
                             size="small"
@@ -360,20 +443,17 @@ export function DocumentsPanel({
                           />
                         )}
 
-                        {registry?.extractionMethod && (
-                          <Chip
-                            size="small"
-                            label={registry.extractionMethod}
-                            variant="outlined"
-                            color="info"
-                          />
-                        )}
-
-                        {doc.extraction_error && (
-                          <Typography variant="caption" color="error.main" noWrap>
-                            {doc.extraction_error}
-                          </Typography>
-                        )}
+                        {(() => {
+                          const methodLabel = humanizeExtractionMethod(registry?.extractionMethod ?? null);
+                          return methodLabel ? (
+                            <Chip
+                              size="small"
+                              label={methodLabel}
+                              variant="outlined"
+                              color="info"
+                            />
+                          ) : null;
+                        })()}
                       </Box>
 
                       {onSetDocumentState && contextState && (
