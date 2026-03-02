@@ -161,7 +161,7 @@ async def run_discovery_pipeline(
 
         # Step 2: Profiling ------------------------------------------------
         results["profiles"] = await _step_profiling(
-            queue, tables,
+            queue, tables, data_product_id, database, schemas[0],
         )
 
         # Step 3: Classification -------------------------------------------
@@ -308,168 +308,211 @@ async def _step_metadata(
 async def _step_profiling(
     queue: asyncio.Queue[dict | None],
     tables: list[str],
+    data_product_id: str,
+    database: str,
+    schema: str,
 ) -> list[dict[str, Any]]:
-    """Step 2: Profile each table (batch aggregate SQL)."""
+    """Step 2: Profile tables with single-scan CTEs and checkpointing."""
     step_idx = 1
-    total = len(tables)
     profiles: list[dict[str, Any]] = []
 
     from services.snowflake import execute_query
-    from tools.snowflake_tools import _validate_fqn, _quoted_fqn, SAMPLE_SIZE
+    from tools.snowflake_tools import (
+        _validate_fqn, _quoted_fqn, _parse_data_type,
+        _build_sample_clause, _build_column_stats_cte,
+        _build_value_patterns_cte, _batch_table_metadata,
+    )
+    from tools.postgres_tools import (
+        load_profile_checkpoint, save_profile_checkpoint,
+        get_pending_profile_tables,
+    )
 
-    for i, table_fqn in enumerate(tables):
-        table_name = table_fqn.split(".")[-1] if "." in table_fqn else table_fqn
-        await _emit(queue, "profiling", STEPS[step_idx]["label"],
-                    "running", f"Analyzing {table_name} ({i + 1} of {total})",
-                    i, total, step_idx)
-
-        parts, fqn_err = _validate_fqn(table_fqn)
-        if fqn_err:
-            logger.warning("Invalid FQN %s: %s", table_fqn, fqn_err)
-            profiles.append({"table": table_fqn, "error": fqn_err, "columns": []})
+    # Extract bare table names from FQNs
+    table_name_to_fqn: dict[str, str] = {}
+    bare_names: list[str] = []
+    for fqn in tables:
+        parts, err = _validate_fqn(fqn)
+        if err:
+            profiles.append({"table": fqn, "error": err, "columns": []})
             continue
+        bare = parts[2]  # TABLE_NAME from DATABASE.SCHEMA.TABLE
+        bare_names.append(bare)
+        table_name_to_fqn[bare] = fqn
 
+    # Load checkpoint and determine pending tables
+    pending = await get_pending_profile_tables(data_product_id, bare_names)
+    total = len(bare_names)  # total for progress (all tables, not just pending)
+
+    # Load existing results from checkpoint for already-processed tables
+    checkpoint = await load_profile_checkpoint(data_product_id)
+    if checkpoint and checkpoint.get("results"):
+        for tname, result in checkpoint["results"].items():
+            if tname not in pending and tname in table_name_to_fqn:
+                profiles.append(result)
+
+    if not pending:
+        logger.info("All %d tables already profiled (checkpoint hit)", total)
+        await _emit(queue, "profiling", STEPS[step_idx]["label"],
+                    "completed", f"{total} tables profiled (cached)", total, total, step_idx)
+        return profiles
+
+    # Batch metadata fetch for pending tables
+    batch_meta = _batch_table_metadata(database, schema, pending)
+
+    # Initialize checkpoint state
+    checkpoint_data = checkpoint or {
+        "database_name": database,
+        "schema_name": schema,
+        "processed_tables": [],
+        "requested_tables": bare_names,
+        "results": {},
+        "status": "in_progress",
+    }
+    # Ensure requested_tables is current
+    checkpoint_data["requested_tables"] = bare_names
+
+    processed_count = len(profiles)  # already-cached tables
+
+    for i, table_name in enumerate(pending):
+        fqn = table_name_to_fqn.get(table_name)
+        if not fqn:
+            continue
+        parts, _ = _validate_fqn(fqn)
         quoted = _quoted_fqn(parts)
 
+        await _emit(queue, "profiling", STEPS[step_idx]["label"],
+                    "running", f"Analyzing {table_name} ({processed_count + i + 1} of {total})",
+                    processed_count + i, total, step_idx)
+
         try:
-            # Get metadata for sampling strategy
-            meta = await execute_query(
-                f'SELECT "ROW_COUNT", "TABLE_TYPE" FROM "{parts[0]}".INFORMATION_SCHEMA.TABLES '
-                f"WHERE TABLE_SCHEMA='{parts[1]}' AND TABLE_NAME='{parts[2]}'"
-            )
-            meta_row = meta[0] if meta else {}
-            table_type = meta_row.get("TABLE_TYPE")
-            row_count_val = meta_row.get("ROW_COUNT")
-            is_view = not meta or table_type in ("VIEW", "MATERIALIZED VIEW")
-            metadata_row_count = int(row_count_val) if row_count_val is not None else None
+            # Get metadata from batch fetch
+            meta = batch_meta.get(table_name, {})
+            row_count = meta.get("ROW_COUNT", 0)
+            table_type = meta.get("TABLE_TYPE", "BASE TABLE")
+            size_mb = meta.get("SIZE_MB", 0)
 
-            # Determine sampling strategy
-            sampled = False
-            if is_view or metadata_row_count is None:
-                from_clause = f"(SELECT * FROM {quoted} LIMIT {SAMPLE_SIZE}) AS _sample"
-                sampled = True
-                total_rows = None
-            elif metadata_row_count == 0:
-                profiles.append({"table": table_fqn, "row_count": 0, "columns": [], "sampled": False})
-                continue
-            elif metadata_row_count <= SAMPLE_SIZE:
-                from_clause = quoted
-                total_rows = metadata_row_count
-            else:
-                from_clause = f"{quoted} TABLESAMPLE BERNOULLI ({SAMPLE_SIZE} ROWS)"
-                sampled = True
-                total_rows = metadata_row_count
-
-            # Get columns
-            raw_cols = await execute_query(f'SHOW COLUMNS IN TABLE {quoted}')
-            from tools.snowflake_tools import _parse_data_type
-            columns = []
-            for col in raw_cols:
-                nullable = col.get("null?", True)
-                columns.append({
-                    "column_name": col.get("column_name", ""),
-                    "data_type": _parse_data_type(col.get("data_type", "{}")),
-                    "is_nullable": "YES" if nullable in (True, "true", "Y", "YES") else "NO",
-                })
-
-            if not columns:
-                profiles.append({"table": table_fqn, "row_count": total_rows or 0, "columns": [], "sampled": sampled})
+            if row_count == 0 and table_type not in ("VIEW", "MATERIALIZED VIEW"):
+                profile_entry = {"table": fqn, "row_count": 0, "column_count": 0,
+                                 "columns": [], "sampled": False, "sample_size": 0}
+                profiles.append(profile_entry)
+                checkpoint_data["results"][table_name] = profile_entry
+                if table_name not in checkpoint_data.get("processed_tables", []):
+                    checkpoint_data.setdefault("processed_tables", []).append(table_name)
+                await save_profile_checkpoint(data_product_id, checkpoint_data)
                 continue
 
-            # Batch profile all columns
-            col_expressions = []
-            for col in columns:
-                cn = col["column_name"]
-                if not cn:
-                    continue
-                expr = (
-                    f'COUNT("{cn}") AS "nn_{cn}", '
-                    f'APPROX_COUNT_DISTINCT("{cn}") AS "dc_{cn}"'
+            # Build sample clause
+            sample_clause = _build_sample_clause(row_count, table_type)
+            sampled = sample_clause != ""
+
+            # --- Phase 1 & 2: Single-scan CTE for column stats ---
+            stats_phase1_sql = _build_column_stats_cte(database, schema, table_name, sample_clause)
+            phase1_result = await execute_query(stats_phase1_sql)
+
+            col_stats: dict[str, dict] = {}
+            if phase1_result:
+                # Phase 1 returns one row with the generated SQL string
+                # The first value in the first row is the Phase 2 SQL
+                first_row = phase1_result[0]
+                phase2_sql = None
+                # CaseInsensitiveDict — try to get the first value
+                for key in first_row:
+                    phase2_sql = first_row[key]
+                    break
+
+                if phase2_sql and isinstance(phase2_sql, str) and phase2_sql.strip():
+                    stats_rows = await execute_query(phase2_sql)
+                    for row in stats_rows:
+                        cname = row.get("COLUMN_NAME") or row.get("column_name", "")
+                        col_stats[cname] = {
+                            "unique_count": int(row.get("UNIQUE_COUNT") or row.get("unique_count") or 0),
+                            "null_count": int(row.get("NULL_COUNT") or row.get("null_count") or 0),
+                            "data_type": str(row.get("DATA_TYPE") or row.get("data_type") or "VARCHAR"),
+                            "length_of_column": max(row_count - int(row.get("NULL_COUNT") or row.get("null_count") or 0), 0),
+                        }
+
+            # --- Phase 1 & 2: Single-scan CTE for value patterns ---
+            patterns: dict[str, dict] = {}
+            patterns_phase1_sql = _build_value_patterns_cte(database, schema, table_name, sample_clause)
+            try:
+                p1_result = await execute_query(patterns_phase1_sql)
+                if p1_result:
+                    first_row = p1_result[0]
+                    p2_sql = None
+                    for key in first_row:
+                        p2_sql = first_row[key]
+                        break
+
+                    if p2_sql and isinstance(p2_sql, str) and p2_sql.strip():
+                        pattern_rows = await execute_query(p2_sql)
+                        for row in pattern_rows:
+                            cname = row.get("COLUMN_NAME") or row.get("column_name", "")
+                            ptype = row.get("PATTERN_TYPE") or row.get("pattern_type", "")
+                            if ptype == "No pattern":
+                                patterns[cname] = {"numeric_ratio": None, "avg_length": None,
+                                                   "min_value": None, "max_value": None}
+                            else:
+                                nr = row.get("NUMERIC_RATIO") or row.get("numeric_ratio")
+                                al = row.get("AVG_LENGTH") or row.get("avg_length")
+                                mn = row.get("MIN_VALUE") or row.get("min_value")
+                                mx = row.get("MAX_VALUE") or row.get("max_value")
+                                patterns[cname] = {
+                                    "numeric_ratio": float(nr) if nr is not None else None,
+                                    "avg_length": float(al) if al is not None else None,
+                                    "min_value": float(mn) if mn is not None else None,
+                                    "max_value": float(mx) if mx is not None else None,
+                                }
+            except Exception as pat_err:
+                logger.warning("Value patterns failed for %s: %s", fqn, pat_err)
+
+            # --- Build profile columns (same shape as before) ---
+            sample_n = row_count if not sampled else min(5000, row_count)
+            profile_cols: list[dict[str, Any]] = []
+
+            for col_name, stats in col_stats.items():
+                non_null = stats["length_of_column"]
+                null_count = stats["null_count"]
+                distinct = stats["unique_count"]
+                data_type = stats["data_type"]
+
+                null_pct = round((null_count / row_count) * 100, 2) if row_count > 0 else 0
+                uniqueness_pct = round((distinct / non_null) * 100, 2) if non_null > 0 else 0
+
+                # Semantic PK filtering (preserved from current code)
+                data_type_upper = data_type.upper()
+                col_name_lower = col_name.lower()
+                pk_excluded_keywords = (
+                    "description", "comment", "note", "text", "body",
+                    "message", "remark", "summary", "detail", "content",
                 )
-                # For string-type columns, also collect up to 25 sample distinct values
-                if col["data_type"].upper() in _STRING_TYPES:
-                    expr += f', ARRAY_SLICE(ARRAY_AGG(DISTINCT "{cn}"), 0, 25) AS "sv_{cn}"'
-                col_expressions.append(expr)
+                is_text_like = data_type_upper in ("TEXT", "CLOB", "NCLOB", "STRING", "VARIANT")
+                is_excluded_name = any(kw in col_name_lower for kw in pk_excluded_keywords)
+                stats_say_pk = uniqueness_pct > 98 and null_pct == 0
+                is_likely_pk = stats_say_pk and not is_text_like and not is_excluded_name
 
-            batch_row: dict[str, Any] = {}
-            sample_n = 0
-            if col_expressions:
-                batch_sql = (
-                    f'SELECT COUNT(*) AS "_sample_n", {", ".join(col_expressions)} '
-                    f"FROM {from_clause}"
-                )
-                batch_result = await execute_query(batch_sql)
-                batch_row = batch_result[0] if batch_result else {}
-
-            sample_n = batch_row.get("_sample_n", 0) or 0
-            if total_rows is None:
-                total_rows = sample_n
-
-            profile_cols = []
-            for col in columns:
-                col_name = col["column_name"]
-                if not col_name:
-                    continue
-                try:
-                    non_null = batch_row.get(f"nn_{col_name}", 0) or 0
-                    distinct = batch_row.get(f"dc_{col_name}", 0) or 0
-                    null_pct = round((1 - non_null / sample_n) * 100, 2) if sample_n > 0 else 0
-                    uniqueness_pct = round((distinct / non_null) * 100, 2) if non_null > 0 else 0
-
-                    # Semantic PK filtering: exclude columns unlikely to be keys
-                    data_type_upper = col["data_type"].upper()
-                    col_name_lower = col_name.lower()
-                    pk_excluded_keywords = (
-                        "description", "comment", "note", "text", "body",
-                        "message", "remark", "summary", "detail", "content",
-                    )
-                    is_text_like = data_type_upper in (
-                        "TEXT", "CLOB", "NCLOB", "STRING", "VARIANT",
-                    )
-                    is_excluded_name = any(kw in col_name_lower for kw in pk_excluded_keywords)
-                    stats_say_pk = uniqueness_pct > 98 and null_pct == 0
-                    is_likely_pk = stats_say_pk and not is_text_like and not is_excluded_name
-
-                    entry: dict[str, Any] = {
-                        "column": col_name,
-                        "data_type": col["data_type"],
-                        "nullable": col["is_nullable"] == "YES",
-                        "null_pct": null_pct,
-                        "uniqueness_pct": uniqueness_pct,
-                        "distinct_count": distinct,
-                        "total_rows": total_rows,
-                        "is_likely_pk": is_likely_pk,
-                        "sampled": sampled,
-                    }
-
-                    # Attach sample_values for string-type columns
-                    sv_key = f"sv_{col_name}"
-                    raw_sv = batch_row.get(sv_key)
-                    if raw_sv is not None:
-                        # Snowflake ARRAY comes back as JSON string from the connector
-                        if isinstance(raw_sv, str):
-                            try:
-                                raw_sv = json.loads(raw_sv)
-                            except (json.JSONDecodeError, TypeError):
-                                raw_sv = None
-                        if isinstance(raw_sv, list):
-                            sample_vals = [str(v) for v in raw_sv if v is not None][:25]
-                            if sample_vals:
-                                entry["sample_values"] = sample_vals
-
-                    profile_cols.append(entry)
-                except Exception as col_err:
-                    logger.warning("Profiling column %s.%s failed: %s", table_fqn, col_name, col_err)
-
-            # Composite PK detection: if no single-column PK was found, test
-            # candidate combinations of NOT-NULL columns with moderate
-            # cardinality.  Pure data-driven — no column-name heuristics.
-            has_single_pk = any(pc.get("is_likely_pk") for pc in profile_cols)
-            if not has_single_pk and total_rows and total_rows > 0:
-                _EXCLUDE_TYPES = {
-                    "BOOLEAN", "VARIANT", "OBJECT", "ARRAY",
-                    "CLOB", "NCLOB",
+                vp = patterns.get(col_name, {})
+                entry: dict[str, Any] = {
+                    "column": col_name,
+                    "data_type": data_type,
+                    "nullable": null_count > 0,
+                    "null_pct": null_pct,
+                    "uniqueness_pct": uniqueness_pct,
+                    "distinct_count": distinct,
+                    "total_rows": row_count,
+                    "is_likely_pk": is_likely_pk,
+                    "sampled": sampled,
+                    # New value pattern fields
+                    "numeric_ratio": vp.get("numeric_ratio"),
+                    "avg_length": vp.get("avg_length"),
+                    "min_value": vp.get("min_value"),
+                    "max_value": vp.get("max_value"),
                 }
+                profile_cols.append(entry)
+
+            # --- Composite PK detection (KEPT AS-IS from current code) ---
+            has_single_pk = any(pc.get("is_likely_pk") for pc in profile_cols)
+            if not has_single_pk and row_count and row_count > 0:
+                _EXCLUDE_TYPES = {"BOOLEAN", "VARIANT", "OBJECT", "ARRAY", "CLOB", "NCLOB"}
                 pk_pool = [
                     pc["column"] for pc in profile_cols
                     if pc["null_pct"] == 0
@@ -477,16 +520,10 @@ async def _step_profiling(
                     and pc.get("distinct_count", 0) > 1
                     and pc.get("uniqueness_pct", 0) < 90
                 ]
-                # Sort by selectivity (highest distinct count first) and cap
-                # at 6 columns to keep the combinatorial search manageable.
-                col_distinct = {
-                    pc["column"]: pc.get("distinct_count", 0)
-                    for pc in profile_cols
-                }
+                col_distinct = {pc["column"]: pc.get("distinct_count", 0) for pc in profile_cols}
                 pk_pool.sort(key=lambda c: col_distinct.get(c, 0), reverse=True)
                 pk_pool = pk_pool[:6]
 
-                # Generate all 2..min(5, len) sized combinations, smallest first.
                 candidates: list[list[str]] = []
                 max_r = min(len(pk_pool), 5)
                 for r in range(2, max_r + 1):
@@ -496,46 +533,54 @@ async def _step_profiling(
                 for combo in candidates:
                     if len(combo) < 2 or len(combo) > 5:
                         continue
-                    quoted = ", ".join(f'"{c}"' for c in combo)
+                    combo_quoted = ", ".join(f'"{c}"' for c in combo)
                     try:
-                        # Snowflake doesn't support COUNT(DISTINCT (col1, col2)) tuple syntax.
-                        # Use a subquery with GROUP BY instead.
                         ck_sql = (
                             f"SELECT "
-                            f"(SELECT COUNT(*) FROM {from_clause}) AS total, "
+                            f"(SELECT COUNT(*) FROM {quoted}) AS total, "
                             f"(SELECT COUNT(*) FROM "
-                            f"(SELECT 1 FROM {from_clause} GROUP BY {quoted})) AS uniq"
+                            f"(SELECT 1 FROM {quoted} GROUP BY {combo_quoted})) AS uniq"
                         )
                         ck_result = await execute_query(ck_sql)
                         ck_row = ck_result[0] if ck_result else {}
                         ck_total = ck_row.get("TOTAL", 0) or 0
                         ck_uniq = ck_row.get("UNIQ", 0) or 0
                         if ck_total > 0 and ck_uniq / ck_total > 0.98:
-                            # Mark these columns as composite PK
                             combo_set = set(combo)
                             for pc in profile_cols:
                                 if pc["column"] in combo_set:
                                     pc["is_likely_pk"] = True
-                            logger.info(
-                                "Composite PK detected for %s: %s",
-                                table_fqn, combo,
-                            )
-                            break  # Use first valid composite key
+                            logger.info("Composite PK detected for %s: %s", fqn, combo)
+                            break
                     except Exception as ck_err:
-                        logger.debug("Composite PK check failed for %s: %s", table_fqn, ck_err)
+                        logger.debug("Composite PK check failed for %s: %s", fqn, ck_err)
 
-            profiles.append({
-                "table": table_fqn,
-                "row_count": total_rows,
-                "column_count": len(columns),
+            # Build final profile entry
+            profile_entry = {
+                "table": fqn,
+                "row_count": row_count,
+                "column_count": len(profile_cols),
                 "columns": profile_cols,
                 "sampled": sampled,
-                "sample_size": sample_n if sampled else total_rows,
-            })
+                "sample_size": sample_n if sampled else row_count,
+            }
+            profiles.append(profile_entry)
+
+            # Save checkpoint after each table
+            checkpoint_data["results"][table_name] = profile_entry
+            if table_name not in checkpoint_data.get("processed_tables", []):
+                checkpoint_data.setdefault("processed_tables", []).append(table_name)
+            checkpoint_data["current_table"] = None
+            await save_profile_checkpoint(data_product_id, checkpoint_data)
 
         except Exception as e:
-            logger.warning("Profiling table %s failed: %s", table_fqn, e)
-            profiles.append({"table": table_fqn, "error": str(e), "columns": []})
+            logger.warning("Profiling table %s failed: %s", fqn, e)
+            profiles.append({"table": fqn, "error": str(e), "columns": []})
+
+    # Mark checkpoint completed
+    checkpoint_data["status"] = "completed"
+    checkpoint_data["current_table"] = None
+    await save_profile_checkpoint(data_product_id, checkpoint_data)
 
     await _emit(queue, "profiling", STEPS[step_idx]["label"],
                 "completed", f"{len(profiles)} tables profiled", total, total, step_idx)
