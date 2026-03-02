@@ -1701,3 +1701,124 @@ async def verify_brd_completeness(data_product_id: str) -> str:
     except Exception as e:
         logger.error("verify_brd_completeness failed: %s", e)
         return json.dumps({"status": "error", "issues": [str(e)], "section_count": 0})
+
+
+# ---------------------------------------------------------------------------
+# Profile checkpoint helpers (internal — NOT @tool functions)
+# Used by the discovery pipeline for fast incremental profiling.
+# ---------------------------------------------------------------------------
+
+
+async def load_profile_checkpoint(data_product_id: str) -> dict | None:
+    """Load an existing profile checkpoint for a data product.
+
+    Returns a dict with checkpoint state, or None if no checkpoint exists.
+    """
+    try:
+        pool = await _get_pool()
+        rows = await pg_service.query(
+            pool,
+            "SELECT * FROM profile_checkpoints WHERE data_product_id = $1",
+            data_product_id,
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        results_raw = row["results"]
+        return {
+            "database_name": row["database_name"],
+            "schema_name": row["schema_name"],
+            "current_table": row["current_table"],
+            "processed_tables": list(row["processed_tables"]) if row["processed_tables"] else [],
+            "requested_tables": list(row["requested_tables"]) if row["requested_tables"] else [],
+            "results": json.loads(results_raw) if isinstance(results_raw, str) else (results_raw or {}),
+            "status": row["status"],
+        }
+    except Exception as e:
+        logger.error("load_profile_checkpoint failed: %s", e)
+        return None
+
+
+async def save_profile_checkpoint(data_product_id: str, checkpoint: dict) -> None:
+    """Upsert a profile checkpoint for a data product."""
+    try:
+        pool = await _get_pool()
+        sql = """
+            INSERT INTO profile_checkpoints
+                (id, data_product_id, database_name, schema_name,
+                 current_table, processed_tables, requested_tables,
+                 results, status)
+            VALUES
+                (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7::jsonb, $8)
+            ON CONFLICT (data_product_id) DO UPDATE SET
+                database_name    = EXCLUDED.database_name,
+                schema_name      = EXCLUDED.schema_name,
+                current_table    = EXCLUDED.current_table,
+                processed_tables = EXCLUDED.processed_tables,
+                requested_tables = EXCLUDED.requested_tables,
+                results          = EXCLUDED.results,
+                status           = EXCLUDED.status,
+                updated_at       = now()
+        """
+        await pg_service.execute(
+            pool,
+            sql,
+            data_product_id,
+            checkpoint.get("database_name", ""),
+            checkpoint.get("schema_name", ""),
+            checkpoint.get("current_table") or None,
+            checkpoint.get("processed_tables", []),
+            checkpoint.get("requested_tables", []),
+            json.dumps(checkpoint.get("results", {})),
+            checkpoint.get("status", "in_progress"),
+        )
+    except Exception as e:
+        logger.error("save_profile_checkpoint failed: %s", e)
+        raise
+
+
+async def get_pending_profile_tables(
+    data_product_id: str, requested_tables: list[str]
+) -> list[str]:
+    """Return the subset of requested_tables that have not yet been profiled.
+
+    If no checkpoint exists, all requested tables are considered pending.
+    """
+    checkpoint = await load_profile_checkpoint(data_product_id)
+    if checkpoint is None:
+        return requested_tables
+    processed = set(checkpoint["processed_tables"])
+    return [t for t in requested_tables if t not in processed]
+
+
+async def reconcile_profile_tables(
+    data_product_id: str, new_tables: list[str]
+) -> tuple[list[str], set[str]]:
+    """Reconcile a new table list against an existing checkpoint.
+
+    Returns (tables_to_profile, removed_tables):
+        - tables_to_profile: unprocessed tables from the original set plus any
+          newly added tables.
+        - removed_tables: tables that were in the old checkpoint but are no
+          longer requested.
+
+    If no checkpoint exists, returns (new_tables, empty set).
+    """
+    checkpoint = await load_profile_checkpoint(data_product_id)
+    if checkpoint is None:
+        return (new_tables, set())
+
+    old = set(checkpoint["requested_tables"])
+    new = set(new_tables)
+    added = new - old
+    removed = old - new
+    processed = set(checkpoint["processed_tables"])
+
+    pending_from_original = [t for t in new_tables if t in (new & old) and t not in processed]
+
+    # Update checkpoint with the new table list and mark in-progress
+    checkpoint["requested_tables"] = new_tables
+    checkpoint["status"] = "in_progress"
+    await save_profile_checkpoint(data_product_id, checkpoint)
+
+    return (pending_from_original + list(added), removed)
