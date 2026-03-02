@@ -855,13 +855,21 @@ def _step_quality(results: dict[str, Any]) -> dict[str, Any]:
             avg_non_null = 100.0 - (sum(id_null_pcts) / len(id_null_pcts))
             completeness_pcts.append(max(0.0, avg_non_null))
         else:
-            # No identifier columns found — fall back to all columns
-            all_null_pcts = [c.get("null_pct", 0) for c in columns if "null_pct" in c]
-            if all_null_pcts:
-                avg_non_null = 100.0 - (sum(all_null_pcts) / len(all_null_pcts))
+            # No identifier columns found — measure only "expected populated"
+            # columns. Columns with 50%+ nulls are structurally optional
+            # (e.g., DECOMMISSION_DATE on active plants) — their nulls are
+            # correct, not a quality issue.
+            populated_cols = [
+                c for c in columns
+                if "null_pct" in c and c.get("null_pct", 0) < 50
+            ]
+            if populated_cols:
+                pop_null_pcts = [c["null_pct"] for c in populated_cols]
+                avg_non_null = 100.0 - (sum(pop_null_pcts) / len(pop_null_pcts))
                 completeness_pcts.append(max(0.0, avg_non_null))
             else:
-                completeness_pcts.append(0.0)
+                # Every column is >50% null — flag but don't destroy score
+                completeness_pcts.append(50.0)
 
         # Only flag identifier columns with gaps — these are real quality issues.
         # Non-identifier columns with high nulls are informational (shown in the
