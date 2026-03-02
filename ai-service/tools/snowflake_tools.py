@@ -2228,3 +2228,184 @@ def _fuzzy_match(brd_item: str, yaml_item: str) -> bool:
     # Match if significant overlap
     overlap = brd_words & yaml_words
     return len(overlap) >= min(len(brd_words), len(yaml_words)) * 0.5
+
+
+# ----------- Fast profiling: batch helpers & single-scan CTE builders -----------
+
+
+def _batch_table_metadata(
+    database: str, schema: str, table_names: list[str]
+) -> dict[str, dict]:
+    """Fetch metadata for multiple tables in a single INFORMATION_SCHEMA query.
+
+    Returns dict keyed by table_name with ROW_COUNT, TABLE_TYPE, SIZE_MB,
+    LAST_ALTERED, COMMENT fields.
+    """
+    if not table_names:
+        return {}
+
+    # Build safe IN clause — table_names are from INFORMATION_SCHEMA, not user input
+    in_list = ", ".join(f"'{t}'" for t in table_names)
+
+    sql = f"""
+        SELECT TABLE_NAME, TABLE_TYPE, ROW_COUNT,
+               BYTES / 1024.0 / 1024.0 AS SIZE_MB,
+               CREATED, LAST_ALTERED, COMMENT
+        FROM "{database}".INFORMATION_SCHEMA.TABLES
+        WHERE TABLE_SCHEMA = '{schema}'
+        AND TABLE_NAME IN ({in_list})
+    """
+
+    try:
+        rows = execute_query_sync(sql)
+        result: dict[str, dict] = {}
+        for row in rows:
+            name = row.get("TABLE_NAME", "")
+            result[name] = {
+                "TABLE_NAME": name,
+                "TABLE_TYPE": row.get("TABLE_TYPE", "BASE TABLE"),
+                "ROW_COUNT": int(row.get("ROW_COUNT") or 0),
+                "SIZE_MB": float(row.get("SIZE_MB") or 0),
+                "CREATED": str(row.get("CREATED") or ""),
+                "LAST_ALTERED": str(row.get("LAST_ALTERED") or ""),
+                "COMMENT": str(row.get("COMMENT") or ""),
+            }
+        return result
+    except Exception as e:
+        logger.error("_batch_table_metadata failed: %s", e)
+        return {}
+
+
+def _build_sample_clause(row_count: int, table_type: str = "BASE TABLE") -> str:
+    """Build adaptive SAMPLE clause based on row count and table type."""
+    MIN_ROWS_FOR_SAMPLING = 1_000_000
+    TARGET_SAMPLE_SIZE = 5000
+
+    if row_count <= 0 or row_count < MIN_ROWS_FOR_SAMPLING:
+        return ""
+
+    percentage = (TARGET_SAMPLE_SIZE / row_count) * 100
+    percentage = max(0.001, min(percentage, 100.0))
+
+    if table_type in ("VIEW", "MATERIALIZED VIEW"):
+        return f"SAMPLE ROW ({percentage})"
+    return f"SAMPLE SYSTEM ({percentage})"
+
+
+def _build_column_stats_cte(
+    database: str, schema: str, table_name: str, sample_clause: str
+) -> str:
+    """Build Phase 1 SQL that generates single-scan column stats query.
+
+    Returns SQL that, when executed, returns one row with one column
+    containing the Phase 2 SQL to execute for actual stats.
+    """
+    return f"""
+    WITH column_info AS (
+        SELECT
+            column_name,
+            data_type,
+            REGEXP_REPLACE(column_name, '["  .\\\\-]', '_') as col_alias
+        FROM "{database}".INFORMATION_SCHEMA.COLUMNS
+        WHERE table_name = '{table_name}'
+        AND table_schema = '{schema}'
+    ),
+    query_parts AS (
+        SELECT
+            LISTAGG(
+                'HLL_ACCUMULATE("' || column_name || '") as hll_' || col_alias || ', ' ||
+                'COUNT_IF("' || column_name || '" IS NULL) as null_' || col_alias,
+                ', '
+            ) as agg_expressions,
+            LISTAGG(
+                'SELECT ''' || column_name || ''' as column_name, ' ||
+                '''' || data_type || ''' as data_type, ' ||
+                'CAST(HLL_ESTIMATE(hll_' || col_alias || ') AS DECIMAL(38,0)) as unique_count, ' ||
+                'null_' || col_alias || ' as null_count ' ||
+                'FROM single_scan_stats',
+                ' UNION ALL '
+            ) as union_statements
+        FROM column_info
+    )
+    SELECT
+        'WITH single_scan_stats AS (SELECT ' || agg_expressions ||
+        ' FROM "{database}"."{schema}"."{table_name}" {sample_clause}) ' || union_statements
+    FROM query_parts
+    """
+
+
+def _build_value_patterns_cte(
+    database: str, schema: str, table_name: str, sample_clause: str
+) -> str:
+    """Build Phase 1 SQL that generates single-scan value patterns query."""
+    return f"""
+    WITH column_info AS (
+        SELECT
+            column_name,
+            data_type,
+            REGEXP_REPLACE(column_name, '["  .\\\\-]', '_') as col_alias,
+            CASE
+                WHEN data_type IN ('NUMBER', 'FLOAT', 'INTEGER', 'DECIMAL', 'DOUBLE',
+                    'DOUBLE PRECISION', 'REAL', 'FLOAT4', 'FLOAT8', 'INT', 'BIGINT',
+                    'SMALLINT', 'TINYINT', 'BYTEINT', 'DEC', 'NUMERIC') THEN 'numeric'
+                WHEN data_type IN ('DATE', 'DATETIME', 'TIME', 'TIMESTAMP',
+                    'TIMESTAMP_LTZ', 'TIMESTAMP_NTZ', 'TIMESTAMP_TZ') THEN 'temporal'
+                WHEN data_type = 'BOOLEAN' THEN 'boolean'
+                WHEN data_type IN ('VARIANT', 'ARRAY', 'OBJECT') THEN 'complex'
+                ELSE 'string'
+            END as type_category
+        FROM "{database}".INFORMATION_SCHEMA.COLUMNS
+        WHERE table_name = '{table_name}'
+        AND table_schema = '{schema}'
+    ),
+    query_parts AS (
+        SELECT
+            LISTAGG(
+                'COUNT("' || column_name || '") as count_' || col_alias || ', ' ||
+                CASE type_category
+                    WHEN 'numeric' THEN
+                        'COUNT("' || column_name || '") as numeric_' || col_alias || ', ' ||
+                        'MIN("' || column_name || '") as min_' || col_alias || ', ' ||
+                        'MAX("' || column_name || '") as max_' || col_alias || ', '
+                    WHEN 'temporal' THEN
+                        '0 as numeric_' || col_alias || ', ' ||
+                        'NULL as min_' || col_alias || ', NULL as max_' || col_alias || ', '
+                    WHEN 'boolean' THEN
+                        'COUNT("' || column_name || '") as numeric_' || col_alias || ', ' ||
+                        'NULL as min_' || col_alias || ', NULL as max_' || col_alias || ', '
+                    WHEN 'complex' THEN
+                        'SUM(CASE WHEN TRY_CAST(CAST("' || column_name || '" AS VARCHAR) AS FLOAT) ' ||
+                        'IS NOT NULL THEN 1 ELSE 0 END) as numeric_' || col_alias || ', ' ||
+                        'NULL as min_' || col_alias || ', NULL as max_' || col_alias || ', '
+                    ELSE
+                        'SUM(CASE WHEN TRY_CAST("' || column_name || '" AS FLOAT) IS NOT NULL ' ||
+                        'THEN 1 ELSE 0 END) as numeric_' || col_alias || ', ' ||
+                        'NULL as min_' || col_alias || ', NULL as max_' || col_alias || ', '
+                END ||
+                'AVG(LENGTH(CAST("' || column_name || '" AS VARCHAR))) as avg_len_' || col_alias,
+                ', '
+            ) as agg_expressions,
+            LISTAGG(
+                'SELECT ''' || column_name || ''' as column_name, ' ||
+                'count_' || col_alias || ' as non_null_count, ' ||
+                'numeric_' || col_alias || ' as numeric_count, ' ||
+                'min_' || col_alias || ' as min_value, ' ||
+                'max_' || col_alias || ' as max_value, ' ||
+                'avg_len_' || col_alias || ' as avg_length ' ||
+                'FROM single_scan_patterns',
+                ' UNION ALL '
+            ) as union_statements
+        FROM column_info
+    )
+    SELECT
+        'WITH single_scan_patterns AS (SELECT ' || agg_expressions ||
+        ' FROM "{database}"."{schema}"."{table_name}" {sample_clause}), ' ||
+        'value_patterns AS (' || union_statements || '), ' ||
+        'result AS (SELECT column_name, min_value, max_value, ' ||
+        'CASE WHEN non_null_count < 5 THEN ''No pattern'' ELSE ''Value pattern'' END AS pattern_type, ' ||
+        'CASE WHEN non_null_count < 5 THEN NULL ' ||
+        'ELSE numeric_count / NULLIF(non_null_count, 0) END AS numeric_ratio, ' ||
+        'CASE WHEN non_null_count < 5 THEN NULL ELSE avg_length END AS avg_length ' ||
+        'FROM value_patterns) SELECT * FROM result'
+    FROM query_parts
+    """
